@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>EZVIZ Archive · Camera & thư viện video</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Đi đến nội dung</a>
+  <section id="login-screen" class="login-screen" hidden aria-labelledby="login-title">
+    <div class="login-card">
+      <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="3"/><path d="m16 10 5-3v10l-5-3"/></svg></div>
+      <p class="eyebrow">EZVIZ ARCHIVE</p>
+      <h1 id="login-title">Một nơi cho mọi camera.</h1>
+      <p class="muted">Đăng nhập dashboard để quản lý camera và tìm lại video đã lưu trên Telegram.</p>
+      <form id="login-form">
+        <label for="login-token">Dashboard token</label>
+        <input id="login-token" name="token" type="password" autocomplete="current-password" required placeholder="Nhập token trong cấu hình Docker">
+        <p class="field-hint">Token dashboard khác với token bot Telegram.</p>
+        <p id="login-error" class="form-error" role="alert" hidden></p>
+        <button class="button primary full-width" type="submit">Mở dashboard <span aria-hidden="true">→</span></button>
+      </form>
+      <p class="login-footnote">Phiên đăng nhập dùng cookie · Không lưu token trong trình duyệt</p>
+    </div>
+  </section>
+
+  <div id="app-shell" class="app-shell" hidden>
+    <aside class="sidebar" aria-label="Điều hướng chính">
+      <a class="brand" href="#cameras"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="3"/><path d="m16 10 5-3v10l-5-3"/></svg></span><span>EZVIZ<span class="brand-sub">ARCHIVE</span></span></a>
+      <p class="nav-label">WORKSPACE</p>
+      <nav class="nav-list">
+        <a href="#cameras" class="nav-item active" data-view="cameras" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="m16 10 5-3v10l-5-3"/></svg>Camera<span id="nav-camera-count" class="nav-count">0</span></a>
+        <a href="#archive" class="nav-item" data-view="archive"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v14H3zM2 3h20v4H2zM9 11h6"/></svg>Thư viện video</a>
+        <a href="#system" class="nav-item" data-view="system"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1M5.6 18.4l2.1-2.1m8.6-8.6 2.1-2.1"/><circle cx="12" cy="12" r="4"/></svg>Hệ thống</a>
+      </nav>
+      <div class="sidebar-note"><span class="note-line"></span><strong>Gọn gàng. Có thứ tự.</strong><p>Camera → Năm → Tháng → Ngày</p></div>
+      <div class="sidebar-footer"><span class="connection-dot" aria-hidden="true"></span><div><strong id="connection-state">Đang kết nối…</strong><span id="sidebar-timezone">Múi giờ đang tải</span></div></div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar"><div class="topbar-crumb"><span>Workspace</span><span aria-hidden="true">/</span><strong id="topbar-page">Camera</strong></div><div class="topbar-actions"><span class="session-badge">Phiên quản trị</span><button id="refresh-button" class="button ghost compact" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-2L20 8M4 16l2.3 3A7 7 0 0 0 17.9 17"/></svg>Làm mới</button><button id="logout-button" class="button ghost compact" type="button">Đăng xuất</button></div></header>
+      <main id="main" tabindex="-1">
+        <div id="global-error" class="notice error-notice" role="alert" hidden></div>
+
+        <section id="view-cameras" class="view" aria-labelledby="cameras-title">
+          <div class="page-heading"><div><p class="eyebrow">CAMERA MANAGEMENT</p><h1 id="cameras-title">Camera của bạn<span class="heading-dot">.</span></h1><p class="muted">Thêm thiết bị, đặt tên dễ nhớ và kiểm tra kết nối trong cùng một nơi.</p></div><button id="add-camera-button" class="button primary" type="button"><span aria-hidden="true" class="plus">+</span>Thêm camera</button></div>
+          <div class="stats-grid" aria-label="Thống kê camera"><div class="stat-card"><span class="stat-label">Tổng camera</span><strong id="stat-cameras">—</strong><span class="stat-detail">Thiết bị đã cấu hình</span></div><div class="stat-card"><span class="stat-label">Đang bật</span><strong id="stat-enabled">—</strong><span class="stat-detail">Tham gia quy trình lưu trữ</span></div><div class="stat-card"><span class="stat-label">Video đã lập chỉ mục</span><strong id="stat-recordings">—</strong><span class="stat-detail">Số bản ghi trong cơ sở dữ liệu</span></div><div class="stat-card"><span class="stat-label">Đã lưu Telegram</span><strong id="stat-uploaded">—</strong><span class="stat-detail">Upload đã xác nhận thành công</span></div></div>
+          <div class="section-heading"><h2>Danh sách thiết bị</h2><label class="search-control"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Tìm camera</span><input id="camera-search" type="search" placeholder="Tìm theo tên, model hoặc IP…"></label></div>
+          <div id="camera-loading" class="loading-state" role="status">Đang tải camera…</div>
+          <div id="camera-grid" class="camera-grid"></div>
+          <div id="camera-empty" class="empty-state" hidden><span class="empty-glyph" aria-hidden="true">+</span><h3>Camera đầu tiên bắt đầu ở đây</h3><p>Thêm tên, model và địa chỉ LAN. Kiểm tra cổng là bước đầu; khả năng tải SD được kiểm chứng riêng.</p><button class="button primary" id="empty-add-camera" type="button">Thêm camera</button></div>
+          <div id="camera-no-match" class="empty-state compact-empty" hidden><h3>Không tìm thấy camera</h3><p>Thử một tên, model hoặc địa chỉ khác.</p></div>
+          <div class="notice info-notice"><span class="notice-icon" aria-hidden="true">i</span><div><strong>Tách biệt kết nối và khả năng tải SD</strong><p>Cổng mở chỉ xác nhận dịch vụ có phản hồi. Dashboard không coi đó là bằng chứng tải được video trên thẻ nhớ.</p></div></div>
+        </section>
+
+        <section id="view-archive" class="view" hidden aria-labelledby="archive-title">
+          <div class="page-heading"><div><p class="eyebrow">YOUR VIDEO LIBRARY</p><h1 id="archive-title">Tìm đúng khoảnh khắc<span class="heading-dot">.</span></h1><p class="muted">Video được nhóm theo tên camera, rồi đến năm, tháng và ngày.</p></div><span id="archive-count-badge" class="outline-badge">Chưa tải</span></div>
+          <div class="archive-panel">
+            <div class="archive-path" aria-label="Đường dẫn thư viện"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v11H3zM3 7V4h7l2 3"/></svg><span id="archive-breadcrumb">Chọn camera để xem thư viện</span></div>
+            <form id="archive-filters" class="filter-grid">
+              <div class="field"><label for="filter-camera">Camera</label><select id="filter-camera" name="camera"><option value="">Tất cả camera</option></select></div>
+              <div class="field"><label for="filter-year">Năm</label><select id="filter-year" name="year" disabled><option value="">Tất cả năm</option></select></div>
+              <div class="field"><label for="filter-month">Tháng</label><select id="filter-month" name="month" disabled><option value="">Tất cả tháng</option></select></div>
+              <div class="field"><label for="filter-day">Ngày</label><select id="filter-day" name="day" disabled><option value="">Tất cả ngày</option></select></div>
+              <div class="field"><label for="filter-status">Trạng thái</label><select id="filter-status" name="status"><option value="uploaded">Đã lưu Telegram</option><option value="all">Tất cả trạng thái</option></select></div>
+              <div class="field"><label for="filter-order">Sắp xếp thời gian</label><select id="filter-order" name="order"><option value="desc">Mới → Cũ</option><option value="asc">Cũ → Mới</option></select></div>
+            </form>
+          </div>
+          <div class="section-heading"><h2>Danh sách video</h2><span id="archive-result-count" class="muted small">—</span></div>
+          <div id="archive-loading" class="loading-state" role="status" hidden>Đang tải thư viện…</div>
+          <div id="archive-empty" class="empty-state" hidden><span class="empty-glyph" aria-hidden="true">▤</span><h3>Chưa có video phù hợp</h3><p>Chọn khoảng thời gian khác hoặc chuyển trạng thái sang “Tất cả trạng thái”. Video mới xuất từ Studio cần được nhập và upload trước khi có liên kết Telegram.</p></div>
+          <div id="archive-table-wrap" class="table-wrap" hidden tabindex="0" aria-label="Bảng video, cuộn ngang trên màn hình nhỏ"><table><thead><tr><th scope="col">Camera / Video</th><th scope="col">Bắt đầu</th><th scope="col">Thời lượng</th><th scope="col">Dung lượng</th><th scope="col">Trạng thái</th><th scope="col" class="align-right">Telegram</th></tr></thead><tbody id="archive-rows"></tbody></table></div>
+          <nav id="archive-pagination" class="pagination" aria-label="Phân trang video" hidden><span id="pagination-summary" class="muted small"></span><div><button id="previous-page" class="button secondary compact" type="button">← Trước</button><button id="next-page" class="button secondary compact" type="button">Tiếp →</button></div></nav>
+          <p class="small muted archive-footnote">Liên kết Telegram mở bài đăng gốc; tài khoản của bạn cần là thành viên kênh riêng tư tương ứng.</p>
+        </section>
+
+        <section id="view-system" class="view" hidden aria-labelledby="system-title">
+          <div class="page-heading"><div><p class="eyebrow">SYSTEM OVERVIEW</p><h1 id="system-title">Nhìn rõ toàn bộ quy trình<span class="heading-dot">.</span></h1><p class="muted">Trạng thái thật của dịch vụ, chế độ upload và bộ tải video SD.</p></div></div>
+          <div class="pipeline"><div><span class="step-number">01</span><strong>Camera / Studio</strong><p>Xuất video từ thẻ SD</p></div><span class="pipeline-arrow" aria-hidden="true">→</span><div><span class="step-number">02</span><strong>Docker Archive</strong><p>Chuẩn hóa MP4 & lập chỉ mục</p></div><span class="pipeline-arrow" aria-hidden="true">→</span><div><span class="step-number">03</span><strong>Telegram</strong><p>Upload & duyệt theo camera</p></div></div>
+          <div class="system-grid"><article class="system-card"><div class="section-heading"><h2>Dịch vụ lưu trữ</h2><span class="status-chip neutral" id="system-service-status">Đang tải</span></div><dl id="system-details" class="details-list"></dl></article><article class="system-card"><div class="section-heading"><h2>Tải trực tiếp từ SD</h2><span class="status-chip amber" id="system-sd-status">Chưa kiểm chứng</span></div><p id="system-sd-description" class="muted">Đang đọc cấu hình adapter…</p><div class="subtle-box"><strong>Quy trình đã triển khai</strong><p>Video xuất bằng EZVIZ Studio → thư mục input / manifest → chuẩn hóa → Telegram.</p></div><p class="small muted">Model C6N và H6c được kiểm tra theo từng thiết bị. Kết quả một model không được tự động áp dụng cho model khác.</p></article></div>
+          <article class="system-card" id="probe-results-card"><div class="section-heading"><h2>Kiểm tra kết nối gần nhất</h2><span class="muted small">TCP · không đăng nhập camera</span></div><div id="system-probes" class="muted small">Chưa có kết quả kiểm tra trong phiên này. Chọn “Kiểm tra LAN” ở thẻ camera.</div></article>
+        </section>
+      </main>
+      <footer class="workspace-footer"><span>EZVIZ Archive</span><span>Không gian riêng cho lịch sử camera của bạn</span></footer>
+    </div>
+  </div>
+  <div id="boot-loading" class="boot-loading" role="status"><div class="loading-ring" aria-hidden="true"></div><span>Đang mở workspace…</span></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <dialog id="camera-dialog" aria-labelledby="camera-dialog-title">
+    <form id="camera-form">
+      <div class="dialog-heading"><div><p class="eyebrow">CAMERA CONFIGURATION</p><h2 id="camera-dialog-title">Thêm camera</h2></div><button id="close-camera-dialog" class="icon-button" type="button" aria-label="Đóng hộp thoại"><span aria-hidden="true">×</span></button></div>
+      <p class="muted dialog-intro">Tên hiển thị có thể đổi bất cứ lúc nào. Mã camera giữ nguyên để lịch sử video không bị tách.</p>
+      <div class="form-grid"><div class="field"><label for="camera-id">Mã camera <span class="required">*</span></label><input id="camera-id" name="id" required maxlength="64" pattern="[a-z0-9][a-z0-9_\-]{0,63}" placeholder="vi-du: phong-khach" aria-describedby="camera-id-hint"><p id="camera-id-hint" class="field-hint">Chữ thường a–z, số, dấu - hoặc _. Không đổi sau khi tạo.</p></div><div class="field"><label for="camera-name">Tên hiển thị <span class="required">*</span></label><input id="camera-name" name="name" required maxlength="120" placeholder="Phòng khách"></div><div class="field"><label for="camera-model">Model</label><input id="camera-model" name="model" maxlength="100" placeholder="CS-H6c hoặc CS-C6N"></div><div class="field"><label for="camera-host">Địa chỉ LAN <span class="required">*</span></label><input id="camera-host" name="host" required maxlength="253" placeholder="192.168.1.11" autocapitalize="none" spellcheck="false" aria-describedby="camera-host-hint"><p id="camera-host-hint" class="field-hint">IPv4 hoặc hostname; không nhập URL hay mật khẩu.</p></div></div>
+      <div class="ports-grid"><div class="field"><label for="camera-device-port">Device port</label><input id="camera-device-port" name="device_port" type="number" min="1" max="65535" value="8000" required></div><div class="field"><label for="camera-rtsp-port">RTSP port</label><input id="camera-rtsp-port" name="rtsp_port" type="number" min="1" max="65535" value="554" required></div><div class="field"><label for="camera-http-port">HTTP port</label><input id="camera-http-port" name="http_port" type="number" min="1" max="65535" value="80" required></div></div>
+      <label class="checkbox-control"><input id="camera-enabled" name="enabled" type="checkbox" checked><span><strong>Bật camera</strong><span>Giữ cấu hình khi tạm ngừng một thiết bị.</span></span></label>
+      <p id="camera-form-error" class="form-error" role="alert" hidden tabindex="-1"></p>
+      <div class="dialog-actions"><button id="cancel-camera-dialog" class="button secondary" type="button">Hủy</button><button id="save-camera-button" class="button primary" type="submit">Lưu camera</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

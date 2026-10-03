@@ -1,0 +1,135 @@
+name: Publish app image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-app-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+      - run: python -m unittest discover -s tests -v
+      - run: node archive_app/web/test_web.js
+      - run: python scripts/ci_validate_manifest.py --self-test
+      - run: docker compose config --quiet
+
+  publish:
+    needs: validate
+    if: >-
+      github.repository == 'bscongluanbui/mycameratele' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Image metadata
+        id: meta
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          platforms: arm,arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Build and execute Docker test stage on all platforms
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: test
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: false
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=app-multiarch
+          cache-to: type=gha,mode=max,scope=app-multiarch
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push final image by digest before moving public tags
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: final
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          tags: ${{ steps.meta.outputs.image }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=app-multiarch
+          cache-to: type=gha,mode=max,scope=app-multiarch
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=mycameratele
+      - name: Real FFmpeg / SQLite / non-root smoke on all platforms
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64 linux/arm/v7; do
+            echo "Container smoke: $platform"
+            docker run --rm --platform "$platform" --read-only --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --tmpfs /tmp:rw,nosuid,mode=1777 \
+              --tmpfs /input:rw,nosuid,uid=10001,gid=10001 \
+              --tmpfs /data:rw,nosuid,uid=10001,gid=10001 \
+              --tmpfs /cache:rw,nosuid,uid=10001,gid=10001 \
+              -e DISPLAY_TIMEZONE=Asia/Ho_Chi_Minh -e ENABLE_UPLOAD=false \
+              --entrypoint python "$IMAGE@$DIGEST" \
+              -c "$(cat scripts/container_smoke.py)"
+          done
+      - name: Publish SHA/version tags; latest moves only from main
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags=(--tag "$IMAGE:sha-$GITHUB_SHA")
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            tags+=(--tag "$IMAGE:latest")
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]
+            tags+=(--tag "$IMAGE:$GITHUB_REF_NAME")
+          fi
+          docker buildx imagetools create "${tags[@]}" "$IMAGE@$DIGEST"
+          docker buildx imagetools inspect --raw "$IMAGE:sha-$GITHUB_SHA" > "$RUNNER_TEMP/app-manifest.json"
+          python scripts/ci_validate_manifest.py "$RUNNER_TEMP/app-manifest.json" linux/amd64 linux/arm64 linux/arm/v7
+          {
+            echo '## Published app image'
+            echo "- SHA tag: \`$IMAGE:sha-$GITHUB_SHA\`"
+            echo "- Digest pull: \`docker pull $IMAGE@$DIGEST\`"
+            echo '- Platforms: linux/amd64, linux/arm64, linux/arm/v7'
+            echo '- Docker test stage and real synthetic-video smoke completed on all three platforms.'
+          } >> "$GITHUB_STEP_SUMMARY"

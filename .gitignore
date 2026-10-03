@@ -1,0 +1,41 @@
+# Runtime settings and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.token
+
+# Runtime storage / private recordings
+input/*
+!input/.gitkeep
+data/
+cache/
+artifacts/
+backups/
+.verification/
+*.mp4
+*.mkv
+*.avi
+*.jpg
+*.png
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+
+# Local build/test/editor outputs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+dist/
+*.zip
+*.tar
+*.tar.gz
+.idea/
+.vscode/
+VERIFICATION.txt
+DIFF_FILE.json
+ROLLBACK.sh

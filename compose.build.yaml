@@ -1,0 +1,24 @@
+# Development only. The default compose.yaml pulls published GHCR images.
+services:
+  archive:
+    image: ${ARCHIVE_BUILD_IMAGE:-mycameratele:dev}
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: final
+  dashboard:
+    image: ${ARCHIVE_BUILD_IMAGE:-mycameratele:dev}
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: final
+  telegram-bot-api:
+    image: ${BOT_API_BUILD_IMAGE:-mycameratele-bot-api:dev}
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile.bot-api
+      args:
+        BUILD_JOBS: ${BOT_API_BUILD_JOBS:-2}

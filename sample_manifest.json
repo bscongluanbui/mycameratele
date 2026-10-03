@@ -1,0 +1,13 @@
+{
+  "_note": "Replace start/end with recording-list timestamps from Studio; these are not derivable from filename or media PTS.",
+  "recordings": [
+    {
+      "camera": "front",
+      "source": "studio-export",
+      "record_id": "clip-001",
+      "path": "clip-001.mp4",
+      "start_time": "REPLACE_WITH_STUDIO_START_ISO8601_OFFSET",
+      "end_time": "REPLACE_WITH_STUDIO_END_ISO8601_OFFSET"
+    }
+  ]
+}

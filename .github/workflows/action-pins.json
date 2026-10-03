@@ -1,0 +1,20 @@
+{
+  "verified_utc_date": "2026-10-03",
+  "method": "git ls-remote --tags https://github.com/ORG/REPO.git refs/tags/vMAJOR refs/tags/vMAJOR^{}; official repository only",
+  "pins": {
+    "actions/checkout@v7": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/setup-python@v7": "5fda3b95a4ea91299a34e894583c3862153e4b97",
+    "actions/setup-node@v7": "820762786026740c76f36085b0efc47a31fe5020",
+    "docker/setup-qemu-action@v4": "99012661954931238ded8c8b007157a8430204e1",
+    "docker/setup-buildx-action@v4": "f87e5991a6d7451dcb8d9637bfbc97413f497069",
+    "docker/login-action@v4": "dbcb813823bdd20940b903addbd779551569679f",
+    "docker/build-push-action@v7": "c3c9e263c25d99ce0380d002d59b67737d91b0dc",
+    "actions/upload-artifact@v7": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    "actions/download-artifact@v8": "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+  },
+  "sources": [
+    "https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images",
+    "https://docs.github.com/en/actions/reference/runners/github-hosted-runners",
+    "https://docs.docker.com/build/ci/github-actions/multi-platform/"
+  ]
+}
