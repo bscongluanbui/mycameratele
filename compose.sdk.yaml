@@ -4,7 +4,6 @@ services:
   archive:
     environment:
       HCNETSDK_DIR: /opt/hcnetsdk
-      LD_LIBRARY_PATH: /opt/hcnetsdk:/opt/hcnetsdk/HCNetSDKCom
     volumes:
       - type: bind
         source: ${HCNETSDK_HOST_DIR:?Set HCNETSDK_HOST_DIR to the official Linux SDK lib directory}

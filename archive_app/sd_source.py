@@ -578,6 +578,13 @@ class HCNetSDKSource:
         try:
             environment = dict(os.environ)
             environment['MYCAM_NATIVE_PARENT_PID'] = str(os.getpid())
+            # Vendor SSL/crypto belongs to the native child only. The parent
+            # Telegram client must keep its system SSL and CA trust paths.
+            sdk_dir=Path(environment.get('HCNETSDK_DIR','/opt/hcnetsdk')).resolve()
+            vendor_paths=[str(sdk_dir),str(sdk_dir/'HCNetSDKCom')]
+            inherited=environment.get('LD_LIBRARY_PATH')
+            if inherited:vendor_paths.append(inherited)
+            environment['LD_LIBRARY_PATH']=os.pathsep.join(vendor_paths)
             for name in list(environment):
                 if name.startswith('TELEGRAM_') or name in ('DASHBOARD_PASSWORD', 'DASHBOARD_TOKEN'):
                     environment.pop(name)
