@@ -55,11 +55,36 @@
     },
     cameraPatch(original, edited) {
       const patch = {};
-      for (const key of ["name", "model", "host", "device_port", "rtsp_port", "http_port", "enabled"]) {
+      for (const key of ["name", "model", "host", "device_port", "rtsp_port", "http_port", "enabled", "upload_enabled", "sd_backend", "sd_username", "sd_channel", "sd_timezone", "sd_lookback_hours"]) {
         if (edited[key] !== undefined && edited[key] !== original[key]) patch[key] = edited[key];
       }
+      if (typeof edited.sd_password === "string" && edited.sd_password) patch.sd_password = edited.sd_password;
+      if (edited.sd_password_clear === true) patch.sd_password_clear = true;
       return patch;
     },
+    uploadEnabled(camera) { return camera?.upload_enabled !== false; },
+    syncActive(job) { return !!job && ["queued", "running"].includes(job.state); },
+    syncState(job) {
+      const values = { queued: ["Đang chờ", "neutral"], running: ["Đang chạy", "blue"], completed: ["Hoàn tất", "green"], blocked: ["Cần xử lý", "amber"], failed: ["Lỗi", "red"] };
+      return values[job?.state] || ["Chưa Start", "neutral"];
+    },
+    syncPhase(job) {
+      const phases = { sd_search: "Tìm recording SD", sd_complete: "Đã xử lý SD", scanning: "Kiểm tra nguồn", finished: "Kết thúc", queued: "Hàng đợi", probing: "Kiểm tra đường đến camera", preflight: "Kiểm tra nguồn SD", sd_download: "Tải SD", downloading: "Tải SD", download: "Tải SD", ingesting: "Lập chỉ mục", ingest: "Lập chỉ mục", normalize: "Chuẩn hóa", uploading: "Upload Telegram", upload: "Upload Telegram", completed: "Kết thúc", done: "Kết thúc" };
+      return phases[job?.phase] || job?.phase || "—";
+    },
+    syncHelp(job) {
+      const code = String(job?.code || "");
+      if (code.includes("sdk_missing") || code.includes("sdk_not_configured")) return "Dùng compose.sdk.yaml và HCNETSDK_DIR để gắn SDK đúng kiến trúc vào /opt/hcnetsdk theo README, rồi Start lại. Cổng Device mở không đồng nghĩa SDK đã sẵn sàng.";
+      if (code.includes("source_missing") || code.includes("unsupported") || code.includes("isapi_unavailable")) return "Kiểm tra nguồn SD / HCNetSDK và tài khoản thiết bị. C6N có thể mở cổng Device 8000 nhưng không có ISAPI ở HTTP 80.";
+      if (code.includes("password") || code.includes("credential") || code.includes("auth")) return "Chỉnh sửa Camera → Nguồn video SD để kiểm tra tên đăng nhập thiết bị và mật khẩu / mã xác thực.";
+      if (code.includes("unreachable") || code.includes("connect") || code.includes("timeout") || code.includes("network")) return "Kiểm tra VPS nhận subnet route Tailscale từ Armbian và truy cập được IP LAN của camera. Camera không có HTTP / ISAPI cần SDK tương thích qua cổng Device.";
+      return "";
+    },
+    syncStatistics(job) {
+      const labels = { sd_searched: "Tìm thấy SD", sd_found: "Tìm thấy SD", sd_downloaded: "Đã tải SD", sd_imported: "Đã nhập SD", imported: "Đã nhập", uploaded: "Đã upload", pending: "Chờ upload", failed: "Lỗi", already_known: "Đã có" };
+      return Object.entries(job?.statistics || {}).filter(([key, value]) => labels[key] && typeof value === "number" && Number.isFinite(value) && value >= 0).map(([key, value]) => `${labels[key]}: ${value}`).join(" · ");
+    },
+    validSdPassword(password) { return typeof password === "string" && !password.includes("\0") && new TextEncoder().encode(password).length <= 64; },
     validUsername(value) { return typeof value === "string" && /^[A-Za-z0-9_.-]{3,64}$/.test(value); },
     accountValidation(values) {
       if (!helpers.validUsername(values.username)) return { field: "account-username", message: "Tên đăng nhập cần có 3–64 ký tự: chữ, số, dấu _, dấu . hoặc dấu -." };
@@ -74,7 +99,7 @@
   if (typeof document === "undefined") return;
 
   const $ = id => document.getElementById(id);
-  const state = { cameras: [], status: {}, csrf: "", probes: new Map(), calendar: [], offset: 0, limit: 25, total: 0, archiveRequest: 0, calendarRequest: 0, editing: null, view: "cameras", authenticated: false, sessionRevision: 0, account: null, accountRequired: false, loginBusy: false, accountBusy: false, logoutBusy: false };
+  const state = { cameras: [], status: {}, csrf: "", probes: new Map(), calendar: [], offset: 0, limit: 25, total: 0, archiveRequest: 0, calendarRequest: 0, editing: null, view: "cameras", authenticated: false, sessionRevision: 0, account: null, accountRequired: false, loginBusy: false, accountBusy: false, logoutBusy: false, sync: {jobs: [], latest: {}, worker_alive: false}, syncRequest: 0, syncTimer: null, syncBusy: new Set(), syncSummary: "" };
   let toastTimer;
   function node(tag, className, text) {
     const item = document.createElement(tag);
@@ -122,6 +147,7 @@
     if (field && $(field)) { $(field).setAttribute("aria-invalid", "true"); $(field).focus(); } else errorBox.focus();
   }
   function showLogin({ username = state.account?.username || "", message = "" } = {}) {
+    stopSyncPolling(); state.syncRequest++; state.sync = {jobs: [], latest: {}, worker_alive: false}; state.syncBusy.clear();
     state.authenticated = false; state.sessionRevision++; state.archiveRequest++; state.calendarRequest++;
     state.account = null; state.accountRequired = false; state.csrf = ""; state.cameras = []; state.status = {}; state.calendar = []; state.probes.clear();
     $("app-shell").hidden = true; $("account-screen").hidden = true; $("boot-loading").hidden = true; $("login-screen").hidden = false;
@@ -132,6 +158,7 @@
     (username ? $("login-password") : $("login-username")).focus();
   }
   function showAccount(account, required = !!account?.password_change_required) {
+    stopSyncPolling(); state.syncRequest++;
     state.account = account; state.accountRequired = required; state.archiveRequest++; state.calendarRequest++;
     $("app-shell").hidden = true; $("login-screen").hidden = true; $("boot-loading").hidden = true; $("account-screen").hidden = false;
     if ($("camera-dialog").open) $("camera-dialog").close();
@@ -207,6 +234,8 @@
     return open ? [`${open}/${values.length} cổng mở`, "green"] : ["Chưa thấy cổng mở", "amber"];
   }
   function renderCameras() {
+    const focused = document.activeElement;
+    const focusKey = focused?.dataset?.cameraStart ? ["cameraStart", focused.dataset.cameraStart] : focused?.dataset?.cameraUpload ? ["cameraUpload", focused.dataset.cameraUpload] : null;
     const query = $("camera-search").value.toLocaleLowerCase("vi-VN").trim();
     const cameras = state.cameras.filter(camera => [camera.name, camera.id, camera.model, camera.host].some(value => String(value || "").toLocaleLowerCase("vi-VN").includes(query)));
     $("camera-grid").replaceChildren(); $("camera-empty").hidden = state.cameras.length > 0; $("camera-no-match").hidden = !state.cameras.length || cameras.length > 0;
@@ -219,12 +248,99 @@
       info.append(infoRow("Địa chỉ LAN", camera.host || "Chưa khai báo", true), infoRow("Mã camera", camera.id, true), infoRow("Kết nối", chip(...summary)), infoRow("Cấu hình", chip(camera.enabled === false ? "Đã tạm dừng" : "Đang bật", camera.enabled === false ? "neutral" : "green")));
       const total = helpers.cameraCount(camera, "total"), uploaded = helpers.cameraCount(camera, "uploaded");
       info.append(infoRow("Video / Đã lưu", `${displayCount(total)} / ${displayCount(uploaded)}`));
+      const job = state.sync.latest?.[camera.id] || camera.sync;
+      info.append(infoRow("Đồng bộ", chip(...helpers.syncState(job))));
+      const syncDetail = node("div", "camera-sync-detail");
+      if (job) {
+        syncDetail.append(node("p", "sync-phase", helpers.syncPhase(job)), node("p", "small muted", job.message || ""));
+        if (job.code) syncDetail.append(node("code", "sync-code", job.code));
+        if (helpers.syncHelp(job)) syncDetail.append(node("p", "field-hint", helpers.syncHelp(job)));
+        if (helpers.syncStatistics(job)) syncDetail.append(node("p", "field-hint", helpers.syncStatistics(job)));
+      } else syncDetail.append(node("p", "small muted", "Chưa có công việc sync. Bấm Start để gửi vào worker."));
+      const upload = node("button", "upload-switch"); upload.type = "button"; upload.setAttribute("role", "switch");
+      upload.setAttribute("aria-checked", String(helpers.uploadEnabled(camera))); upload.setAttribute("aria-label", `Upload Telegram cho ${camera.name || camera.id}`);
+      upload.dataset.cameraUpload = camera.id; upload.disabled = state.syncBusy.has("upload:" + camera.id);
+      upload.append(node("span", "switch-track"), node("span", "", `Upload ${helpers.uploadEnabled(camera) ? "ON" : "OFF"}`));
+      upload.addEventListener("click", () => toggleUpload(camera, upload));
+      const uploadBox = node("div", "camera-upload-control"); uploadBox.append(upload, node("p", "field-hint", "OFF chỉ dừng upload; tải SD vẫn tiếp tục."));
       const actions = node("div", "camera-card-bottom");
+      const start = button(helpers.syncActive(job) ? "Đã xếp hàng" : "Start sync", "primary", () => startSync(camera.id, start), "network");
+      start.dataset.cameraStart = camera.id; start.disabled = camera.enabled === false || helpers.syncActive(job) || state.syncBusy.has(camera.id);
+      start.setAttribute("aria-label", `Start sync ${camera.name || camera.id}`); actions.append(start);
       actions.append(button("Thư viện", "primary", () => openCameraArchive(camera.id), "folder"), button("Chỉnh sửa", "ghost", () => openCameraForm(camera), "edit"));
       const probeButton = button("Kiểm tra LAN", "ghost", () => probeCamera(camera, probeButton), "network"); actions.append(probeButton);
-      card.append(top, info, actions); $("camera-grid").append(card);
+      card.append(top, info, syncDetail, uploadBox, actions); $("camera-grid").append(card);
     }
     renderStats();
+    $("start-all-button").disabled = !state.cameras.some(camera => camera.enabled !== false) || state.syncBusy.has("all");
+    if (focusKey) for (const control of $("camera-grid").querySelectorAll("button")) { if (control.dataset[focusKey[0]] === focusKey[1] && !control.disabled) { control.focus({preventScroll: true}); break; } }
+  }
+  function stopSyncPolling() { if (state.syncTimer !== null) clearTimeout(state.syncTimer); state.syncTimer = null; }
+  function scheduleSyncPolling() {
+    stopSyncPolling();
+    if (!state.authenticated || state.accountRequired || !$("account-screen").hidden) return;
+    const active = Object.values(state.sync.latest || {}).some(helpers.syncActive);
+    state.syncTimer = setTimeout(() => { state.syncTimer = null; loadSync(); }, active ? 2500 : 15000);
+  }
+  function renderSync() {
+    const jobs = Array.isArray(state.sync.jobs) ? state.sync.jobs : [];
+    const active = Object.values(state.sync.latest || {}).filter(helpers.syncActive).length;
+    const blocked = Object.values(state.sync.latest || {}).filter(job => ["blocked", "failed"].includes(job.state)).length;
+    const summary = active ? `${active} camera đang chờ hoặc chạy sync. Tiến trình tự cập nhật.` : blocked ? `${blocked} camera cần xử lý. Xem mã và hướng dẫn ở tiến trình bên dưới.` : "Không có sync đang chạy. Start để đồng bộ camera.";
+    if (summary !== state.syncSummary) { state.syncSummary = summary; $("sync-summary").textContent = summary; }
+    $("sync-worker-status").textContent = state.sync.worker_alive ? "Worker hoạt động" : "Chưa thấy heartbeat worker";
+    $("sync-worker-status").className = `status-chip ${state.sync.worker_alive ? "green" : "amber"}`;
+    const target = $("sync-jobs"); target.replaceChildren();
+    for (const job of jobs.slice(0, 6)) {
+      const item = node("article", "sync-job"), top = node("div", "sync-job-heading");
+      top.append(node("strong", "", job.camera_name || cameraName(job.camera_id)), chip(...helpers.syncState(job))); item.append(top);
+      item.append(node("p", "sync-phase", helpers.syncPhase(job)), node("p", "small muted", job.message || ""));
+      if (job.code) item.append(node("code", "sync-code", job.code));
+      if (helpers.syncHelp(job)) item.append(node("p", "field-hint", helpers.syncHelp(job)));
+      if (helpers.syncStatistics(job)) item.append(node("p", "field-hint", helpers.syncStatistics(job)));
+      target.append(item);
+    }
+    if (!jobs.length) target.append(node("p", "small muted", "Chưa có lịch sử sync. Thêm camera tự tạo công việc đầu tiên."));
+  }
+  async function loadSync() {
+    if (!state.authenticated || state.accountRequired || !$("account-screen").hidden) return;
+    const revision = state.sessionRevision, request = ++state.syncRequest;
+    try {
+      const result = await api("/api/sync?limit=20");
+      if (!state.authenticated || state.accountRequired || revision !== state.sessionRevision || request !== state.syncRequest || !$("account-screen").hidden) return;
+      const previous = JSON.stringify(Object.values(state.sync.latest || {}).map(job => [job.id, job.state, job.statistics]));
+      state.sync = { jobs: Array.isArray(result.jobs) ? result.jobs : [], latest: result.latest || {}, worker_alive: result.worker_alive === true };
+      $("sync-error").hidden = true; renderSync(); renderCameras();
+      const next = JSON.stringify(Object.values(state.sync.latest).map(job => [job.id, job.state, job.statistics]));
+      if (previous !== next && state.sync.jobs.length && !Object.values(state.sync.latest).some(helpers.syncActive)) await refresh();
+    } catch (error) {
+      if (revision === state.sessionRevision && error.httpStatus !== 401 && error.code !== "password_change_required") { $("sync-error").textContent = error.message; $("sync-error").hidden = false; }
+    } finally { if (revision === state.sessionRevision && request === state.syncRequest) scheduleSyncPolling(); }
+  }
+  async function startSync(cameraId = null, control = $("start-all-button")) {
+    if (!state.authenticated || state.accountRequired) return;
+    const key = cameraId || "all", revision = state.sessionRevision;
+    if (state.syncBusy.has(key)) return;
+    state.syncBusy.add(key); control.disabled = true;
+    try {
+      const result = await api("/api/sync", { method: "POST", body: { camera_id: cameraId } });
+      if (!state.authenticated || revision !== state.sessionRevision) return;
+      const count = Array.isArray(result.jobs) ? result.jobs.length : 0;
+      toast(`Đã tiếp nhận Start cho ${count} camera. Theo dõi tiến trình đồng bộ.`); await loadSync();
+    } catch (error) { if (revision === state.sessionRevision && error.httpStatus !== 401) toast(error.message, true); }
+    finally { state.syncBusy.delete(key); if (revision === state.sessionRevision) { control.disabled = false; renderCameras(); } }
+  }
+  async function toggleUpload(camera, control) {
+    if (!state.authenticated || state.accountRequired) return;
+    const key = "upload:" + camera.id, revision = state.sessionRevision;
+    if (state.syncBusy.has(key)) return;
+    state.syncBusy.add(key); control.disabled = true;
+    try {
+      await api(`/api/cameras/${encodeURIComponent(camera.id)}`, { method: "PATCH", body: { upload_enabled: !helpers.uploadEnabled(camera) } });
+      if (!state.authenticated || revision !== state.sessionRevision) return;
+      toast(`Upload ${!helpers.uploadEnabled(camera) ? "ON" : "OFF"} cho ${camera.name || camera.id}. Tải SD không bị tạm dừng.`); await refresh();
+    } catch (error) { if (revision === state.sessionRevision && error.httpStatus !== 401) toast(error.message, true); }
+    finally { state.syncBusy.delete(key); if (revision === state.sessionRevision) renderCameras(); }
   }
   function option(value, label) { const item = node("option", "", label); item.value = String(value); return item; }
   function refreshCameraOptions() {
@@ -250,12 +366,9 @@
     ];
     $("system-details").replaceChildren();
     for (const [label, value] of details) { const row = node("div"); row.append(node("dt", "", label), node("dd", "", typeof value === "object" ? "Có dữ liệu" : value)); $("system-details").append(row); }
-    const adapter = typeof status.sd_adapter === "object" ? (status.sd_adapter.status || status.sd_adapter.name || "not_implemented") : String(status.sd_adapter || "not_implemented");
-    const noAutomaticDownload = status.sd_auto_download === "not_implemented" || ["not_implemented", "none", "", "exported-file-ingest"].includes(adapter);
-    $("system-sd-status").textContent = noAutomaticDownload ? "Chưa triển khai tải SD" : "Cần kiểm chứng thiết bị";
-    $("system-sd-description").textContent = noAutomaticDownload
-      ? "Bộ tải lịch sử SD trực tiếp chưa được triển khai. Hiện hệ thống xử lý video đã xuất từ Studio; thêm camera không tự tạo bộ tải SD."
-      : `Adapter: ${adapter}. Kết quả TCP không xác nhận khả năng đọc hoặc tải lịch sử SD.`;
+    const adapter = typeof status.sd_adapter === "object" ? (status.sd_adapter.status || status.sd_adapter.name || "auto") : String(status.sd_adapter || "auto");
+    $("system-sd-status").textContent = "Theo dõi tiến trình sync";
+    $("system-sd-description").textContent = `Nguồn SD: ${adapter}. Worker chọn ISAPI hoặc HCNetSDK theo cấu hình camera. HCNetSDK cần compose.sdk.yaml / HCNETSDK_DIR và SDK đúng kiến trúc tại /opt/hcnetsdk. VPS cần route camera LAN qua Tailscale / Armbian; cổng mở không xác nhận đã tải được SD.`;
     renderProbes();
   }
   function renderProbes() {
@@ -284,6 +397,7 @@
       state.status = status; state.csrf = status.csrf_token || state.csrf; state.cameras = Array.isArray(response.cameras) ? response.cameras : [];
       $("boot-loading").hidden = true; $("login-screen").hidden = true; if ($("account-screen").hidden) $("app-shell").hidden = false;
       renderCameras(); refreshCameraOptions(); renderSystem();
+      await loadSync();
       if (state.view === "archive") { await loadCalendar(true); await loadArchive(); }
     } catch (error) {
       if (error.httpStatus !== 401 && error.code !== "password_change_required") {
@@ -318,15 +432,25 @@
     $("camera-name").value = camera?.name || ""; $("camera-model").value = camera?.model || ""; $("camera-host").value = camera?.host || "";
     for (const [name, fallback] of [["device_port", 8000], ["rtsp_port", 554], ["http_port", 80]]) $("camera-" + name.replaceAll("_", "-")).value = camera?.[name] || fallback;
     $("camera-enabled").checked = camera?.enabled !== false;
+    $("camera-upload-enabled").checked = helpers.uploadEnabled(camera);
+    $("camera-sd-backend").value = camera?.sd_backend || "auto"; $("camera-sd-username").value = camera?.sd_username || "admin";
+    $("camera-sd-channel").value = camera?.sd_channel || 1; $("camera-sd-timezone").value = camera?.sd_timezone || "Asia/Ho_Chi_Minh"; $("camera-sd-lookback").value = camera?.sd_lookback_hours || 168;
+    $("camera-sd-password").value = ""; $("camera-sd-password-clear").checked = false; $("camera-sd-clear-control").hidden = !camera?.sd_password_configured;
+    $("camera-sd-password-hint").textContent = camera?.sd_password_configured ? "Đã có mật khẩu thiết bị. Để trống sẽ giữ nguyên; mật khẩu hiện có không hiển thị." : "Chưa lưu mật khẩu thiết bị. Nhập mật khẩu / mã xác thực của camera để thử tải SD.";
     $("camera-dialog").showModal(); (camera ? $("camera-name") : $("camera-id")).focus();
   }
   async function saveCamera(event) {
     event.preventDefault(); if (!$("camera-form").reportValidity()) return;
     const values = new FormData($("camera-form"));
-    const data = { id: String(values.get("id") || "").trim(), name: String(values.get("name") || "").trim(), model: String(values.get("model") || "").trim(), host: String(values.get("host") || "").trim(), enabled: $("camera-enabled").checked };
+    const data = { id: String(values.get("id") || "").trim(), name: String(values.get("name") || "").trim(), model: String(values.get("model") || "").trim(), host: String(values.get("host") || "").trim(), enabled: $("camera-enabled").checked, upload_enabled: $("camera-upload-enabled").checked,
+      sd_backend: $("camera-sd-backend").value, sd_username: $("camera-sd-username").value.trim(), sd_channel: Number($("camera-sd-channel").value), sd_timezone: $("camera-sd-timezone").value.trim(), sd_lookback_hours: Number($("camera-sd-lookback").value) };
+    if ($("camera-sd-password").value) data.sd_password = $("camera-sd-password").value;
+    if ($("camera-sd-password-clear").checked) data.sd_password_clear = true;
     for (const name of ["device_port", "rtsp_port", "http_port"]) data[name] = Number(values.get(name));
     const errorBox = $("camera-form-error"); errorBox.hidden = true;
     if (!data.name || !helpers.validHost(data.host)) { errorBox.textContent = !data.name ? "Nhập tên hiển thị cho camera." : "Địa chỉ LAN cần là IPv4 hợp lệ hoặc hostname, không có http://, đường dẫn hay mật khẩu."; errorBox.hidden = false; errorBox.focus(); return; }
+    if (data.sd_password && data.sd_password_clear) { errorBox.textContent = "Chọn nhập mật khẩu mới hoặc xóa mật khẩu đã lưu, không chọn cả hai."; errorBox.hidden = false; errorBox.focus(); return; }
+    if (data.sd_password && !helpers.validSdPassword(data.sd_password)) { errorBox.textContent = "Mật khẩu thiết bị cần dài tối đa 64 byte UTF-8 và không chứa ký tự NUL."; errorBox.hidden = false; $("camera-sd-password").focus(); return; }
     $("save-camera-button").disabled = true;
     try {
       const wasEditing = !!state.editing;
@@ -338,7 +462,7 @@
         if (["host", "device_port", "rtsp_port", "http_port"].some(key => key in patch)) state.probes.delete(state.editing);
       }
       else await api("/api/cameras", { method: "POST", body: data });
-      $("camera-dialog").close(); await refresh(); toast(wasEditing ? "Đã cập nhật camera. Mã và lịch sử video được giữ nguyên." : "Đã thêm camera. Chọn “Kiểm tra LAN” để xem phản hồi cổng.");
+      $("camera-sd-password").value = ""; $("camera-dialog").close(); await refresh(); toast(wasEditing ? "Đã cập nhật camera. Mã và lịch sử video được giữ nguyên." : data.enabled ? "Đã thêm camera và gửi Start vào hàng đợi. Theo dõi tiến trình đồng bộ." : "Đã thêm camera ở trạng thái tạm dừng. Bật camera trước khi Start.");
     } catch (error) { errorBox.textContent = error.message; errorBox.hidden = false; errorBox.focus(); }
     finally { $("save-camera-button").disabled = false; }
   }
@@ -448,7 +572,7 @@
   });
   $("account-cancel").addEventListener("click", () => {
     if (state.accountRequired || state.accountBusy) return;
-    clearPasswords($("account-form")); $("account-screen").hidden = true; $("app-shell").hidden = false; $("account-button").focus();
+    clearPasswords($("account-form")); $("account-screen").hidden = true; $("app-shell").hidden = false; $("account-button").focus(); loadSync();
   });
   $("account-form").addEventListener("submit", async event => {
     event.preventDefault(); if (state.accountBusy) return;
@@ -467,6 +591,7 @@
     } finally { state.accountBusy = false; $("account-save").disabled = false; $("account-cancel").disabled = false; $("account-logout").disabled = false; form.removeAttribute("aria-busy"); $("account-status").hidden = true; }
   });
   $("refresh-button").addEventListener("click", refresh); $("camera-search").addEventListener("input", renderCameras);
+  $("start-all-button").addEventListener("click", () => startSync());
   async function logout() {
     if (state.logoutBusy) return;
     state.logoutBusy = true; $("logout-button").disabled = true; $("account-logout").disabled = true;
@@ -476,7 +601,8 @@
   }
   $("logout-button").addEventListener("click", logout); $("account-logout").addEventListener("click", logout);
   $("add-camera-button").addEventListener("click", () => openCameraForm()); $("empty-add-camera").addEventListener("click", () => openCameraForm());
-  for (const id of ["close-camera-dialog", "cancel-camera-dialog"]) $(id).addEventListener("click", () => $("camera-dialog").close());
+  for (const id of ["close-camera-dialog", "cancel-camera-dialog"]) $(id).addEventListener("click", () => { $("camera-sd-password").value = ""; $("camera-dialog").close(); });
+  $("camera-dialog").addEventListener("close", () => { $("camera-sd-password").value = ""; });
   $("camera-form").addEventListener("submit", saveCamera);
   $("archive-filters").addEventListener("submit", event => event.preventDefault());
   $("filter-camera").addEventListener("change", async () => { state.offset = 0; try { await loadCalendar(false); await loadArchive(); } catch (error) { globalError(error.message); } });

@@ -5,17 +5,19 @@ cho phép duyệt lại lịch sử ngay trong private chat riêng của mỗi n
 Không cần channel/group. SQLite là mục lục, Telegram chứa media, bot là browser.
 
 ```text
-MP4 xuất từ EZVIZ Studio + thời gian ghi hình
-  → input / manifest → kiểm tra media, remux không transcode
-  → cache + SQLite → upload một lần vào private chat owner
+Camera SD → lịch quét tự động / Start sync
+  → HCNetSDK native hoặc ISAPI của thiết bị → download file đã đóng
+  → kiểm tra media, remux MP4 → cache + SQLite → private chat owner
   → Camera → Năm → Tháng → Ngày → Video
   → phát lại bằng file_id trong private chat của người được cho phép
 ```
 
-**Downloader lịch sử SD trực tiếp từ camera vẫn chưa được triển khai.** Luồng
-hiện có nhận file xuất bằng Studio; thêm camera/probe TCP/RTSP live không chứng
-minh đã tải được recording trên SD. Tài liệu này mô tả phiên bản có private-chat
-flow; sửa source tại máy local không tự cập nhật image `latest` trên GHCR.
+**Lấy SD có điều kiện theo giao thức thực tế của camera, không theo tên model.**
+Adapter native dùng Linux HCNetSDK chính thức, đúng kiến trúc máy chạy Docker;
+ISAPI dùng Digest và chỉ chấp nhận kết quả search recording thật. Thư viện SDK
+không đi kèm image; xem mục 2. Các model C6N/H6c và firmware đã cung cấp **chưa
+được kiểm thử download trên thiết bị thật**. Cổng mở / RTSP live không chứng minh
+đã truy cập được SD. MP4/manifest xuất từ Studio vẫn là nguồn nhập tùy chọn.
 
 ## 1. Cài đặt trên Ubuntu / Armbian
 
@@ -107,11 +109,86 @@ Nếu dùng local Bot API, giữ cả hai file Compose và profile trong lệnh 
 như mục production bên dưới. Thay đổi tài khoản dashboard không đổi token bot,
 allowlist, camera hay kho video. Backup toàn bộ volume `/data` giữ cả tài khoản.
 
-## 2. Thêm camera và nhập recording
+## 2. Camera SD tự động, Start sync và công tắc upload
 
-Trên dashboard, tạo mã camera ổn định, tên hiển thị, model, địa chỉ LAN và các
-cổng. Đổi tên không đổi mã/lịch sử; manifest dùng mã, không dùng tên hiển thị.
-Camera từ manifest cũ có thể tự đăng ký. Kiểm tra LAN chỉ kiểm tra TCP.
+Dashboard cho thêm camera, đổi tên, địa chỉ, cổng và thông tin SD:
+
+- **Username thiết bị** (thường `admin`) và **mật khẩu thiết bị / mã xác thực**:
+  điền trực tiếp trong form, không phải mật khẩu tài khoản EZVIZ cloud.
+  Edit để trống giữ mật khẩu cũ; lựa chọn xóa riêng để xóa credential.
+  API không trả lại mật khẩu; file secret nằm trong volume `/data`, quyền 0600.
+- Backend `auto`: ưu tiên native HCNetSDK khi đã mount SDK; nếu SDK chưa có thì
+  thử ISAPI. Chọn `hcnetsdk` để dùng cổng thiết bị 8000; `isapi` dùng HTTP port.
+- Channel thường 1, timezone `Asia/Ho_Chi_Minh`, lookback mặc định 168 giờ,
+  tối đa 720 giờ. Chỉ nhập clip đã kết thúc ít nhất 2 phút; không ghi RTSP live.
+- **Bật camera** điều khiển lấy nguồn + upload. **Upload Telegram** riêng từng
+  camera mặc định bật (kể cả camera cũ khi nâng cấp); tắt chỉ ngừng upload,
+  vẫn tải/kiểm tra video về cache. Bật lại dùng Start sync để đẩy phần còn chờ.
+- **Start all** tạo job cho camera đang bật. **Start sync** ở mỗi card chỉ chạy
+  camera đó. Thêm camera đang bật tự xếp job lần đầu. Job lưu trong SQLite,
+  chống trùng, tiếp tục kiểm tra sau restart; không tự gửi lại upload mơ hồ.
+- Worker tự tạo job mỗi `SD_SYNC_INTERVAL_SECONDS=300` giây. Nút Start bỏ qua
+  thời gian chờ này; dashboard/bot chỉ xếp job, worker xử lý tải và upload.
+- Telegram có `/sync`, nút **Start sync** ở menu chính và từng mục camera,
+  công tắc upload và nút cập nhật trạng thái. Allowlist được kiểm tra trước
+  thao tác; các gate owner `/start` và `ENABLE_UPLOAD=true` vẫn giữ nguyên.
+
+Trạng thái hiển thị đang xếp hàng / kiểm tra / tải SD / upload / hoàn tất hoặc
+lý do dừng. Không có worker heartbeat thì job vẫn queued; xem `docker compose
+ps` và logs worker. Thiếu credential, SDK, tuyến mạng, giao thức không hỗ trợ,
+file chưa đóng, cache đầy, Telegram chưa cấu hình đều phải hiện rõ, không giả
+báo thành công. Nếu search SD thực sự trả 0 clip, job ghi nhận kết quả rỗng.
+
+### Native HCNetSDK trong Docker
+
+Lấy **Device Network SDK for Linux** từ
+[Hikvision SDK](https://www.hikvision.com/en/support/download/sdk/), đúng CPU
+**máy chạy container** (VPS x86_64 cần Linux64 x86_64; Armbian aarch64 cần
+Linux ARM64). Trang catalogue Linux64 không tự chứng minh hỗ trợ ARM64;
+[portal SDK của hãng](https://open.hikvision.com/download/5cda567cf47ae80dd41a54b3?type=20)
+có thể cần đăng nhập để lấy gói đúng kiến trúc. Hiện chưa có binary ARM64
+được kiểm chứng hoặc bundle trong image. Không dùng DLL Windows từ EZVIZ Studio, không dùng SDK ARM64
+trên VPS x86. Giữ đủ thư mục lib, `HCNetSDKCom` và dependency của gói chính thức.
+Nếu hãng không cung cấp gói đúng kiến trúc, native backend báo thiếu/incompatible;
+ISAPI chỉ hoạt động nếu firmware thực sự có endpoint recording tương ứng.
+
+```bash
+# Đặt .so và HCNetSDKCom từ SDK chính thức vào một thư mục trên Docker HOST.
+# .env: HCNETSDK_HOST_DIR=/absolute/path/to/official-sdk/lib
+# Để VPS chấp nhận subnet route Armbian đã advertise/approve:
+sudo tailscale set --accept-routes=true
+
+docker compose -f compose.yaml -f compose.sdk.yaml pull archive dashboard
+docker compose -f compose.yaml -f compose.sdk.yaml up -d archive dashboard
+```
+
+Với Local Bot API, giữ thêm `-f compose.local.yaml --profile local-api` trong
+các lệnh trên. SDK chỉ mount vào worker, read-only; `/input` vẫn read-only,
+download SD dùng `/cache/sd-stage`, không ghi vào thư mục Studio nguồn.
+Sau lần cài SDK đầu, các lần update chỉ pull/up với cùng tập file Compose.
+
+### VPS → Tailscale → Armbian → LAN camera
+
+Armbian advertise `192.168.31.0/24`, route đã approve và ACL/grants cho phép VPS
+đến camera. VPS Linux phải accept routes. Đây là các bước theo
+[Tailscale subnet routers](https://tailscale.com/docs/features/subnet-routers).
+Docker dùng network bridge mặc định; kiểm tra từ **worker container**, không chỉ
+ping từ VPS. Không mở camera port ra Internet.
+
+```bash
+docker compose exec -T archive python -c "import socket; s=socket.create_connection(('192.168.31.166',8000),5); s.close(); print('C6N device port reachable')"
+docker compose exec -T archive python -c "import socket; s=socket.create_connection(('192.168.31.137',8000),5); s.close(); print('H6c device port reachable')"
+```
+
+Các lệnh TCP này chỉ kiểm tra tuyến mạng. Sau đó nhập credential tại dashboard,
+Start từng camera và đối chiếu `searched/downloaded/imported/uploaded` cùng
+thời gian clip thật. Mã lỗi SDK/API chưa xác nhận tương thích phải được giữ lại.
+Không chuyển sang quay live RTSP để thay thế video cũ trên SD.
+
+### Nguồn Studio tùy chọn
+
+Mã camera ổn định, tên hiển thị đổi được mà không đổi mã/lịch sử; manifest dùng
+mã, không dùng tên. Camera từ manifest cũ có thể tự đăng ký.
 
 Xuất recording bằng Studio, copy MP4 vào `input`, lấy đúng Start Time/End Time
 của dòng đã xuất rồi tạo `input/manifest.json`:

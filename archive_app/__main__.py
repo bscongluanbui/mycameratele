@@ -11,6 +11,7 @@ import time
 
 from .core import Archive, Settings
 from .telegram import Telegram
+from .sync import SyncQueue
 
 
 def emit(event, **data):
@@ -33,7 +34,7 @@ def mutation_lock(settings):
 
 
 def main():
-    parser=argparse.ArgumentParser(description='Portable exported SD clip ingest and Telegram archive; native SD downloader pending.')
+    parser=argparse.ArgumentParser(description='Camera SD sync, exported clip ingest and private Telegram archive.')
     subs=parser.add_subparsers(dest='command',required=True)
     doctor=subs.add_parser('doctor');doctor.add_argument('--network',action='store_true')
     dashboard=subs.add_parser('dashboard');dashboard.add_argument('--host',default=os.environ.get('DASHBOARD_HOST','0.0.0.0'));dashboard.add_argument('--port',type=int,default=int(os.environ.get('DASHBOARD_PORT','8080')))
@@ -48,10 +49,10 @@ def main():
     settings=Settings.from_env()
     if args.command=='dashboard':
         from .dashboard import serve
-        emit('dashboard_started',port=args.port,sd_auto_download='not_implemented')
+        emit('dashboard_started',port=args.port,sd_auto_download='configured_per_camera')
         serve(settings,args.host,args.port);return 0
     if args.command=='doctor':
-        data={'machine':platform.machine(),'sd_adapter':'exported-file-ingest','automatic_sd_download':'not_implemented',
+        data={'machine':platform.machine(),'sd_adapter':'per-camera-native-or-isapi','automatic_sd_download':'requires_device_credentials_and_compatible_backend',
               'input_dir':str(settings.input_dir),'upload_enabled':settings.enable_upload,'api_mode':settings.api_mode,
               'telegram_destination':'owner_private_chat','owner_configured':bool(settings.effective_owner),
               'allowed_users_count':len(settings.allowed_users)}
@@ -103,6 +104,16 @@ def main():
             running=False
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
         archive.recover_uploads()
+        recovered_ingests=archive.recover_ingests()
+        if recovered_ingests:emit('ingests_recovered',recordings=recovered_ingests)
+        from .sd_source import recover_staging
+        recovered=recover_staging(archive)
+        if recovered:emit('sd_staging_recovered',files=recovered)
+        sync=SyncQueue(archive)
+        sync.recover()  # The exclusive worker lock above prevents two runners.
+        sync_interval=int(os.environ.get('SD_SYNC_INTERVAL_SECONDS','300'))
+        if not 30<=sync_interval<=86400:raise ValueError('SD_SYNC_INTERVAL_SECONDS must be between 30 and 86400')
+        next_sync=0.0
         heartbeat_stop=threading.Event()
         def heartbeat():
             while not heartbeat_stop.is_set():
@@ -127,6 +138,15 @@ def main():
         poll_thread.start()
         emit('started',**archive.status())
         while running:
+            if time.monotonic()>=next_sync:
+                try:
+                    queued=sync.enqueue(source='automatic')
+                    if queued['jobs']:emit('sync_scheduled',cameras=len(queued['jobs']))
+                except Exception as exc:emit('sync_schedule_error',error_type=type(exc).__name__)
+                next_sync=time.monotonic()+sync_interval
+            try:
+                if sync.run_once(telegram):emit('sync_job_finished')
+            except Exception as exc:emit('sync_error',error_type=type(exc).__name__)
             try:
                 if archive.backup_daily():emit('backup',result='created',retention_days=7)
             except Exception as exc:emit('backup_error',error_type=type(exc).__name__)
@@ -145,6 +165,7 @@ def main():
                     except Exception as exc:emit('cleanup_error',error_type=type(exc).__name__)
             for _ in range(settings.interval):
                 if not running:break
+                if archive.conn.execute("SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1").fetchone():break
                 time.sleep(1)
         heartbeat_stop.set();heartbeat_thread.join(timeout=11);poll_thread.join(timeout=36)
         emit('stopped');return 0

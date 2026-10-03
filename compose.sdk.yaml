@@ -1,0 +1,14 @@
+# Official Linux HCNetSDK only, matching the CPU/userland of the Docker HOST.
+# Keep the complete SDK lib directory incl HCNetSDKCom/dependencies.
+services:
+  archive:
+    environment:
+      HCNETSDK_DIR: /opt/hcnetsdk
+      LD_LIBRARY_PATH: /opt/hcnetsdk:/opt/hcnetsdk/HCNetSDKCom
+    volumes:
+      - type: bind
+        source: ${HCNETSDK_HOST_DIR:?Set HCNETSDK_HOST_DIR to the official Linux SDK lib directory}
+        target: /opt/hcnetsdk
+        read_only: true
+        bind:
+          create_host_path: false

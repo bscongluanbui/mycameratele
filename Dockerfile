@@ -4,7 +4,7 @@ ARG PYTHON_IMAGE=python:3.12-slim-bookworm
 FROM ${PYTHON_IMAGE} AS runtime
 
 LABEL org.opencontainers.image.title="mycameratele" \
-    org.opencontainers.image.description="Camera archive dashboard and Telegram calendar; exported-file ingest" \
+    org.opencontainers.image.description="Camera archive dashboard and Telegram calendar; SD sync controls and exported-file ingest" \
     org.opencontainers.image.source="https://github.com/bscongluanbui/mycameratele"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

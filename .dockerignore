@@ -26,3 +26,8 @@ dist
 *.sqlite*
 VERIFICATION.txt
 ROLLBACK.sh
+
+sdk
+sdk/**
+tests/.tmp*
+tests/.tmp*/**

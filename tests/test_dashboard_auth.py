@@ -171,7 +171,7 @@ class DashboardAuthHTTPTests(AuthFixture):
                              'new_password': 'synthetic-password-123', **changes})
 
     def test_public_health_assets_and_unauthenticated_private_endpoints(self):
-        self.assertEqual(self.request('GET', '/healthz')[1]['version'], '2.3')
+        self.assertEqual(self.request('GET', '/healthz')[1]['version'], '2.4')
         self.assertEqual(self.request('GET', '/')[0], 200)
         for path in ['/api/account', '/api/status', '/api/cameras', '/api/archive']:
             with self.subTest(path=path):

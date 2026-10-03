@@ -39,3 +39,7 @@ dist/
 VERIFICATION.txt
 DIFF_FILE.json
 ROLLBACK.sh
+
+# Official SDK bundles and isolated test fixtures are not source.
+sdk/
+tests/.tmp*/

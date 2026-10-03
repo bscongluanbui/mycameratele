@@ -201,7 +201,7 @@ class PrivateCoreTests(unittest.TestCase):
         self.assertFalse(status['owner_started'])
         self.assertEqual(status['allowed_users_count'], 1)
         self.assertEqual(status['cache_retention_hours'], 24)
-        self.assertEqual(status['version'], '2.2')
+        self.assertEqual(status['version'], '2.4')
         self.archive.state('telegram_owner_started:42', '1')
         self.assertTrue(self.archive.status()['owner_started'])
         for name in ('owner_user_id', 'chat_id', 'file_id', 'file_unique_id', 'token'):

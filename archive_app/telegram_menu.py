@@ -34,6 +34,7 @@ class TimeMenus:
     def commands():
         """Commands for Telegram's persistent Menu button (setMyCommands)."""
         return [
+            {'command': 'sync', 'description': 'Start sync tất cả camera đang bật'},
             {'command': 'today', 'description': 'Hôm nay → chọn Camera → video'},
             {'command': 'yesterday', 'description': 'Hôm qua → chọn Camera → video'},
             {'command': 'last6h', 'description': '6 giờ trước → chọn Camera → video'},

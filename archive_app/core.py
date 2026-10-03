@@ -242,6 +242,15 @@ class Archive:
                                ('deleted_at', 'REAL'), ('deleted_by', 'INTEGER')):
                 if name not in columns:
                     self.conn.execute(f'ALTER TABLE recordings ADD COLUMN {name} {kind}')
+            camera_columns = {row[1] for row in self.conn.execute('PRAGMA table_info(cameras)')}
+            for name, kind in (('upload_enabled','INTEGER NOT NULL DEFAULT 1'),
+                               ('sd_backend',"TEXT NOT NULL DEFAULT 'auto'"),
+                               ('sd_username',"TEXT NOT NULL DEFAULT 'admin'"),
+                               ('sd_channel','INTEGER NOT NULL DEFAULT 1'),
+                               ('sd_timezone',"TEXT NOT NULL DEFAULT 'Asia/Ho_Chi_Minh'"),
+                               ('sd_lookback_hours','INTEGER NOT NULL DEFAULT 168')):
+                if name not in camera_columns:
+                    self.conn.execute(f'ALTER TABLE cameras ADD COLUMN {name} {kind}')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS recording_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, recording_key TEXT NOT NULL,
                 actor INTEGER NOT NULL, action TEXT NOT NULL CHECK(action IN ('delete','restore')),
@@ -264,22 +273,47 @@ class Archive:
 
     @staticmethod
     def _camera_fields(data, partial=False):
-        allowed={'id','name','model','host','device_port','rtsp_port','http_port','enabled'}
+        allowed={'id','name','model','host','device_port','rtsp_port','http_port','enabled','upload_enabled',
+                 'sd_backend','sd_username','sd_channel','sd_timezone','sd_lookback_hours','sd_password','sd_password_clear'}
         if not isinstance(data,dict) or set(data)-allowed:
             raise ValueError('Unknown camera fields')
         values=dict(data)
         if not partial:
             values={'name':data.get('id',''),'model':'','host':'','device_port':8000,
-                    'rtsp_port':554,'http_port':80,'enabled':True,**values}
+                    'rtsp_port':554,'http_port':80,'enabled':True,'upload_enabled':True,
+                    'sd_backend':'auto','sd_username':'admin','sd_channel':1,
+                    'sd_timezone':'Asia/Ho_Chi_Minh','sd_lookback_hours':168,**values}
         if 'id' in values and (not isinstance(values['id'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',values['id'])):
             raise ValueError('Camera ID must be a stable ASCII slug')
-        for field,maximum in (('name',100),('model',100),('host',253)):
+        for field,maximum in (('name',100),('model',100),('host',253),('sd_username',64)):
             if field not in values:continue
             value=values[field]
             if not isinstance(value,str) or len(value)>maximum or any(ord(c)<32 for c in value):
                 raise ValueError('Invalid camera '+field)
             values[field]=value.strip()
         if 'name' in values and not values['name']:raise ValueError('Camera name is required')
+        if 'sd_username' in values and not values['sd_username']:raise ValueError('SD username is required')
+        if 'sd_username' in values and len(values['sd_username'].encode('utf-8'))>64:
+            raise ValueError('SD username exceeds 64 UTF-8 bytes')
+        if 'sd_backend' in values and values['sd_backend'] not in ('auto','isapi','hcnetsdk'):
+            raise ValueError('Invalid SD backend')
+        for field,maximum in (('sd_channel',256),('sd_lookback_hours',720)):
+            if field in values and (type(values[field]) is not int or not 1<=values[field]<=maximum):
+                raise ValueError('Invalid '+field)
+        if 'sd_timezone' in values:
+            if not isinstance(values['sd_timezone'],str) or len(values['sd_timezone'])>100:
+                raise ValueError('Invalid SD timezone')
+            try:get_zone(values['sd_timezone'])
+            except (ValueError,KeyError):raise ValueError('Invalid SD timezone') from None
+        if 'sd_password' in values:
+            password=values['sd_password']
+            if not isinstance(password,str) or '\0' in password:
+                raise ValueError('Invalid SD password')
+            if len(password.encode('utf-8'))>64:raise ValueError('SD password exceeds 64 UTF-8 bytes')
+        if 'sd_password_clear' in values and type(values['sd_password_clear']) is not bool:
+            raise ValueError('sd_password_clear must be boolean')
+        if values.get('sd_password') and values.get('sd_password_clear'):
+            raise ValueError('Choose set or clear SD password')
         if values.get('host'):
             host=values['host']
             try:
@@ -293,9 +327,10 @@ class Archive:
             if field in values:
                 port=values[field]
                 if type(port) is not int or not 1<=port<=65535:raise ValueError('Invalid camera port')
-        if 'enabled' in values:
-            if type(values['enabled']) is not bool:raise ValueError('enabled must be boolean')
-            values['enabled']=int(values['enabled'])
+        for field in ('enabled','upload_enabled'):
+            if field in values:
+                if type(values[field]) is not bool:raise ValueError(field+' must be boolean')
+                values[field]=int(values[field])
         return values
 
     def cameras(self):
@@ -305,11 +340,50 @@ class Archive:
             GROUP BY c.id ORDER BY c.name COLLATE NOCASE,c.id''')
         results=[]
         for row in rows:
-            item=dict(row);item['enabled']=bool(item['enabled'])
+            item=dict(row);item['enabled']=bool(item['enabled']);item['upload_enabled']=bool(item['upload_enabled'])
             item['probe']=json.loads(item.pop('probe_json')) if item['probe_json'] else None
             item.pop('probe_json',None)
+            path=self._camera_password_path(item['id'])
+            item['sd_password_configured']=path.is_file() and path.stat().st_size>0
             results.append(item)
         return results
+
+    def _camera_password_path(self,slug,create=False):
+        if not isinstance(slug,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',slug):
+            raise ValueError('Invalid camera ID')
+        if self.settings.state_dir.resolve()!=self._state_root:
+            raise ValueError('State directory changed')
+        root=self._state_root/'camera-secrets'
+        if _is_link(root):raise ValueError('Camera secrets directory must not be a link')
+        if create:
+            root.mkdir(exist_ok=True)
+            os.chmod(root,0o700)
+        return _confined_path(root/(slug+'.password'),self._state_root,allow_missing=True)
+
+    def _write_camera_password(self,slug,password=None,clear=False):
+        if not password and not clear:return
+        destination=self._camera_password_path(slug,create=True)
+        if clear:
+            if destination.exists():destination.unlink()
+            return
+        partial=self._camera_password_path(slug).parent/('.'+slug+'.'+uuid.uuid4().hex+'.partial')
+        descriptor=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0),0o600)
+        try:
+            with os.fdopen(descriptor,'wb') as handle:
+                handle.write(password.encode('utf-8'));handle.flush();os.fsync(handle.fileno())
+            _confined_path(destination,self._state_root,allow_missing=True)
+            os.replace(partial,destination)
+        finally:
+            if partial.exists():_confined_path(partial,self._state_root).unlink()
+
+    def camera_sd_config(self,slug):
+        """Worker-only credentials; never return this dictionary through an API."""
+        camera=next((item for item in self.cameras() if item['id']==slug),None)
+        if camera is None:raise KeyError('Unknown camera')
+        path=self._camera_password_path(slug)
+        if path.exists() and path.stat().st_size>4096:raise ValueError('Invalid camera secret')
+        camera['sd_password']=path.read_text(encoding='utf-8') if path.is_file() else ''
+        return camera
 
     def camera_name(self,slug):
         row=self.conn.execute('SELECT name FROM cameras WHERE id=?',(slug,)).fetchone()
@@ -319,9 +393,11 @@ class Archive:
         values=self._camera_fields(data)
         if not values.get('id'):raise ValueError('Camera ID is required')
         values['created_at']=time.time()
+        password=values.pop('sd_password',None);clear=values.pop('sd_password_clear',False)
         try:
             with self.conn:
                 self.conn.execute('INSERT INTO cameras('+','.join(values)+') VALUES('+','.join('?' for _ in values)+')',tuple(values.values()))
+                self._write_camera_password(values['id'],password,clear)
         except sqlite3.IntegrityError:
             raise ValueError('Camera ID already exists') from None
         return next(c for c in self.cameras() if c['id']==values['id'])
@@ -330,9 +406,16 @@ class Archive:
         if not isinstance(data,dict) or 'id' in data:raise ValueError('Camera ID is immutable')
         values=self._camera_fields(data,partial=True)
         if not values:raise ValueError('No changes provided')
+        password=values.pop('sd_password',None);clear=values.pop('sd_password_clear',False)
         if set(values)&{'host','device_port','rtsp_port','http_port'}:values['probe_json']=None
         with self.conn:
-            changed=self.conn.execute('UPDATE cameras SET '+','.join(k+'=?' for k in values)+' WHERE id=?',(*values.values(),slug)).rowcount
+            if values:
+                changed=self.conn.execute('UPDATE cameras SET '+','.join(k+'=?' for k in values)+' WHERE id=?',(*values.values(),slug)).rowcount
+            else:
+                self.conn.execute('BEGIN IMMEDIATE')
+                changed=self.conn.execute('SELECT 1 FROM cameras WHERE id=?',(slug,)).fetchone() is not None
+            if not changed:raise KeyError('Unknown camera')
+            self._write_camera_password(slug,password,clear)
         if not changed:raise KeyError('Unknown camera')
         return next(c for c in self.cameras() if c['id']==slug)
 
@@ -514,13 +597,24 @@ class Archive:
         return {'recordings': [dict(row) for row in rows], 'total': total, 'offset': offset, 'limit': limit}
 
     def ingest_entry(self, entry, dry_run=False):
+        return self._ingest_entry(entry,dry_run)
+
+    def ingest_download(self,entry,path,dry_run=False):
+        """Accept only an adapter-owned, camera-scoped file inside cache/sd-stage."""
+        record_key(entry)
+        source=_confined_path(path,self._cache_root)
+        root=self._cache_root/'sd-stage'/entry['camera']
+        if not source.is_relative_to(root):raise ValueError('Download source outside camera staging directory')
+        return self._ingest_entry(dict(entry,path=str(source)),dry_run,source)
+
+    def _ingest_entry(self, entry, dry_run=False, downloaded_source=None):
         key = record_key(entry)
         start = parse_time(entry['start_time'])
         end = parse_time(entry['end_time'])
         if end <= start:
             raise ValueError('end_time must be greater than start_time')
         if end-start>timedelta(days=7):raise ValueError('Recording interval exceeds seven days')
-        source = resolve_input(entry['path'], self.settings.input_dir)
+        source = resolve_input(entry['path'], self.settings.input_dir) if downloaded_source is None else downloaded_source
         start_ms, end_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
         if dry_run:
             return {'key': key, 'record_key': key, 'camera': entry['camera'], 'status': 'validated', 'source_bytes': source.stat().st_size}
@@ -561,15 +655,19 @@ class Archive:
             raise
         return dict(self.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone(), record_key=key)
 
-    def ingest_manifest(self, path, dry_run=False, continue_on_error=False):
+    def ingest_manifest(self, path, dry_run=False, continue_on_error=False, camera=None):
+        if camera is not None and (not isinstance(camera,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',camera)):
+            raise ValueError('Invalid camera filter')
         path = resolve_input(path, self.settings.input_dir)
         if path.stat().st_size > 1000000:
             raise ValueError('Manifest too large')
         document = json.loads(path.read_text(encoding='utf-8-sig'))
-        if not isinstance(document.get('recordings'), list) or len(document['recordings']) > 1000:
+        if not isinstance(document,dict) or not isinstance(document.get('recordings'), list) or len(document['recordings']) > 1000:
             raise ValueError('Manifest requires recordings list (max 1000 entries)')
         results=[]
         for entry in document['recordings']:
+            if camera is not None and (not isinstance(entry,dict) or entry.get('camera')!=camera):
+                continue
             try:
                 results.append(self.ingest_entry(entry, dry_run))
             except Exception as exc:
@@ -592,10 +690,15 @@ class Archive:
         direction='ASC' if order=='asc' else 'DESC'
         return [dict(row) for row in self.conn.execute(sql + ' ORDER BY start_ms '+direction+',key '+direction, values)]
 
-    def claim_upload(self):
+    def claim_upload(self,camera=None):
+        if camera is not None and (not isinstance(camera,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',camera)):
+            raise ValueError('Invalid camera filter')
         self.conn.execute('BEGIN IMMEDIATE')
         try:
-            row = self.conn.execute("SELECT r.* FROM recordings r JOIN cameras c ON c.id=r.camera WHERE r.status='downloaded' AND c.enabled=1 AND r.retry_at<=? ORDER BY r.start_ms,r.key LIMIT 1", (time.time(),)).fetchone()
+            sql="SELECT r.* FROM recordings r JOIN cameras c ON c.id=r.camera WHERE r.status='downloaded' AND r.deleted_at IS NULL AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"
+            params=[time.time()]
+            if camera is not None:sql+=' AND r.camera=?';params.append(camera)
+            row = self.conn.execute(sql+' ORDER BY r.start_ms,r.key LIMIT 1',params).fetchone()
             if row is None:
                 self.conn.commit()
                 return None
@@ -627,6 +730,16 @@ class Archive:
     def recover_uploads(self):
         with self.conn:
             return self.conn.execute("UPDATE recordings SET status='upload_unknown',last_error='process_restart_after_claim' WHERE status='uploading'").rowcount
+
+    def recover_ingests(self):
+        """Exclusive worker startup only; no Telegram attempt exists yet."""
+        rows=self.conn.execute("SELECT key FROM recordings WHERE status='ingesting' AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL").fetchall()
+        for row in rows:
+            if not re.fullmatch(r'[0-9a-f]{64}',row['key']):raise ValueError('Invalid managed recording key')
+            partial=_confined_path(self._cache_root/(row['key']+'.part.mp4'),self._cache_root,allow_missing=True)
+            if partial.exists():partial.unlink()
+        with self.conn:
+            return self.conn.execute("UPDATE recordings SET status='failed',last_error='worker_restarted_during_ingest' WHERE status='ingesting' AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL").rowcount
 
     def cleanup(self, key):
         row = self.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone()
@@ -762,14 +875,18 @@ class Archive:
             self.conn.execute('INSERT INTO state(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value', (name,str(value)))
 
     def status(self):
+        camera_sources=[{'camera_id':camera['id'],'enabled':camera['enabled'],
+                         'backend':camera['sd_backend'],'configured':bool(camera['host'] and camera['sd_password_configured']),
+                         'password_configured':camera['sd_password_configured']} for camera in self.cameras()]
         return {'queue':dict(self.conn.execute('SELECT status,count(*) FROM recordings GROUP BY status').fetchall()),
-                'sd_adapter':'exported-file-ingest', 'sd_auto_download':'not_implemented',
+                'sd_adapter':'hcnetsdk-or-isapi+exported-file-ingest', 'sd_auto_download':'per_camera_configured',
+                'sd_sources':camera_sources,
                 'upload_enabled':self.settings.enable_upload, 'timezone':self.settings.timezone,
                 'telegram_destination':'owner_private_chat','owner_configured':bool(self.settings.effective_owner),
                 'owner_started':bool(self.settings.effective_owner) and self.state(f'telegram_owner_started:{self.settings.effective_owner}')=='1',
                 'allowed_users_count':len(set(self.settings.allowed_users) | ({self.settings.effective_owner} if self.settings.effective_owner else set())),
                 'cache_retention_hours':self.settings.cache_retention_hours,'api_mode':self.settings.api_mode,
-                'version':'2.2','counts':{'cameras':self.conn.execute('SELECT COUNT(*) FROM cameras').fetchone()[0],
+                'version':'2.4','counts':{'cameras':self.conn.execute('SELECT COUNT(*) FROM cameras').fetchone()[0],
                 'recordings':self.conn.execute('SELECT COUNT(*) FROM recordings WHERE deleted_at IS NULL').fetchone()[0],
                 'uploaded':self.conn.execute("SELECT COUNT(*) FROM recordings WHERE status='uploaded' AND deleted_at IS NULL").fetchone()[0],
                 'deleted':self.conn.execute('SELECT COUNT(*) FROM recordings WHERE deleted_at IS NOT NULL').fetchone()[0]}}

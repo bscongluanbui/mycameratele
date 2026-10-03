@@ -28,7 +28,7 @@ class Telegram:
         """Configure the Telegram Menu once per token/schema, with bounded retries."""
         if not self.settings.token:
             return False
-        state_key='telegram_commands_v3:'+hashlib.sha256(self.settings.token.encode()).hexdigest()[:16]
+        state_key='telegram_commands_v4:'+hashlib.sha256(self.settings.token.encode()).hexdigest()[:16]
         if archive.state(state_key)=='1':return True
         if time.time()<self._menu_retry_at:return False
         self._menu_retry_at=time.time()+60
@@ -43,7 +43,7 @@ class Telegram:
     def reply_keyboard():
         return {'keyboard':[[{'text':'📅 Hôm nay'},{'text':'📆 Hôm qua'},{'text':'🕕 6 giờ trước'}],
                             [{'text':'📷 Camera'},{'text':'🕐 Video gần đây'},{'text':'🗑 Thùng rác'}],
-                            [{'text':'⚙ Trạng thái'}]],'resize_keyboard':True,'is_persistent':True}
+                            [{'text':'▶ Start sync'},{'text':'⚙ Trạng thái'}]],'resize_keyboard':True,'is_persistent':True}
 
     @staticmethod
     def recording_buttons(row, label):
@@ -127,11 +127,11 @@ class Telegram:
             raise ApiRejected(result.get('error_code',0),result.get('parameters',{}).get('retry_after',0))
         return result['result']
 
-    def upload_one(self, archive):
+    def upload_one(self, archive, camera=None):
         if (not self.settings.enable_upload or not self.settings.token or not self.owner or
             archive.state(f'telegram_owner_started:{self.owner}') != '1'):
             return None
-        row = archive.claim_upload()
+        row = archive.claim_upload() if camera is None else archive.claim_upload(camera)
         if row is None:
             return None
         path = Path(row['local_path'])
@@ -298,6 +298,10 @@ class Telegram:
             return self.trash_menu(archive,int(data.split(':')[1]))
         if data.startswith('recent:'):
             return self.recent_menu(archive,int(data.split(':')[1]))
+        if data.startswith('ss:'):
+            target=data[3:]
+            camera=None if target=='all' else self._camera(archive,target)['id']
+            return self.sync_menu(archive,camera)
         if data == 'root' or data.startswith('r:'):
             page = 0 if data == 'root' else int(data.split(':')[1])
             cameras = sorted(archive.cameras(), key=lambda c: (c['name'].casefold(), c['id']))
@@ -312,6 +316,8 @@ class Telegram:
                 nav.append({'text':'→', 'callback_data':f'r:{page+1}'})
             if nav:
                 buttons.append(nav)
+            buttons.append([{'text':'▶ Start sync tất cả','callback_data':'sync:all'},
+                            {'text':'Tiến trình sync','callback_data':'ss:all'}])
             buttons.extend(TimeMenus.shortcuts())
             buttons.append([{'text':'🕐 Video gần đây','callback_data':'recent:0'},
                             {'text':'🗑 Thùng rác','callback_data':'trash:0'},
@@ -333,8 +339,10 @@ class Telegram:
         if kind == 'c':
             buttons = [[{'text':str(y['year']), 'callback_data':f"y:{token}:{y['year']}:{order}"}]
                        for y in sorted(years, key=lambda y:y['year'], reverse=backwards)]
+            buttons.extend(self.sync_camera_buttons(camera))
             self._controls(buttons, f'c:{token}:{{order}}', 'root', order)
-            return f'{name} — chọn Năm', buttons
+            upload='ON' if camera.get('upload_enabled',True) else 'OFF'
+            return f'{name} — chọn Năm\nUpload Telegram: {upload}. OFF chỉ tạm dừng upload, không dừng tải SD.', buttons
         if kind == 'y':
             year = int(pieces[2])
             if not 1 <= year <= 9999:
@@ -383,6 +391,71 @@ class Telegram:
         if len(matches) != 1:
             raise ValueError('Invalid camera selection')
         return matches[0]
+
+    def sync_camera_buttons(self,camera):
+        token=self.camera_token(camera['id'])
+        upload=camera.get('upload_enabled',True)
+        return [[{'text':'▶ Start sync','callback_data':'sync:'+token},
+                 {'text':'Tiến trình','callback_data':'ss:'+token}],
+                [{'text':'Upload ON → OFF' if upload else 'Upload OFF → ON',
+                  'callback_data':f'up:{token}:{0 if upload else 1}'}]]
+
+    def sync_menu(self,archive,camera=None,result=None):
+        """Public queue diagnostics only; work runs in the worker, never poll()."""
+        from .sync import SyncQueue
+        result=result if result is not None else SyncQueue(archive).status(camera=camera,limit=20)
+        states={'queued':'Đang chờ','running':'Đang chạy','completed':'Hoàn tất',
+                'blocked':'Cần xử lý','failed':'Lỗi'}
+        phases={'queued':'Hàng đợi','sd_download':'Tải SD','download':'Tải SD',
+                'ingest':'Lập chỉ mục','normalize':'Chuẩn hóa','upload':'Upload Telegram',
+                'completed':'Kết thúc','preflight':'Kiểm tra nguồn SD'}
+        lines=['Sync '+(archive.camera_name(camera) if camera else 'tất cả camera'),
+               'Worker: '+('đang hoạt động' if result.get('worker_alive') else 'chưa thấy heartbeat mới')]
+        jobs=result.get('jobs',[])
+        for job in jobs[:10]:
+            name=job.get('camera_name') or archive.camera_name(job.get('camera_id',''))
+            state=states.get(job.get('state'),str(job.get('state') or 'Chưa rõ'))
+            phase=phases.get(job.get('phase'),str(job.get('phase') or '—'))
+            lines.append(f'{name}: {state} | {phase}')
+            if job.get('code'):lines.append('Mã: '+str(job['code'])[:100])
+            if job.get('message'):lines.append(str(job['message'])[:300])
+            statistics=job.get('statistics')
+            if isinstance(statistics,dict):
+                numbers=[f'{key}={value}' for key,value in statistics.items()
+                         if isinstance(value,(int,float)) and not isinstance(value,bool)]
+                if numbers:lines.append(' | '.join(numbers)[:300])
+        if not jobs:lines.append('Chưa có công việc sync. Start gửi công việc vào hàng đợi; trạng thái sẽ phản ánh tải SD thực tế.')
+        token=self.camera_token(camera) if camera else 'all'
+        buttons=[[{'text':'▶ Start sync','callback_data':'sync:'+token},
+                  {'text':'↻ Tiến trình','callback_data':'ss:'+token}]]
+        if camera:
+            configured=self._camera(archive,token)
+            buttons.extend(self.sync_camera_buttons(configured)[1:])
+        buttons.append([{'text':'↩ Camera','callback_data':f'c:{token}:asc' if camera else 'root'}])
+        return '\n'.join(lines)[:3900],buttons
+
+    def sync_action(self,archive,data,actor):
+        """Mutations are reached only after the private-chat allowlist gate."""
+        if type(actor) is not int or actor<=0 or actor not in self.viewers:
+            raise ValueError('Invalid sync actor')
+        from .sync import SyncQueue
+        if data.startswith('sync:'):
+            target=data[5:]
+            if target=='all':camera=None
+            else:
+                configured=self._camera(archive,target)
+                if configured.get('enabled') is False:raise ValueError('Camera is disabled')
+                camera=configured['id']
+            result=SyncQueue(archive).enqueue(camera=camera,source='telegram',actor=actor)
+            text,buttons=self.sync_menu(archive,camera)
+            count=len(result.get('jobs',[]))
+            return f'Đã tiếp nhận Start cho {count} camera. Theo dõi tiến trình bên dưới.\n'+text,buttons
+        selection=re.fullmatch(r'up:([a-f0-9]{12}):([01])',data)
+        if selection:
+            configured=self._camera(archive,selection[1])
+            archive.update_camera(configured['id'],{'upload_enabled':selection[2]=='1'})
+            return self.menu(archive,f"c:{selection[1]}:asc")
+        raise ValueError('Invalid sync action')
 
     @staticmethod
     def _controls(buttons, sort_callback, back_callback, order):
@@ -524,6 +597,8 @@ class Telegram:
                         elif callback['data']=='cancel-delete':
                             archive.state(f'telegram_delete_confirm:{actor}','{}')
                             text,buttons=self.menu(archive,'root')
+                        elif callback['data'].startswith(('sync:','up:')):
+                            text,buttons=self.sync_action(archive,callback['data'],actor)
                         else:text,buttons=self.menu(archive,callback['data'])
                     else:
                         words=message.get('text','').split()
@@ -544,6 +619,8 @@ class Telegram:
                         elif command == '/status':
                             text=json.dumps(archive.status(),ensure_ascii=False)
                             buttons=[[{'text':'Archive','callback_data':'root'}]]
+                        elif command == '/sync' or message.get('text','').strip() in ('▶ Start sync','Start sync'):
+                            text,buttons=self.sync_action(archive,'sync:all',actor)
                         else:
                             mapping={'/today':'today','/yesterday':'yesterday','/last6h':'last6h','/recent':'recent:0','/trash':'trash:0',
                                      '📅 Hôm nay':'today','Hôm nay':'today','📆 Hôm qua':'yesterday','Hôm qua':'yesterday',

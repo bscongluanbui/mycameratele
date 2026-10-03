@@ -1,1 +1,1 @@
-"""Portable exported-recording archive. Native camera SD acquisition is separate."""
+"""Camera SD acquisition, durable sync and private Telegram recording archive."""

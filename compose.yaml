@@ -30,6 +30,8 @@ services:
       ENABLE_UPLOAD: ${ENABLE_UPLOAD:-false}
       KEEP_CACHE: ${KEEP_CACHE:-true}
       CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-24}
+      SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-300}
+      HCNETSDK_DIR: /opt/hcnetsdk
     volumes:
       - archive-state:/data
       - archive-cache:/cache
@@ -77,6 +79,8 @@ services:
       ENABLE_UPLOAD: ${ENABLE_UPLOAD:-false}
       KEEP_CACHE: ${KEEP_CACHE:-true}
       CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-24}
+      SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-300}
+      HCNETSDK_DIR: /opt/hcnetsdk
       DASHBOARD_COOKIE_SECURE: ${DASHBOARD_COOKIE_SECURE:-false}
     ports:
       - "${DASHBOARD_BIND_IP:-0.0.0.0}:${DASHBOARD_PORT:-8080}:8080"

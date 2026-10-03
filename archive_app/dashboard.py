@@ -13,6 +13,7 @@ import time
 
 from .core import Archive,Settings
 from .dashboard_auth import DashboardAuth
+from .sync import SyncQueue
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -32,7 +33,7 @@ class DashboardServer(ThreadingHTTPServer):
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    server_version='EZVIZDashboard/2.3'
+    server_version='EZVIZDashboard/2.4'
     def setup(self):
         super().setup();self.connection.settimeout(15)
     def log_message(self,*args):pass  # Requests can contain cookies; do not log headers/tokens.
@@ -115,7 +116,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed=urlsplit(self.path);path=parsed.path
         try:
             if path=='/healthz' and method=='GET':
-                self.send(200,{'healthy':True,'service':'dashboard','version':'2.3'});return
+                self.send(200,{'healthy':True,'service':'dashboard','version':'2.4'});return
             if not path.startswith('/api/'):
                 assets={'/':('index.html','text/html'),'/app.js':('app.js','text/javascript'),'/style.css':('style.css','text/css')}
                 if method!='GET' or path not in assets:self.send(404,{'error':'Not found'});return
@@ -172,18 +173,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     heartbeat=self.server.settings.state_dir/'heartbeat'
                     status=archive.status()
                     status.update(csrf_token=session['csrf_token'],heartbeat={'worker_alive':heartbeat.exists() and time.time()-heartbeat.stat().st_mtime<max(120,self.server.settings.interval*4)})
-                    self.send(200,status)
-                elif path=='/api/cameras' and method=='GET':self.send(200,{'cameras':archive.cameras()})
-                elif path=='/api/cameras' and method=='POST':self.send(201,archive.add_camera(self.read_json()))
+                    response=(200,status)
+                elif path=='/api/cameras' and method=='GET':
+                    sync=SyncQueue(archive).status()
+                    response=(200,{'cameras':[{**camera,'sync':sync['latest'].get(camera['id'])} for camera in archive.cameras()],
+                                   'worker_alive':sync['worker_alive']})
+                elif path=='/api/cameras' and method=='POST':
+                    camera=archive.add_camera(self.read_json())
+                    if camera['enabled']:
+                        result=SyncQueue(archive).enqueue(camera['id'],source='camera-added',actor=account['username'])
+                        camera.update(sync=result['jobs'][0],worker_alive=result['worker_alive'])
+                    response=(201,camera)
+                elif path=='/api/sync' and method=='POST':
+                    data=self.read_json()
+                    if set(data)-{'camera_id'}:raise ValueError('Unknown sync field')
+                    camera=data.get('camera_id')
+                    if camera is not None and (not isinstance(camera,str) or not camera):raise ValueError('Invalid camera')
+                    response=(202,SyncQueue(archive).enqueue(camera,source='dashboard',actor=account['username']))
+                elif path=='/api/sync' and method=='GET':
+                    query=parse_qs(parsed.query,keep_blank_values=True)
+                    if set(query)-{'camera','limit'} or any(len(values)!=1 for values in query.values()):raise ValueError('Unknown sync filter')
+                    camera=query.get('camera',[None])[0]
+                    if camera=='':raise ValueError('Select a camera')
+                    response=(200,SyncQueue(archive).status(camera,int(query.get('limit',['20'])[0])))
                 elif path.startswith('/api/cameras/'):
                     pieces=path[len('/api/cameras/'):].split('/');slug=unquote(pieces[0])
-                    if len(pieces)==1 and method=='PATCH':self.send(200,archive.update_camera(slug,self.read_json()))
-                    elif len(pieces)==2 and pieces[1]=='probe' and method=='POST':self.send(200,archive.probe_camera(slug))
-                    else:self.send(404,{'error':'Not found'})
+                    if len(pieces)==1 and method=='PATCH':response=(200,archive.update_camera(slug,self.read_json()))
+                    elif len(pieces)==2 and pieces[1]=='probe' and method=='POST':response=(200,archive.probe_camera(slug))
+                    else:response=(404,{'error':'Not found'})
                 elif path=='/api/calendar' and method=='GET':
                     query=parse_qs(parsed.query);camera=query.get('camera',[''])[0]
                     if not camera:raise ValueError('Select a camera')
-                    self.send(200,archive.calendar(camera))
+                    response=(200,archive.calendar(camera))
                 elif path=='/api/archive' and method=='GET':
                     query=parse_qs(parsed.query)
                     allowed={'camera','year','month','day','order','status','offset','limit'}
@@ -191,9 +212,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     args={k:v[0] for k,v in query.items()}
                     for key in ('year','month','day','offset','limit'):
                         if key in args:args[key]=int(args[key])
-                    self.send(200,archive.browse(**args))
-                else:self.send(404,{'error':'Not found'})
+                    response=(200,archive.browse(**args))
+                else:response=(404,{'error':'Not found'})
             finally:archive.close()
+            # Release SQLite handles before the client can receive/act on the
+            # response (important for Windows teardown and concurrent readers).
+            self.send(*response)
         except (ValueError,TypeError,UnicodeError,json.JSONDecodeError):self.send(400,{'error':'Dữ liệu đầu vào không hợp lệ'})
         except KeyError:self.send(404,{'error':'Không tìm thấy camera'})
         except (BrokenPipeError,ConnectionResetError):pass

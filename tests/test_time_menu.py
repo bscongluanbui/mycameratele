@@ -69,7 +69,7 @@ class TimeMenuTests(unittest.TestCase):
         self.assertEqual(self.callbacks(self.menus.shortcuts()), ['today', 'yesterday', 'last6h'])
         commands = self.menus.commands()
         self.assertEqual([command['command'] for command in commands],
-                         ['today', 'yesterday', 'last6h', 'archive', 'recent', 'trash', 'status'])
+                         ['sync', 'today', 'yesterday', 'last6h', 'archive', 'recent', 'trash', 'status'])
         for command in commands:
             self.assertRegex(command['command'], r'^[a-z0-9_]{1,32}$')
             self.assertTrue(1 <= len(command['description']) <= 256)
