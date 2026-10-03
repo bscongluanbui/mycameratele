@@ -106,7 +106,7 @@ class PrivateTelegramTests(unittest.TestCase):
         self.poll_updates([self.message(42,'/start',2)])
         self.assertEqual(self.archive.state('telegram_owner_started:42'),'1')
         self.request.side_effect=None
-        self.request.return_value=self.media_response()
+        self.request.return_value=self.media_response(field='document')
         self.assertEqual(self.telegram.upload_one(self.archive),'uploaded')
         self.assertEqual(self.request.call_args.args[1]['chat_id'],42)
         self.assertEqual(self.row(key)['chat_id'],'42')
@@ -222,13 +222,13 @@ class PrivateTelegramTests(unittest.TestCase):
     def test_invalid_upload_identity_remains_unknown_and_retains_cache(self):
         self.archive.state('telegram_owner_started:42','1')
         invalid=[]
-        wrong_owner=self.media_response(43);invalid.append(wrong_owner)
-        channel=self.media_response();channel['chat']['type']='channel';invalid.append(channel)
-        missing_unique=self.media_response();del missing_unique['video']['file_unique_id'];invalid.append(missing_unique)
-        invalid.append(self.media_response(field='document'))
-        zero_message=self.media_response();zero_message['message_id']=0;invalid.append(zero_message)
-        boolean_message=self.media_response();boolean_message['message_id']=True;invalid.append(boolean_message)
-        missing_chat_type=self.media_response();del missing_chat_type['chat']['type'];invalid.append(missing_chat_type)
+        wrong_owner=self.media_response(43,field='document');invalid.append(wrong_owner)
+        channel=self.media_response(field='document');channel['chat']['type']='channel';invalid.append(channel)
+        missing_unique=self.media_response(field='document');del missing_unique['document']['file_unique_id'];invalid.append(missing_unique)
+        invalid.append(self.media_response(field='video'))
+        zero_message=self.media_response(field='document');zero_message['message_id']=0;invalid.append(zero_message)
+        boolean_message=self.media_response(field='document');boolean_message['message_id']=True;invalid.append(boolean_message)
+        missing_chat_type=self.media_response(field='document');del missing_chat_type['chat']['type'];invalid.append(missing_chat_type)
         for index,response in enumerate(invalid):
             with self.subTest(index=index):
                 key=self.ingest(index)
@@ -243,11 +243,11 @@ class PrivateTelegramTests(unittest.TestCase):
         self.archive.state('telegram_owner_started:42','1')
         self.archive.state('telegram_bot_id','900')
         key=self.ingest()
-        self.request.return_value=self.media_response()
+        self.request.return_value=self.media_response(field='document')
         self.assertEqual(self.telegram.upload_one(self.archive),'uploaded')
         row=self.row(key)
         self.assertEqual((row['chat_id'],row['file_id'],row['file_unique_id'],row['media_type']),
-                         ('42','returned-file-id','returned-unique-id','video'))
+                         ('42','returned-file-id','returned-unique-id','document'))
         self.assertGreater(row['uploaded_at'],0)
         self.assertEqual(row['bot_id'],900)
         self.assertFalse(Path(row['local_path']).exists())

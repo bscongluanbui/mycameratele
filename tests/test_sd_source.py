@@ -510,7 +510,7 @@ class SDOrchestrationTests(unittest.TestCase):
         self.archive.settings.cache_max_bytes = 1300
         provider = FakeSource(files=[recording(size=0)])
         self.sync(provider)
-        self.assertEqual(provider.downloads[0][2], 100)
+        self.assertEqual(provider.downloads[0][2], 150)
 
     def test_batch_limit_reports_backlog_without_skipping_future_rescan(self):
         provider = FakeSource(files=[recording(rid=f'file{i}', start=f'2026-10-03T10:00:0{i}+07:00') for i in range(3)])

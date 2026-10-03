@@ -168,7 +168,7 @@ class CameraFirstMenuTests(unittest.TestCase):
         self.camera()
         key = self.recording(uploaded=False)
         self.archive.update_camera('Front_Camera', {'name':'Tên mới ✓'})
-        message = {'chat':{'id':42,'type':'private'}, 'message_id':90, 'video':{'file_id':'new-file-id','file_unique_id':'new-unique-id'}}
+        message = {'chat':{'id':42,'type':'private'}, 'message_id':90, 'document':{'file_id':'new-file-id','file_unique_id':'new-unique-id'}}
         with patch.object(self.telegram, 'request', return_value=message) as request:
             self.assertEqual(self.telegram.upload_one(self.archive), 'uploaded')
         caption = request.call_args.args[1]['caption']

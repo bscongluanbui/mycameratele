@@ -1,6 +1,8 @@
-"""Real FFmpeg/SQLite smoke executed in each published Linux image by CI.
+"""Byte-preserving SQLite smoke executed in each published Linux image by CI.
 
-Input is generated color/silence, never camera footage. No network credentials.
+FFmpeg only generates color/silence input before the pipeline guard. The archive
+pipeline uses no subprocess and preserves source/cache/upload SHA-256. No camera
+footage or network credentials are supplied.
 Run with writable /input, /data, /cache tmpfs and a read-only root filesystem.
 """
 import hashlib
@@ -37,11 +39,20 @@ entry = {
     "path": source.name, "start_time": "2026-10-03T10:00:00+07:00",
     "end_time": "2026-10-03T10:00:01+07:00",
 }
+assert settings.passthrough_probe is False
+original_subprocess_run = subprocess.run
+pipeline_subprocess_calls = []
+def reject_pipeline_subprocess(*args, **kwargs):
+    pipeline_subprocess_calls.append((args, kwargs))
+    raise AssertionError('Archive pipeline invoked a subprocess')
+subprocess.run = reject_pipeline_subprocess
 archive = Archive(settings)
 try:
     row = archive.ingest_entry(entry)
     assert row["status"] == "downloaded"
-    assert row["codec_video"] == "h264" and row["codec_audio"] == "aac"
+    assert row["processing_method"] == "passthrough"
+    assert row["sha256"] == original
+    assert hashlib.sha256(Path(row["local_path"]).read_bytes()).hexdigest() == original
     assert archive.ingest_entry(entry)["key"] == row["key"]
     assert hashlib.sha256(source.read_bytes()).hexdigest() == original
     assert Path(row["local_path"]).is_file()
@@ -66,7 +77,12 @@ try:
     calls = []
     def fake_request(method, fields, **kwargs):
         calls.append((method, fields, kwargs))
-        field = 'video' if method == 'sendVideo' else 'document'
+        assert method == 'sendDocument'
+        if kwargs.get('file_path'):
+            assert kwargs['file_field'] == 'document'
+            assert fields['disable_content_type_detection'] is True
+            assert hashlib.sha256(Path(kwargs['file_path']).read_bytes()).hexdigest() == original
+        field = 'document'
         return {'message_id': len(calls), 'chat': {'id': fields['chat_id'], 'type': 'private'},
                 field: {'file_id': 'fixture-file-id', 'file_unique_id': 'fixture-unique-id'}}
     telegram.request = fake_request
@@ -75,14 +91,14 @@ try:
     assert calls[0][1]['chat_id'] == 42
     assert Path(row['local_path']).is_file()  # Cache holds for a full 24 hours.
     saved = dict(archive.conn.execute('SELECT * FROM recordings WHERE key=?', (row['key'],)).fetchone())
-    assert saved['file_unique_id'] == 'fixture-unique-id' and saved['media_type'] == 'video'
+    assert saved['file_unique_id'] == 'fixture-unique-id' and saved['media_type'] == 'document'
     archive.conn.execute('UPDATE recordings SET uploaded_at=? WHERE key=?', (time.time()-86401, row['key']))
     archive.conn.commit()
     assert archive.cleanup(row['key']) and not Path(row['local_path']).exists()
     before = dict(archive.conn.execute('SELECT * FROM recordings WHERE key=?', (row['key'],)).fetchone())
     for viewer in (77, 88):
         assert telegram.replay(archive, row['key'][:32], viewer) == 'replayed'
-        assert calls[-1][1]['chat_id'] == viewer and calls[-1][1]['video'] == 'fixture-file-id'
+        assert calls[-1][1]['chat_id'] == viewer and calls[-1][1]['document'] == 'fixture-file-id'
         assert not calls[-1][2]  # No binary reads/re-upload kwargs after cleanup.
     try: telegram.replay(archive, row['key'][:32], 999)
     except ValueError: pass
@@ -100,7 +116,7 @@ try:
     else: raise AssertionError('Deleted clip remained downloadable through old bot link')
     assert archive.restore_recording(row['key'],88)
     assert telegram.replay(archive,row['key'][:32],77,purpose='download')=='replayed'
-    assert calls[-1][1]['video']=='fixture-file-id' and not calls[-1][2]
+    assert calls[-1][1]['document']=='fixture-file-id' and not calls[-1][2]
     # Frozen shortcut -> camera -> filtered clip includes view/download/delete.
     anchor=int(parse_time('2026-10-03T12:00:00+07:00').timestamp())
     _,cameras=TimeMenus(telegram).menu(archive,f'w:h:{anchor}:a:0')
@@ -111,8 +127,10 @@ try:
     assert archive.backup_daily().is_file()
     assert archive.backup_daily() is None
     assert hashlib.sha256(source.read_bytes()).hexdigest() == original
+    assert not pipeline_subprocess_calls
 finally:
     archive.close()
+    subprocess.run = original_subprocess_run
 
 # Exercise the actual HTTP dashboard inside every target image. The fixture
 # credentials are local CI data only; no VPS/account secrets are supplied.
@@ -147,7 +165,9 @@ try:
 finally:
     dashboard.shutdown();dashboard.server_close();thread.join(2)
 print(json.dumps({"result": "OK", "machine": platform.machine(), "uid": os.getuid(),
-                  "ffmpeg": "h264+aac-remux-decode", "sqlite": "durable-idempotent",
+                  "pipeline": "byte-preserving-no-subprocess", "sha256": "source=cache=upload",
+                  "upload_method": "sendDocument", "fixture": "ffmpeg-generated-color-silence-only",
+                  "sqlite": "durable-idempotent",
                   "source": "unchanged", "timezone": "+07:00", "telegram_posts": 0,
                   "private_bot": "owner+2-viewers-file-id-replay", "cache": "24h-cleanup",
                   "bot_controls": "download+shared-trash-restore+time-camera-video",

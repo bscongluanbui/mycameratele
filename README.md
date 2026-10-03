@@ -7,7 +7,7 @@ Không cần channel/group. SQLite là mục lục, Telegram chứa media, bot l
 ```text
 Camera SD → lịch quét tự động / Start sync
   → HCNetSDK native hoặc ISAPI của thiết bị → download file đã đóng
-  → kiểm tra media, remux MP4 → cache + SQLite → private chat owner
+  → chép nguyên byte + SHA-256 → cache + SQLite → sendDocument vào private chat owner
   → Camera → Năm → Tháng → Ngày → Video
   → phát lại bằng file_id trong private chat của người được cho phép
 ```
@@ -15,9 +15,10 @@ Camera SD → lịch quét tự động / Start sync
 **Lấy SD có điều kiện theo giao thức thực tế của camera, không theo tên model.**
 Adapter native dùng Linux HCNetSDK chính thức, đúng kiến trúc máy chạy Docker;
 ISAPI dùng Digest và chỉ chấp nhận kết quả search recording thật. Thư viện SDK
-không đi kèm image; xem mục 2. Các model C6N/H6c và firmware đã cung cấp **chưa
-được kiểm thử download trên thiết bị thật**. Cổng mở / RTSP live không chứng minh
-đã truy cập được SD. MP4/manifest xuất từ Studio vẫn là nguồn nhập tùy chọn.
+không đi kèm image; xem mục 2. SDK Linux ARM64 đã khởi tạo và tìm/tải recording
+C6N trên VPS ARM64 qua tuyến Tailscale; H6c vẫn cần kiểm thử riêng. Kết quả của
+một model không chứng minh tương thích model khác. Cổng mở / RTSP live không
+chứng minh đã truy cập được SD. File/manifest xuất từ Studio vẫn là nguồn nhập tùy chọn.
 
 ## 1. Cài đặt trên Ubuntu / Armbian
 
@@ -123,12 +124,13 @@ Dashboard cho thêm camera, đổi tên, địa chỉ, cổng và thông tin SD:
   tối đa 720 giờ. Chỉ nhập clip đã kết thúc ít nhất 2 phút; không ghi RTSP live.
 - **Bật camera** điều khiển lấy nguồn + upload. **Upload Telegram** riêng từng
   camera mặc định bật (kể cả camera cũ khi nâng cấp); tắt chỉ ngừng upload,
-  vẫn tải/kiểm tra video về cache. Bật lại dùng Start sync để đẩy phần còn chờ.
+  vẫn tải nguyên bản video về cache. Bật lại dùng Start sync để đẩy phần còn chờ.
 - **Start all** tạo job cho camera đang bật. **Start sync** ở mỗi card chỉ chạy
   camera đó. Thêm camera đang bật tự xếp job lần đầu. Job lưu trong SQLite,
   chống trùng, tiếp tục kiểm tra sau restart; không tự gửi lại upload mơ hồ.
-- Worker tự tạo job mỗi `SD_SYNC_INTERVAL_SECONDS=300` giây. Nút Start bỏ qua
+- Worker tự tạo job mỗi `SD_SYNC_INTERVAL_SECONDS=900` giây. Nút Start bỏ qua
   thời gian chờ này; dashboard/bot chỉ xếp job, worker xử lý tải và upload.
+  Mặc định 900 giây tương đương **15 phút**, không quét SD liên tục.
 - Telegram có `/sync`, nút **Start sync** ở menu chính và từng mục camera,
   công tắc upload và nút cập nhật trạng thái. Allowlist được kiểm tra trước
   thao tác; các gate owner `/start` và `ENABLE_UPLOAD=true` vẫn giữ nguyên.
@@ -139,6 +141,44 @@ ps` và logs worker. Thiếu credential, SDK, tuyến mạng, giao thức không
 file chưa đóng, cache đầy, Telegram chưa cấu hình đều phải hiện rõ, không giả
 báo thành công. Nếu search SD thực sự trả 0 clip, job ghi nhận kết quả rỗng.
 
+### Trung chuyển nguyên bản: không chuyển đổi định dạng
+
+Worker **chỉ tải → chép nguyên byte vào cache → upload file gốc**. Không gọi
+FFmpeg trong pipeline; không transcode, encode, remux, đổi container, faststart,
+resample hoặc chạy decode toàn bộ. Đuôi file từ nguồn được giữ khi xác định được;
+recording SDK chưa rõ container dùng đuôi nhận diện hoặc `.bin`, không giả gán
+`.mp4`. Mặc định chỉ đọc header nhỏ để nhận diện đuôi: **không gọi cả FFmpeg
+lẫn ffprobe**. `PASSTHROUGH_PROBE_METADATA=false` là mặc định. Chỉ khi bạn chủ
+động bật tùy chọn này, ffprobe đọc metadata tối đa 5 giây, không ghi media; lỗi
+probe hoặc định dạng chưa nhận diện vẫn cho phép upload file nguyên byte.
+
+SHA-256 và kích thước được ghi cho cache trước khi upload. File mới gửi bằng
+`sendDocument` để lưu như tài liệu; codec/container gốc có thể cần tải về rồi
+mở bằng VLC hoặc phần mềm tương thích. Việc xem lại dùng file_id của cùng bot,
+không tải xuống rồi upload lại. Cache chỉ là trung chuyển, theo retention hiện có;
+SQLite giữ mục lục Camera → Năm → Tháng → Ngày và file_id Telegram.
+
+Các bản đã upload trước khi nâng cấp giữ nguyên file_id/loại media hiện có.
+Metadata `processing_method=legacy` phân biệt bản cũ với `passthrough`; một file
+đã được bản cũ remux không tự trở lại byte SD gốc. Cache cũ chưa gửi và chưa có
+lượt gửi mơ hồ được đưa về `raw_reingest_required` để lấy lại nguyên bản trước
+upload. Bản `upload_unknown` vẫn chờ đối soát, không tự tải/gửi lại gây trùng.
+
+### Vì sao ít file nhỏ vẫn có thể lâu?
+
+Dung lượng không phải thời gian duy nhất: camera SD/HCNetSDK có thời gian mở
+phiên/tìm recording/khởi động từng lượt tải; tuyến VPS → Tailscale → Armbian
+thêm độ trễ. Worker xử lý lần lượt để tránh tải chồng và upload trùng. Theo dõi
+`phase`, `sd_searched`, `sd_downloaded`, `sd_imported`, `uploaded` và thời gian
+**Cập nhật ... trước** của job (dashboard): bộ đếm tải
+thay đổi chứng minh đang tiến lên; kiểm tra đúng giai đoạn tải hay upload và
+lỗi hiện tại của job. Không coi "27 file nhẹ" hoặc số upload tạm thời bằng 0 là bằng chứng worker bị treo.
+
+Nếu bộ đếm/thời điểm cập nhật không đổi, đối chiếu log worker và lỗi SDK/Telegram
+của đúng job trước khi retry. Start gửi yêu cầu vào hàng đợi, không tạo thêm một
+worker để vượt qua job đang chạy. Tắt upload một camera vẫn tiếp tục tải cache;
+tắt camera dừng xử lý nguồn của camera đó ở điểm kiểm tra tiếp theo.
+
 ### Native HCNetSDK trong Docker
 
 Lấy **Device Network SDK for Linux** từ
@@ -146,8 +186,9 @@ Lấy **Device Network SDK for Linux** từ
 **máy chạy container** (VPS x86_64 cần Linux64 x86_64; Armbian aarch64 cần
 Linux ARM64). Trang catalogue Linux64 không tự chứng minh hỗ trợ ARM64;
 [portal SDK của hãng](https://open.hikvision.com/download/5cda567cf47ae80dd41a54b3?type=20)
-có thể cần đăng nhập để lấy gói đúng kiến trúc. Hiện chưa có binary ARM64
-được kiểm chứng hoặc bundle trong image. Không dùng DLL Windows từ EZVIZ Studio, không dùng SDK ARM64
+có thể cần đăng nhập để lấy gói đúng kiến trúc. Gói ARM64 chính hãng đã được
+kiểm tra ZIP/ELF/header và khởi tạo trên VPS ARM64; binary vẫn không bundle
+trong image. Không dùng DLL Windows từ EZVIZ Studio, không dùng SDK ARM64
 trên VPS x86. Giữ đủ thư mục lib, `HCNetSDKCom` và dependency của gói chính thức.
 Nếu hãng không cung cấp gói đúng kiến trúc, native backend báo thiếu/incompatible;
 ISAPI chỉ hoạt động nếu firmware thực sự có endpoint recording tương ứng.
@@ -301,9 +342,12 @@ nguyên khoảng ban đầu; bấm shortcut lại để lấy khoảng mới.
 
 ### Xem, tải và Thùng rác chung
 
-- **Xem:** bot gửi video vào chat riêng của người được phép.
+- **Xem:** bot gửi lại file vào chat riêng của người được phép. Telegram hoặc
+  phần mềm trên máy người xem quyết định phát được định dạng gốc hay không;
+  worker không chuyển đổi file để ép phát trong Telegram.
 - **Tải:** bot gửi lại media gốc và hướng dẫn dùng nút tải / menu Telegram
-  `Lưu video` hoặc `Save to Downloads`. Video vẫn dùng sendVideo, document vẫn
+  `Save to Downloads`. File mới lưu bằng **sendDocument** để giữ nguyên bản.
+  Bản lưu cũ dùng sendVideo tiếp tục phát lại bằng sendVideo, document tiếp tục
   dùng sendDocument; không đổi loại file_id hay re-upload binary. Đây là tải
   bằng client Telegram, không phát đường dẫn download chứa bot token.
 - **Xóa:** nút đầu chỉ mở xác nhận; xác nhận gắn với ID người bấm, hết hạn sau
@@ -330,8 +374,9 @@ dashboard không đoán link channel. Cây thư mục là virtual filesystem tro
 SQLite, không phải thư mục vật lý trên Telegram.
 
 Cloud mode chỉ dành cho kiểm tra clip nhỏ, giới hạn binary upload 50 MB;
-file vượt ngưỡng được giữ để xử lý, không tự chia/transcode. Dùng `sendVideo`
-cho codec phù hợp, còn lại gửi `sendDocument`; không encode lại chỉ để ép video.
+file vượt ngưỡng được giữ để xử lý, không tự chia/transcode. Mọi file mới dùng
+**sendDocument** và tắt nhận diện nội dung tự động; không gửi sendVideo để ép
+Telegram xử lý như video. File nguồn, cache và payload upload có cùng SHA-256.
 Sau khi chuyển sang Local API, bản ghi `needs_review` vì file thiếu/vượt ngưỡng
 cũ cần lệnh rõ ràng; worker không tự retry các upload mơ hồ:
 

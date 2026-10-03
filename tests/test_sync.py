@@ -41,8 +41,9 @@ class SyncTests(unittest.TestCase):
         self.telegram=Telegram(self.settings);self.calls=[]
         def request(method,fields,**kwargs):
             self.calls.append((method,fields,kwargs))
+            field='video' if method=='sendVideo' else 'document'
             return {'message_id':len(self.calls),'chat':{'id':42,'type':'private'},
-                    'video':{'file_id':'synthetic-file-'+str(len(self.calls)),'file_unique_id':'synthetic-unique'}}
+                    field:{'file_id':'synthetic-file-'+str(len(self.calls)),'file_unique_id':'synthetic-unique'}}
         self.telegram.request=request
 
     def tearDown(self):

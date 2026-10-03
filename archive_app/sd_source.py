@@ -51,7 +51,8 @@ class SDSourceError(Exception):
 def recover_staging(archive):
     """Remove abandoned adapter files at exclusive worker startup only.
 
-    Normalized MP4s, catalog metadata and unknown user files are never touched.
+    Original-byte cached recordings, catalog metadata and unknown user files
+    are never touched.
     Root/camera component links are rejected instead of traversed, including
     Windows junctions. Linux native helpers die with the original worker.
     """
@@ -712,7 +713,7 @@ class SDSource:
         if type(channel) is not int or not 1 <= channel <= 9999 or backend not in ('auto', 'isapi', 'hcnetsdk'):
             raise SDSourceError('sd_config_invalid', 'Invalid camera SD backend/channel.')
         zone = get_zone(config.get('sd_timezone', config.get('timezone', self.archive.settings.timezone)))
-        max_bytes = min(MAX_NATIVE_FILE, self.archive.settings.cache_max_bytes // 3)
+        max_bytes = min(MAX_NATIVE_FILE, self.archive.settings.cache_max_bytes // 2)
         if max_bytes <= 0:
             raise SDSourceError('sd_cache_budget', 'Cache budget is too small for SD staging.')
         common = (address, username, password, channel, zone, max_bytes)
@@ -809,14 +810,14 @@ class SDSource:
                     continue
                 used = sum(path.stat().st_size for path in self.archive.settings.cache_dir.rglob('*') if path.is_file())
                 free = shutil.disk_usage(root).free
-                provider.max_bytes = min(MAX_NATIVE_FILE, (self.archive.settings.cache_max_bytes - used) // 3,
-                                         (free - self.archive.settings.min_free_bytes) // 3)
+                provider.max_bytes = min(MAX_NATIVE_FILE, (self.archive.settings.cache_max_bytes - used) // 2,
+                                         (free - self.archive.settings.min_free_bytes) // 2)
                 estimate = max(1, recording.get('size', 0))
                 if provider.max_bytes <= 0:
                     raise SDSourceError('sd_cache_budget', 'SD staging cache budget reached; confirmed recordings remain intact.')
                 if estimate > provider.max_bytes:
                     raise SDSourceError('sd_size_limit', 'SD file exceeds the bounded native staging size; shorten camera recording segments.')
-                needed = estimate * 3  # Source, remux target, and validation headroom.
+                needed = estimate * 2  # Staged source and identical-byte cached copy.
                 if used + needed > self.archive.settings.cache_max_bytes or free - needed < self.archive.settings.min_free_bytes:
                     raise SDSourceError('sd_cache_budget', 'SD staging cache budget reached; confirmed recordings remain intact.')
                 partial = root / f'{key}.{uuid.uuid4().hex}.part'
@@ -836,10 +837,10 @@ class SDSource:
                 except SDSourceError:
                     raise
                 except Exception:
-                    raise SDSourceError('sd_media_validation_failed', 'Downloaded SD recording failed MP4 remux/decode validation; no Telegram upload was attempted.') from None
+                    raise SDSourceError('sd_media_validation_failed', 'Downloaded SD recording could not be copied intact into the managed cache; no Telegram upload was attempted.') from None
                 finally:
-                    # Catalog owns a normalized MP4; source files are temporary
-                    # even after validation failure to keep retries bounded.
+                    # Catalog owns an identical-byte cached original; staging
+                    # files are temporary, including after a copy failure.
                     partial.unlink(missing_ok=True)
                     complete.unlink(missing_ok=True)
         notify('sd_complete')

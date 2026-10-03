@@ -104,6 +104,8 @@ def main():
             running=False
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
         archive.recover_uploads()
+        legacy=archive.invalidate_legacy_cache()
+        if legacy:emit('legacy_media_requeued',files=legacy)
         recovered_ingests=archive.recover_ingests()
         if recovered_ingests:emit('ingests_recovered',recordings=recovered_ingests)
         from .sd_source import recover_staging
@@ -111,7 +113,7 @@ def main():
         if recovered:emit('sd_staging_recovered',files=recovered)
         sync=SyncQueue(archive)
         sync.recover()  # The exclusive worker lock above prevents two runners.
-        sync_interval=int(os.environ.get('SD_SYNC_INTERVAL_SECONDS','300'))
+        sync_interval=int(os.environ.get('SD_SYNC_INTERVAL_SECONDS','900'))
         if not 30<=sync_interval<=86400:raise ValueError('SD_SYNC_INTERVAL_SECONDS must be between 30 and 86400')
         next_sync=0.0
         heartbeat_stop=threading.Event()

@@ -1,5 +1,9 @@
-"""Real FFmpeg + SQLite, synthetic SD source and fake Telegram; no device login."""
-import json,os,platform,shutil,subprocess,tempfile
+"""Byte-preserving SQLite/SD smoke; FFmpeg only creates a synthetic fixture.
+
+The archive pipeline is guarded against any subprocess invocation. No camera
+login, Telegram network traffic, decode, remux or transcode runs in the pipeline.
+"""
+import hashlib,json,os,platform,shutil,subprocess,tempfile
 from pathlib import Path
 from datetime import datetime,timedelta,timezone
 from unittest.mock import patch
@@ -14,6 +18,7 @@ def run():
         root=Path(tmp);source=root/'synthetic.mp4'
         subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-f','lavfi','-i','color=c=blue:s=96x64:r=12',
             '-f','lavfi','-i','anullsrc=r=16000:cl=mono','-t','1','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac','-threads','1',str(source)],check=True,timeout=120)
+        source_sha=hashlib.sha256(source.read_bytes()).hexdigest()
         settings=Settings(root/'state',root/'cache',root/'input','UTC+07:00',min_free_bytes=0,enable_upload=True,
                           owner_user_id=42,allowed_users=(42,77),token='synthetic-not-a-real-token')
         settings.input_dir.mkdir()
@@ -28,30 +33,39 @@ def run():
                 shutil.copyfile(source,destination);downloads.append(recording['record_id']);return destination.stat().st_size
         t=Telegram(settings)
         def request(method,fields,**kwargs):
-            posts.append(method);assert method in ('sendVideo','sendDocument')
+            posts.append(method);assert method=='sendDocument'
+            assert kwargs['file_field']=='document'
+            assert fields['disable_content_type_detection'] is True
+            assert hashlib.sha256(Path(kwargs['file_path']).read_bytes()).hexdigest()==source_sha
             return {'message_id':len(posts),'chat':{'id':42,'type':'private'},
-                    'video' if method=='sendVideo' else 'document':{'file_id':'synthetic-file-id','file_unique_id':'synthetic-unique'}}
+                    'document':{'file_id':'synthetic-file-id','file_unique_id':'synthetic-unique'}}
         t.request=request
         try:
             a.add_camera({'id':'fixture','host':'192.168.31.166','sd_password':'synthetic-device','upload_enabled':False})
             a.state('telegram_owner_started:42','1');q=SyncQueue(a)
-            with patch.object(SDSource,'_provider',return_value=Provider()),patch.object(Archive,'probe_camera',return_value={'tcp':{'8000':'unconfirmed'}}):
+            with patch.object(SDSource,'_provider',return_value=Provider()),patch.object(Archive,'probe_camera',return_value={'tcp':{'8000':'unconfirmed'}}),patch.object(subprocess,'run',side_effect=AssertionError('Pipeline invoked a subprocess')) as processing_run:
+                assert settings.passthrough_probe is False
                 q.enqueue('fixture',source='synthetic-smoke');assert q.run_once(t)
                 job=q.status('fixture')['latest']['fixture'];assert job['code']=='camera_upload_disabled'
                 row=dict(a.conn.execute('SELECT * FROM recordings').fetchone())
                 assert row['status']=='downloaded' and Path(row['local_path']).is_file() and not posts
                 assert not list(settings.input_dir.iterdir())
+                assert row['sha256']==source_sha
+                assert row['processing_method']=='passthrough'
+                assert hashlib.sha256(Path(row['local_path']).read_bytes()).hexdigest()==source_sha
                 a.update_camera('fixture',{'upload_enabled':True});q.enqueue('fixture',source='synthetic-smoke');q.run_once(t)
                 assert q.status('fixture')['latest']['fixture']['state']=='completed'
                 assert len(downloads)==1 and len(posts)==1
                 row=dict(a.conn.execute('SELECT * FROM recordings').fetchone());assert row['status']=='uploaded'
+                assert row['media_type']=='document' and row['sha256']==source_sha
                 q.enqueue('fixture',source='synthetic-smoke');q.run_once(t);assert len(posts)==1 and len(downloads)==1
                 a.soft_delete(row['key'],77);q.enqueue('fixture',source='synthetic-smoke');q.run_once(t)
                 assert a.browse(status='all')['total']==0 and len(posts)==1 and len(downloads)==1
                 assert a.restore_recording(row['key'],77);assert a.browse(status='all')['total']==1
+                assert processing_run.call_count==0
         finally:a.close()
     print(json.dumps({'result':'OK','machine':platform.machine(),'source':'synthetic-SD-provider-not-real-camera',
-                      'ffmpeg':'real-remux+decode','upload_toggle':'off-download-cache/on-single-post','rescan':'idempotent',
+                      'pipeline':'byte-preserving-no-subprocess','sha256':'source=cache=upload','upload_method':'sendDocument','fixture':'ffmpeg-generated-color-silence-only','upload_toggle':'off-download-cache/on-single-post','rescan':'idempotent',
                       'trash':'not-resurrected+restore','input_writes':0,'real_telegram_posts':0},sort_keys=True))
 
 if __name__=='__main__':run()

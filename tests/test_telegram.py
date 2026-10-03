@@ -67,20 +67,21 @@ class TelegramTests(unittest.TestCase):
     def test_success_persists_telegram_identity_and_cleans_only_cache(self):
         key = self.ingest()
         cached = Path(self.row(key)["local_path"])
-        self.request.return_value = {"chat": {"id": 42,"type":"private"}, "message_id": 17, "video": {"file_id": "confirmed-file-id","file_unique_id":"confirmed-unique-id"}}
+        self.request.return_value = {"chat": {"id": 42,"type":"private"}, "message_id": 17, "document": {"file_id": "confirmed-file-id","file_unique_id":"confirmed-unique-id"}}
         self.assertEqual(self.telegram.upload_one(self.archive), "uploaded")
         row = self.row(key)
         self.assertEqual(row["status"], "uploaded")
         self.assertEqual(row["file_id"], "confirmed-file-id")
         self.assertEqual(row["message_id"], 17)
         self.assertEqual(row['file_unique_id'],'confirmed-unique-id')
-        self.assertEqual(row['media_type'],'video')
+        self.assertEqual(row['media_type'],'document')
         self.assertFalse(cached.exists())
         self.assertTrue(self.source.is_file())
         args, kwargs = self.request.call_args
-        self.assertEqual(args[0], "sendVideo")
-        self.assertEqual(kwargs["file_field"], "video")
-        self.assertIs(args[1]["supports_streaming"], True)
+        self.assertEqual(args[0], "sendDocument")
+        self.assertEqual(kwargs["file_field"], "document")
+        self.assertIs(args[1]["disable_content_type_detection"], True)
+        self.assertNotIn("supports_streaming", args[1])
         self.archive.close()
         self.archive = Archive(self.settings)
         self.assertEqual(self.row(key)["file_id"], "confirmed-file-id")

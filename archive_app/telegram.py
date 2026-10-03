@@ -98,12 +98,14 @@ class Telegram:
                 fields = dict(fields, **{file_field:Path(file_path).resolve().as_uri()})
             body = json.dumps(fields).encode()
         else:
-            boundary = 'ezviz-archive-stdlib-boundary'
+            boundary = 'ezviz-archive-'+secrets.token_hex(16)
             chunks = []
             for name, value in fields.items():
                 value = value if isinstance(value,str) else json.dumps(value)
                 chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode())
-            chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="clip.mp4"\r\nContent-Type: video/mp4\r\n\r\n').encode())
+            filename=re.sub(r'[^A-Za-z0-9._-]', '_', Path(file_path).name)[:180] or 'camera-recording.bin'
+            mime='application/octet-stream' if file_field=='document' else 'video/mp4'
+            chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n').encode())
             head = b''.join(chunks)
             tail = f'\r\n--{boundary}--\r\n'.encode()
             def stream():
@@ -140,11 +142,10 @@ class Telegram:
                 archive.conn.execute("UPDATE recordings SET status='needs_review',last_error='missing_or_oversize_file' WHERE key=?", (row['key'],))
             return 'needs_review'
         caption = self.caption(archive, row)
-        video = row['codec_video']=='h264' and row['codec_audio'] in (None,'aac')
-        method, field = ('sendVideo','video') if video else ('sendDocument','document')
-        fields = {'chat_id':self.owner,'caption':caption,'disable_notification':True}
-        if video:
-            fields['supports_streaming']=True
+        # Preserve raw bytes: do not request Telegram's video processing path.
+        method,field='sendDocument','document'
+        fields={'chat_id':self.owner,'caption':caption,'disable_notification':True,
+                'disable_content_type_detection':True}
         try:
             message = self.request(method,fields,file_path=path,file_field=field)
             media = self.validate_media_message(message, field)
@@ -162,9 +163,11 @@ class Telegram:
                 else:
                     archive.conn.execute("UPDATE recordings SET status='upload_unknown',last_error='server_error_after_send' WHERE key=?", (row['key'],))
             return 'api_rejected'
-        except Exception:
+        except Exception as error:
+            # Keep a sanitized type for diagnosis, never the token-bearing URL.
+            error_type=re.sub(r'[^A-Za-z0-9_]', '', type(error).__name__)[:48]
             with archive.conn:
-                archive.conn.execute("UPDATE recordings SET status='upload_unknown',last_error='ambiguous_post_or_commit' WHERE key=?", (row['key'],))
+                archive.conn.execute("UPDATE recordings SET status='upload_unknown',last_error=? WHERE key=?", ('ambiguous_'+error_type,row['key']))
             return 'upload_unknown'
         archive.cleanup(row['key'])
         return 'uploaded'

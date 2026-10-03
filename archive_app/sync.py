@@ -256,7 +256,10 @@ class SyncQueue:
         self._progress(job, statistics, 'sd_search', 'Đang tìm và tải recording SD của camera')
         try:
             from .sd_source import SDSource, SDSourceError
+            last_imported=0
+            early_upload_paused=False
             def sd_progress(snapshot):
+                nonlocal last_imported,early_upload_paused
                 statistics['sd_backend']=snapshot.get('backend')
                 for output,source in (('sd_searched','searched'),('sd_downloaded','downloaded'),
                                       ('sd_imported','imported'),('sd_deferred','deferred'),('sd_backlog','backlog')):
@@ -267,6 +270,19 @@ class SyncQueue:
                 phase=snapshot.get('phase','sd_download')
                 if phase not in ('sd_search','sd_download','sd_complete'):phase='sd_download'
                 self._progress(job,statistics,phase,'Đang xử lý recording SD; số liệu cập nhật sau từng file')
+                # A raw file can upload immediately; do not wait for the whole SD batch.
+                imported=snapshot.get('imported',0)
+                is_new=imported>last_imported
+                last_imported=max(last_imported,imported)
+                if is_new and not early_upload_paused and statistics['uploaded']<MAX_UPLOADS_PER_JOB and not self._gate(slug):
+                    self._progress(job,statistics,'uploading','Đang upload file gốc vừa tải từ SD')
+                    try:result=telegram.upload_one(self.archive,camera=slug)
+                    except Exception:
+                        early_upload_paused=True
+                    else:
+                        if result=='uploaded':statistics['uploaded']+=1
+                        elif result is not None:early_upload_paused=True
+                    self._progress(job,statistics,phase,'Đã xử lý file gốc; tiếp tục tải recording SD')
             sd_result=SDSource(self.archive,slug).sync(progress=sd_progress)
             sd_progress(sd_result)
         except Exception as error:
@@ -325,10 +341,11 @@ class SyncQueue:
         if not statistics['pending']:
             if sd_error:self._finish(job,statistics,'blocked',*sd_error)
             elif statistics['sd_backlog']:self._finish(job,statistics,'blocked','sd_batch_limit','Nguồn SD còn recording; worker sẽ xử lý trong lần đồng bộ tiếp')
+            elif statistics['uploaded']:self._finish(job,statistics,'completed','completed','Đã tải và upload file gốc của camera')
             else:self._finish(job, statistics, 'completed', 'no_new_recordings', 'Không có video mới cần upload; các bản ghi đã lưu giữ nguyên')
             return
         self._progress(job, statistics, 'uploading', 'Đang xử lý hàng đợi upload của camera')
-        for _ in range(MAX_UPLOADS_PER_JOB):
+        for _ in range(max(0,MAX_UPLOADS_PER_JOB-statistics['uploaded'])):
             gate = self._gate(slug)
             if gate:
                 self._finish(job, statistics, 'blocked', *gate)

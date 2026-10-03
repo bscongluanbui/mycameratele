@@ -69,7 +69,7 @@
       return values[job?.state] || ["Chưa Start", "neutral"];
     },
     syncPhase(job) {
-      const phases = { sd_search: "Tìm recording SD", sd_complete: "Đã xử lý SD", scanning: "Kiểm tra nguồn", finished: "Kết thúc", queued: "Hàng đợi", probing: "Kiểm tra đường đến camera", preflight: "Kiểm tra nguồn SD", sd_download: "Tải SD", downloading: "Tải SD", download: "Tải SD", ingesting: "Lập chỉ mục", ingest: "Lập chỉ mục", normalize: "Chuẩn hóa", uploading: "Upload Telegram", upload: "Upload Telegram", completed: "Kết thúc", done: "Kết thúc" };
+      const phases = { sd_search: "Tìm recording SD", sd_complete: "Đã xử lý SD", scanning: "Kiểm tra nguồn", finished: "Kết thúc", queued: "Hàng đợi", probing: "Kiểm tra đường đến camera", preflight: "Kiểm tra nguồn SD", sd_download: "Tải SD", downloading: "Tải SD", download: "Tải SD", ingesting: "Lập chỉ mục", ingest: "Lập chỉ mục", normalize: "Chép nguyên bản", uploading: "Upload Telegram", upload: "Upload Telegram", completed: "Kết thúc", done: "Kết thúc" };
       return phases[job?.phase] || job?.phase || "—";
     },
     syncHelp(job) {
@@ -83,6 +83,13 @@
     syncStatistics(job) {
       const labels = { sd_searched: "Tìm thấy SD", sd_found: "Tìm thấy SD", sd_downloaded: "Đã tải SD", sd_imported: "Đã nhập SD", imported: "Đã nhập", uploaded: "Đã upload", pending: "Chờ upload", failed: "Lỗi", already_known: "Đã có" };
       return Object.entries(job?.statistics || {}).filter(([key, value]) => labels[key] && typeof value === "number" && Number.isFinite(value) && value >= 0).map(([key, value]) => `${labels[key]}: ${value}`).join(" · ");
+    },
+    syncUpdated(job, now = Date.now()) {
+      const updated = helpers.checkedMillis(job?.updated_at);
+      if (updated === null || !Number.isFinite(now) || !Number.isFinite(new Date(updated).getTime())) return "";
+      const seconds = Math.max(0, Math.floor((now - updated) / 1000));
+      const age = seconds < 60 ? `${seconds} giây` : seconds < 3600 ? `${Math.floor(seconds / 60)} phút` : `${Math.floor(seconds / 3600)} giờ`;
+      return `Cập nhật ${age} trước · ${new Date(updated).toLocaleString("vi-VN")}`;
     },
     validSdPassword(password) { return typeof password === "string" && !password.includes("\0") && new TextEncoder().encode(password).length <= 64; },
     validUsername(value) { return typeof value === "string" && /^[A-Za-z0-9_.-]{3,64}$/.test(value); },
@@ -256,6 +263,7 @@
         if (job.code) syncDetail.append(node("code", "sync-code", job.code));
         if (helpers.syncHelp(job)) syncDetail.append(node("p", "field-hint", helpers.syncHelp(job)));
         if (helpers.syncStatistics(job)) syncDetail.append(node("p", "field-hint", helpers.syncStatistics(job)));
+        if (helpers.syncUpdated(job)) syncDetail.append(node("p", "small muted", helpers.syncUpdated(job)));
       } else syncDetail.append(node("p", "small muted", "Chưa có công việc sync. Bấm Start để gửi vào worker."));
       const upload = node("button", "upload-switch"); upload.type = "button"; upload.setAttribute("role", "switch");
       upload.setAttribute("aria-checked", String(helpers.uploadEnabled(camera))); upload.setAttribute("aria-label", `Upload Telegram cho ${camera.name || camera.id}`);
@@ -298,6 +306,7 @@
       if (job.code) item.append(node("code", "sync-code", job.code));
       if (helpers.syncHelp(job)) item.append(node("p", "field-hint", helpers.syncHelp(job)));
       if (helpers.syncStatistics(job)) item.append(node("p", "field-hint", helpers.syncStatistics(job)));
+      if (helpers.syncUpdated(job)) item.append(node("p", "small muted", helpers.syncUpdated(job)));
       target.append(item);
     }
     if (!jobs.length) target.append(node("p", "small muted", "Chưa có lịch sử sync. Thêm camera tự tạo công việc đầu tiên."));
@@ -368,7 +377,7 @@
     for (const [label, value] of details) { const row = node("div"); row.append(node("dt", "", label), node("dd", "", typeof value === "object" ? "Có dữ liệu" : value)); $("system-details").append(row); }
     const adapter = typeof status.sd_adapter === "object" ? (status.sd_adapter.status || status.sd_adapter.name || "auto") : String(status.sd_adapter || "auto");
     $("system-sd-status").textContent = "Theo dõi tiến trình sync";
-    $("system-sd-description").textContent = `Nguồn SD: ${adapter}. Worker chọn ISAPI hoặc HCNetSDK theo cấu hình camera. HCNetSDK cần compose.sdk.yaml / HCNETSDK_DIR và SDK đúng kiến trúc tại /opt/hcnetsdk. VPS cần route camera LAN qua Tailscale / Armbian; cổng mở không xác nhận đã tải được SD.`;
+    $("system-sd-description").textContent = `Nguồn SD: ${adapter}. Worker chọn ISAPI hoặc HCNetSDK theo cấu hình camera, giữ nguyên byte và upload document; không transcode, remux hoặc decode. HCNetSDK cần compose.sdk.yaml / HCNETSDK_DIR và SDK đúng kiến trúc tại /opt/hcnetsdk. VPS cần route camera LAN qua Tailscale / Armbian; cổng mở không xác nhận đã tải được SD.`;
     renderProbes();
   }
   function renderProbes() {

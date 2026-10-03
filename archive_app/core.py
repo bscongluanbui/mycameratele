@@ -85,6 +85,9 @@ class Settings:
     # Direct constructors retain the original immediate-cleanup behavior. The
     # deployment environment defaults to a 24-hour post-upload retention.
     cache_retention_hours: float = 0.0
+    # Metadata probing is optional and disabled by default. In either mode the
+    # archive copies the original bytes: no remux, decode, resize or transcode.
+    passthrough_probe: bool = False
 
     @property
     def effective_owner(self):
@@ -135,6 +138,7 @@ class Settings:
             int(float(os.environ.get('CACHE_MIN_FREE_GB', '5')) * 1e9),
             max(1, int(os.environ.get('SCAN_INTERVAL_SECONDS', '15'))),
             owner, username, retention,
+            os.environ.get('PASSTHROUGH_PROBE_METADATA', 'false').lower() == 'true',
         )
         get_zone(result.timezone)
         limit = 2000000000 if mode == 'local' else 50000000
@@ -148,35 +152,129 @@ class Settings:
 
 
 def normalize(source, dest, settings):
-    dest = Path(dest)
-    partial = dest.with_suffix('.part.mp4')
-    command = [settings.ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', str(source),
-               '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-movflags', '+faststart', str(partial)]
+    """Compatibility name for a byte-for-byte copy, never media conversion.
+
+    A camera's SDK can return a proprietary container despite its filename.
+    Inspect at most 4 KiB for naming, retain unknown formats as .bin, and make
+    any optional metadata probe best effort. Upload must not depend on being
+    able to decode camera audio/video.
+    """
+    source, dest = Path(source), Path(dest)
+    before = source.stat()
+    if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+        raise ValueError('Source must be a nonempty regular file')
+    with source.open('rb') as handle:
+        header = handle.read(4096)
+    container, extension = _media_header(header)
+    probe_status, duration, video, audio = 'disabled', None, None, None
+    if settings.passthrough_probe:
+        probe_status = 'unavailable'
+        try:
+            probe = subprocess.run([
+                settings.ffprobe, '-v', 'error', '-probesize', '262144',
+                '-analyzeduration', '500000', '-show_entries',
+                'format=format_name,duration:stream=codec_type,codec_name',
+                '-of', 'json', str(source),
+            ], capture_output=True, timeout=5)
+            if not probe.returncode and len(probe.stdout) <= 1000000:
+                data = json.loads(probe.stdout)
+                if isinstance(data, dict):
+                    media_format = data.get('format', {})
+                    streams = data.get('streams', [])
+                    if isinstance(media_format, dict) and isinstance(streams, list):
+                        name = media_format.get('format_name')
+                        if isinstance(name, str) and len(name) <= 100:
+                            container = name
+                            extension = _media_extension(name, extension)
+                        try:
+                            value = float(media_format.get('duration'))
+                            if math.isfinite(value) and value > 0:
+                                duration = value
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                        for stream in streams:
+                            if not isinstance(stream, dict):
+                                continue
+                            codec = stream.get('codec_name')
+                            if not isinstance(codec, str) or len(codec) > 100:
+                                continue
+                            if stream.get('codec_type') == 'video' and video is None:
+                                video = codec
+                            elif stream.get('codec_type') == 'audio' and audio is None:
+                                audio = codec
+                        probe_status = 'metadata'
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            # Original bytes remain useful even when a proprietary container
+            # is not supported by FFprobe or FFprobe is absent.
+            pass
+    suffix = source.suffix.lower()
+    if re.fullmatch(r'\.[a-z0-9]{1,10}', suffix) and suffix not in ('.source', '.part', '.partial'):
+        extension = suffix
+    dest = dest.with_suffix(extension)
+    partial = dest.with_suffix('.part' + extension)
+    _confined_path(dest, dest.parent.resolve(), allow_missing=True)
+    _confined_path(partial, dest.parent.resolve(), allow_missing=True)
+    source_digest = hashlib.sha256()
+    created = False
     try:
-        result = subprocess.run(command, capture_output=True, timeout=1800)
-        if result.returncode or result.stderr:
-            raise ValueError('Remux returned an error; source remains intact')
-        probe = subprocess.run([settings.ffprobe, '-v', 'error', '-show_format', '-show_streams',
-                                '-of', 'json', str(partial)], capture_output=True, timeout=120)
-        if probe.returncode or probe.stderr:
-            raise ValueError('Output probe failed')
-        data = json.loads(probe.stdout)
-        if 'mp4' not in data['format']['format_name'].split(','):
-            raise ValueError('Output is not ISO BMFF MP4')
-        decode = subprocess.run([settings.ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-i', str(partial),
-                                 '-map', '0:v:0', '-map', '0:a?', '-fps_mode', 'passthrough',
-                                 '-enc_time_base:v', '1:90000', '-f', 'null', '-'],
-                                capture_output=True, timeout=1800)
-        if decode.returncode or decode.stderr:
-            raise ValueError('Decode validation failed')
-        video = next(s for s in data['streams'] if s['codec_type'] == 'video')
-        audio = next((s for s in data['streams'] if s['codec_type'] == 'audio'), {})
+        descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        created = True
+        copied = 0
+        with os.fdopen(descriptor, 'wb') as output_handle, source.open('rb') as input_handle:
+            for block in iter(lambda: input_handle.read(1024 * 1024), b''):
+                source_digest.update(block)
+                output_handle.write(block)
+                copied += len(block)
+            output_handle.flush()
+            os.fsync(output_handle.fileno())
+            after = os.fstat(input_handle.fileno())
+        current = source.stat()
+        if (copied != before.st_size or after.st_size != before.st_size
+                or current.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns
+                or current.st_mtime_ns != before.st_mtime_ns
+                or (after.st_ino, after.st_dev) != (before.st_ino, before.st_dev)
+                or (current.st_ino, current.st_dev) != (before.st_ino, before.st_dev)):
+            raise ValueError('Source changed during pass-through copy; source was retained')
+        with partial.open('rb') as handle:
+            cached_digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+        if source_digest.hexdigest() != cached_digest or partial.stat().st_size != copied:
+            raise ValueError('Pass-through copy integrity mismatch; source was retained')
+        _confined_path(dest, dest.parent.resolve(), allow_missing=True)
         partial.replace(dest)
-        return {'duration': float(data['format']['duration']), 'codec_video': video['codec_name'],
-                'codec_audio': audio.get('codec_name'), 'bytes': dest.stat().st_size}
+        return {'duration': duration, 'codec_video': video, 'codec_audio': audio,
+                'bytes': copied, 'sha256': cached_digest, 'path': str(dest),
+                'container': container, 'probe_status': probe_status,
+                'file_extension': extension, 'processing_method': 'passthrough'}
     finally:
-        if partial.exists():
-            partial.unlink()
+        if created and partial.exists():
+            _confined_path(partial, dest.parent.resolve()).unlink()
+
+
+def _media_header(header):
+    """Bounded naming hint; it neither changes bytes nor certifies decodability."""
+    if len(header) >= 12 and header[4:8] == b'ftyp':
+        return 'mov,mp4', '.mp4'
+    if header.startswith(b'\x00\x00\x01\xba'):
+        return 'mpeg', '.ps'
+    if len(header) >= 377 and all(header[offset] == 0x47 for offset in (0, 188, 376)):
+        return 'mpegts', '.ts'
+    if header.startswith(b'\x1aE\xdf\xa3'):
+        return 'matroska', '.mkv'
+    if header.startswith(b'RIFF') and header[8:12] == b'AVI ':
+        return 'avi', '.avi'
+    if header.startswith(b'FLV'):
+        return 'flv', '.flv'
+    return None, '.bin'
+
+
+def _media_extension(container, fallback='.bin'):
+    names = set(container.split(','))
+    for name, extension in (('mp4', '.mp4'), ('mov', '.mov'), ('mpeg', '.ps'),
+                            ('mpegts', '.ts'), ('matroska', '.mkv'), ('webm', '.webm'),
+                            ('avi', '.avi'), ('flv', '.flv'), ('h264', '.h264'), ('hevc', '.h265')):
+        if name in names:
+            return extension
+    return fallback
 
 
 def _is_link(path):
@@ -239,7 +337,10 @@ class Archive:
             columns = {row[1] for row in self.conn.execute('PRAGMA table_info(recordings)')}
             for name, kind in (('file_unique_id', 'TEXT'), ('media_type', 'TEXT'),
                                ('bot_id', 'INTEGER'), ('uploaded_at', 'REAL'), ('cleaned_at', 'REAL'),
-                               ('deleted_at', 'REAL'), ('deleted_by', 'INTEGER')):
+                               ('deleted_at', 'REAL'), ('deleted_by', 'INTEGER'),
+                               ('processing_method', "TEXT NOT NULL DEFAULT 'legacy'"),
+                               ('media_container', 'TEXT'), ('media_probe_status', 'TEXT'),
+                               ('media_extension', 'TEXT')):
                 if name not in columns:
                     self.conn.execute(f'ALTER TABLE recordings ADD COLUMN {name} {kind}')
             camera_columns = {row[1] for row in self.conn.execute('PRAGMA table_info(cameras)')}
@@ -632,23 +733,36 @@ class Archive:
                     raise ValueError('Closed recording end_time changed; operator review required')
                 return dict(old, record_key=key)
         in_cache = sum(p.stat().st_size for p in self.settings.cache_dir.rglob('*') if p.is_file())
-        needed = source.stat().st_size * 2
+        needed = source.stat().st_size  # One exact cached copy, no conversion working file.
         free = shutil.disk_usage(self.settings.cache_dir).free
         if in_cache + needed > self.settings.cache_max_bytes or free - needed < self.settings.min_free_bytes:
             raise ValueError('Cache budget reached; source was retained')
-        dest = self.settings.cache_dir / (key + '.mp4')
+        dest = _confined_path(self._cache_root / (key + '.mp4'), self._cache_root, allow_missing=True)
         with self.conn:
             self.conn.execute('''INSERT INTO recordings(key,camera,record_id,start_ms,end_ms,source_path,status,created_at)
                 VALUES(?,?,?,?,?,?,'ingesting',?) ON CONFLICT(key) DO UPDATE SET status='ingesting',end_ms=excluded.end_ms''',
                 (key, entry['camera'], str(entry['record_id']), start_ms, end_ms, str(source), time.time()))
         try:
             info = normalize(source, dest, self.settings)
-            with dest.open('rb') as handle:
-                digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+            dest = _confined_path(info.get('path', dest), self._cache_root)
+            digest = info.get('sha256')
+            if not digest:
+                with dest.open('rb') as handle:
+                    digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+            duration = info['duration'] if info.get('duration') is not None else (end-start).total_seconds()
             with self.conn:
                 self.conn.execute('''UPDATE recordings SET local_path=?,status='downloaded',duration=?,codec_video=?,
-                    codec_audio=?,file_size=?,sha256=?,last_error=NULL WHERE key=?''',
-                    (str(dest), info['duration'], info['codec_video'], info['codec_audio'], info['bytes'], digest, key))
+                    codec_audio=?,file_size=?,sha256=?,last_error=NULL,processing_method='passthrough',
+                    media_container=?,media_probe_status=?,media_extension=? WHERE key=?''',
+                    (str(dest), duration, info['codec_video'], info['codec_audio'], info['bytes'], digest,
+                     info.get('container'), info.get('probe_status', 'disabled'), info.get('file_extension', dest.suffix), key))
+            # Remove only this row's prior managed converted copy, after the
+            # original-byte copy and its durable catalog reference exist.
+            if (old and old['local_path'] and old['local_path'] != str(dest)
+                    and re.fullmatch(re.escape(key) + r'\.[a-z0-9]{1,10}', Path(old['local_path']).name)):
+                prior = _confined_path(old['local_path'], self._cache_root, allow_missing=True)
+                if prior.exists():
+                    prior.unlink()
         except Exception as exc:
             with self.conn:
                 self.conn.execute("UPDATE recordings SET status='failed',last_error=? WHERE key=?", (type(exc).__name__, key))
@@ -736,10 +850,35 @@ class Archive:
         rows=self.conn.execute("SELECT key FROM recordings WHERE status='ingesting' AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL").fetchall()
         for row in rows:
             if not re.fullmatch(r'[0-9a-f]{64}',row['key']):raise ValueError('Invalid managed recording key')
-            partial=_confined_path(self._cache_root/(row['key']+'.part.mp4'),self._cache_root,allow_missing=True)
-            if partial.exists():partial.unlink()
+            # The old remux partial (.part.mp4) and new original-format copy
+            # partials share a generated stable key; never delete unknown files.
+            for candidate in self._cache_root.glob(row['key'] + '.part.*'):
+                if not re.fullmatch(re.escape(row['key']) + r'\.part\.[a-z0-9]{1,10}', candidate.name):
+                    continue
+                partial=_confined_path(candidate,self._cache_root)
+                partial.unlink()
         with self.conn:
             return self.conn.execute("UPDATE recordings SET status='failed',last_error='worker_restarted_during_ingest' WHERE status='ingesting' AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL").rowcount
+
+    def invalidate_legacy_cache(self, camera=None):
+        """Request raw re-ingest only for unposted, unambiguous old media.
+
+        An operator can call this once when migrating a deployed remux cache.
+        Existing posted, in-flight, uncertain and deleted clips remain intact;
+        no Telegram retry or source deletion occurs here.
+        """
+        if camera is not None and (not isinstance(camera, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', camera)):
+            raise ValueError('Invalid camera filter')
+        sql = """UPDATE recordings SET status='failed',last_error='raw_reingest_required'
+            WHERE processing_method!='passthrough' AND status IN ('downloaded','failed')
+            AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL
+            AND COALESCE(last_error,'')!='raw_reingest_required'"""
+        values = []
+        if camera is not None:
+            sql += ' AND camera=?'
+            values.append(camera)
+        with self.conn:
+            return self.conn.execute(sql, values).rowcount
 
     def cleanup(self, key):
         row = self.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone()
