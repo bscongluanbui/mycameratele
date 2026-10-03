@@ -26,6 +26,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --chown=10001:10001 archive_app/ ./archive_app/
 COPY --chown=10001:10001 tests/ ./tests/
+COPY --chown=10001:10001 compose.sdk.yaml ./compose.sdk.yaml
 USER 10001:10001
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
