@@ -1,6 +1,7 @@
 import json
 import hashlib
 import re
+import secrets
 from pathlib import Path
 import time
 import urllib.error
@@ -9,6 +10,7 @@ import urllib.request
 from datetime import datetime
 
 from .core import get_zone
+from .telegram_menu import TimeMenus
 
 
 class ApiRejected(Exception):
@@ -20,6 +22,35 @@ class ApiRejected(Exception):
 class Telegram:
     def __init__(self, settings):
         self.settings = settings
+        self._menu_retry_at = 0
+
+    def register_commands(self, archive):
+        """Configure the Telegram Menu once per token/schema, with bounded retries."""
+        if not self.settings.token:
+            return False
+        state_key='telegram_commands_v3:'+hashlib.sha256(self.settings.token.encode()).hexdigest()[:16]
+        if archive.state(state_key)=='1':return True
+        if time.time()<self._menu_retry_at:return False
+        self._menu_retry_at=time.time()+60
+        if self.request('setMyCommands',{'commands':TimeMenus.commands(),'scope':{'type':'all_private_chats'}}) is not True:
+            raise ValueError('Telegram command menu was not confirmed')
+        if self.request('setChatMenuButton',{'menu_button':{'type':'commands'}}) is not True:
+            raise ValueError('Telegram menu button was not confirmed')
+        archive.state(state_key,'1')
+        return True
+
+    @staticmethod
+    def reply_keyboard():
+        return {'keyboard':[[{'text':'📅 Hôm nay'},{'text':'📆 Hôm qua'},{'text':'🕕 6 giờ trước'}],
+                            [{'text':'📷 Camera'},{'text':'🕐 Video gần đây'},{'text':'🗑 Thùng rác'}],
+                            [{'text':'⚙ Trạng thái'}]],'resize_keyboard':True,'is_persistent':True}
+
+    @staticmethod
+    def recording_buttons(row, label):
+        prefix=row['key'][:32]
+        return [{'text':label,'callback_data':'v:'+prefix},
+                {'text':'⬇ Tải','callback_data':'f:'+prefix},
+                {'text':'🗑 Xóa','callback_data':'x:'+prefix}]
 
     @property
     def owner(self):
@@ -161,12 +192,12 @@ class Telegram:
                 archive.conn.execute("INSERT INTO state(name,value) VALUES('telegram_offset',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
                                      (str(update_id+1),))
 
-    def replay(self, archive, prefix, chat_id=None, *, update_id=None):
+    def replay(self, archive, prefix, chat_id=None, *, update_id=None, purpose='view'):
         """Resend Telegram's stored file ID; never read/delete/reupload local bytes."""
         recipient = self.owner if chat_id is None else chat_id
-        if type(recipient) is not int or recipient not in self.viewers or not re.fullmatch(r'[a-f0-9]{32}', prefix):
+        if type(recipient) is not int or recipient not in self.viewers or not re.fullmatch(r'[a-f0-9]{32}', prefix) or purpose not in ('view','download'):
             raise ValueError('Invalid archive play selection')
-        rows = archive.conn.execute("SELECT * FROM recordings WHERE status='uploaded' AND substr(key,1,32)=?",
+        rows = archive.conn.execute("SELECT * FROM recordings WHERE status='uploaded' AND deleted_at IS NULL AND substr(key,1,32)=?",
                                     (prefix,)).fetchall()
         if len(rows) != 1:
             raise ValueError('Unknown or ambiguous archive selection')
@@ -185,6 +216,9 @@ class Telegram:
         if field not in ('video','document'):
             raise ValueError('Unknown archived media type')
         fields = {'chat_id':recipient,field:file_id,'caption':self.caption(archive,row),'disable_notification':True}
+        fields['reply_markup']={'inline_keyboard':[self.recording_buttons(row,'▶ Xem lại')]}
+        if purpose=='download':
+            fields['caption']+='\n⬇ Tải bản gốc: dùng nút tải hoặc menu Telegram → Lưu video / Save to Downloads.'
         if field == 'video':
             fields['supports_streaming'] = True
         if update_id is not None:
@@ -242,8 +276,7 @@ class Telegram:
         buttons = []
         for row in result['recordings']:
             stamp = datetime.fromtimestamp(row['start_ms']/1000,zone).strftime('%d/%m %H:%M:%S')
-            buttons.append([{'text':archive.camera_name(row['camera'])+' | '+stamp+' ▶',
-                             'callback_data':self.play_callback(row)}])
+            buttons.append(self.recording_buttons(row,archive.camera_name(row['camera'])+' | '+stamp+' ▶'))
         nav = []
         if page:
             nav.append({'text':'←','callback_data':f'recent:{page-1}'})
@@ -259,10 +292,10 @@ class Telegram:
         # Keep callback payloads compact even for a 64-character camera ID.
         if data == 'status':
             return json.dumps(archive.status(),ensure_ascii=False),[[{'text':'↩ Camera','callback_data':'root'}]]
-        if data in ('today','yesterday'):
-            from datetime import timedelta
-            day=datetime.now(get_zone(self.settings.timezone))-(timedelta(days=1) if data=='yesterday' else timedelta())
-            return self._legacy_menu(archive,'d:'+day.strftime('%Y-%m-%d'))
+        if data in ('today','yesterday','last6h') or data.startswith(('w:','wc:')):
+            return TimeMenus(self).menu(archive,data)
+        if data.startswith('trash:'):
+            return self.trash_menu(archive,int(data.split(':')[1]))
         if data.startswith('recent:'):
             return self.recent_menu(archive,int(data.split(':')[1]))
         if data == 'root' or data.startswith('r:'):
@@ -279,8 +312,9 @@ class Telegram:
                 nav.append({'text':'→', 'callback_data':f'r:{page+1}'})
             if nav:
                 buttons.append(nav)
+            buttons.extend(TimeMenus.shortcuts())
             buttons.append([{'text':'🕐 Video gần đây','callback_data':'recent:0'},
-                            {'text':'📅 Hôm nay','callback_data':'today'},
+                            {'text':'🗑 Thùng rác','callback_data':'trash:0'},
                             {'text':'⚙ Trạng thái','callback_data':'status'}])
             return 'Archive — chọn Camera' + ('' if cameras else ' (chưa có camera)'), buttons
         pieces = data.split(':')
@@ -329,7 +363,7 @@ class Telegram:
         buttons = []
         for row in rows[page*10:page*10+10]:
             stamp = datetime.fromtimestamp(row['start_ms']/1000, zone).strftime('%H:%M:%S')
-            buttons.append([{'text':stamp+' ▶', 'callback_data':self.play_callback(row)}])
+            buttons.append(self.recording_buttons(row,stamp+' ▶'))
         nav = []
         if page:
             nav.append({'text':'←', 'callback_data':f'p:{token}:{day}:{order}:{page-1}'})
@@ -387,7 +421,7 @@ class Telegram:
             buttons=[]
             for row in rows[page*10:page*10+10]:
                 stamp=datetime.fromtimestamp(row['start_ms']/1000,zone).strftime('%H:%M:%S')
-                buttons.append([{'text':stamp+' ▶','callback_data':self.play_callback(row)}])
+                buttons.append(self.recording_buttons(row,stamp+' ▶'))
             nav=[]
             if page:
                 nav.append({'text':'←','callback_data':f'p:{day}:{camera_token}:{page-1}'})
@@ -397,6 +431,49 @@ class Telegram:
                 buttons.append(nav)
             return f'{day} | {archive.camera_name(camera)} | trang {page+1}',buttons
         raise ValueError('Unknown menu selection')
+
+    def trash_menu(self, archive, page=0):
+        if type(page) is not int or not 0<=page<=100000:raise ValueError('Invalid trash page')
+        result=archive.trash(offset=page*10,limit=10)
+        if page and not result['recordings']:raise ValueError('Invalid trash page')
+        buttons=[];zone=get_zone(self.settings.timezone)
+        for row in result['recordings']:
+            stamp=datetime.fromtimestamp(row['start_ms']/1000,zone).strftime('%d/%m %H:%M:%S')
+            buttons.append([{'text':f"↩ Khôi phục {archive.camera_name(row['camera'])} | {stamp}",
+                             'callback_data':'u:'+row['key'][:32]}])
+        nav=[]
+        if page:nav.append({'text':'←','callback_data':f'trash:{page-1}'})
+        if (page+1)*10<result['total']:nav.append({'text':'→','callback_data':f'trash:{page+1}'})
+        if nav:buttons.append(nav)
+        buttons.append([{'text':'↩ Camera','callback_data':'root'}])
+        return f"Thùng rác kho chung | {result['total']} video | trang {page+1}",buttons
+
+    def deletion_menu(self, archive, prefix, actor):
+        if actor not in self.viewers:raise ValueError('Viewer is not authorized')
+        row=archive.find_recording(prefix)
+        if not row:raise ValueError('Recording is no longer available')
+        nonce=secrets.token_hex(6)
+        archive.state(f'telegram_delete_confirm:{actor}',json.dumps({'key':row['key'],'nonce':nonce,'expires':time.time()+300}))
+        text=(self.caption(archive,row)+'\n\nXóa khỏi kho chung? Tất cả người được phép sẽ không còn thấy video '
+              'trong danh sách. Có thể khôi phục từ Thùng rác. Bản tin Telegram và bản đã tải vẫn còn.')
+        return text,[[{'text':'🗑 Xác nhận xóa khỏi kho','callback_data':f'xc:{prefix}:{nonce}'},
+                      {'text':'Hủy','callback_data':'cancel-delete'}]]
+
+    def confirm_deletion(self, archive, data, actor):
+        if actor not in self.viewers:raise ValueError('Viewer is not authorized')
+        pieces=data.split(':')
+        if len(pieces)!=3 or not re.fullmatch(r'[a-f0-9]{32}',pieces[1]) or not re.fullmatch(r'[a-f0-9]{12}',pieces[2]):
+            raise ValueError('Invalid delete confirmation')
+        pending=json.loads(archive.state(f'telegram_delete_confirm:{actor}') or '{}')
+        if (not isinstance(pending,dict) or not isinstance(pending.get('key'),str) or
+            pending['key'][:32]!=pieces[1] or pending.get('nonce')!=pieces[2] or
+            not isinstance(pending.get('expires'),(int,float)) or time.time()>pending['expires']):
+            raise ValueError('Delete confirmation expired or belongs to another viewer')
+        archive.soft_delete(pending['key'],actor)
+        archive.state(f'telegram_delete_confirm:{actor}','{}')
+        return 'Đã chuyển video vào Thùng rác của kho chung.',[[{'text':'↩ Khôi phục','callback_data':'u:'+pieces[1]},
+                                                            {'text':'🗑 Thùng rác','callback_data':'trash:0'},
+                                                            {'text':'📷 Camera','callback_data':'root'}]]
 
     def poll(self,archive):
         if not self.settings.token or not self.viewers:
@@ -417,6 +494,7 @@ class Telegram:
                 archive.state('telegram_offset',update['update_id']+1)
                 continue
             chat_id=message['chat']['id']
+            persistent_keyboard=False
             previous=self._replay_attempt(archive)
             if previous.get('update_id')==update['update_id'] and previous.get('phase') in ('pending','unknown','done','rejected'):
                 # Crash after the POST but before its durable cursor commit.
@@ -428,11 +506,25 @@ class Telegram:
                 try:
                     if callback:
                         self.request('answerCallbackQuery',{'callback_query_id':callback['id']})
-                        if callback['data'].startswith('v:'):
-                            self.replay(archive,callback['data'][2:],chat_id,update_id=update['update_id'])
+                        if callback['data'].startswith(('v:','f:')):
+                            self.replay(archive,callback['data'][2:],chat_id,update_id=update['update_id'],
+                                        purpose='download' if callback['data'].startswith('f:') else 'view')
                             archive.state('telegram_offset',update['update_id']+1)
                             continue
-                        text,buttons=self.menu(archive,callback['data'])
+                        if callback['data'].startswith('x:'):
+                            text,buttons=self.deletion_menu(archive,callback['data'][2:],actor)
+                        elif callback['data'].startswith('xc:'):
+                            text,buttons=self.confirm_deletion(archive,callback['data'],actor)
+                        elif callback['data'].startswith('u:'):
+                            row=archive.find_recording(callback['data'][2:],include_deleted=True)
+                            if not row:raise ValueError('Unknown recording to restore')
+                            archive.restore_recording(row['key'],actor)
+                            text,buttons=self.trash_menu(archive)
+                            text='Đã khôi phục video vào kho chung.\n'+text
+                        elif callback['data']=='cancel-delete':
+                            archive.state(f'telegram_delete_confirm:{actor}','{}')
+                            text,buttons=self.menu(archive,'root')
+                        else:text,buttons=self.menu(archive,callback['data'])
                     else:
                         words=message.get('text','').split()
                         command=words[0].split('@')[0] if words else ''
@@ -448,21 +540,19 @@ class Telegram:
                                   'Đã kết nối viewer. Video đã lưu được phát lại trong chat riêng này.')+'\nDùng /archive hoặc /recent để xem lại.'
                             buttons=[[{'text':'📷 Camera','callback_data':'root'},
                                       {'text':'🕐 Video gần đây','callback_data':'recent:0'}]]
+                            persistent_keyboard=True
                         elif command == '/status':
                             text=json.dumps(archive.status(),ensure_ascii=False)
                             buttons=[[{'text':'Archive','callback_data':'root'}]]
                         else:
-                            if command=='/today':
-                                data='d:'+datetime.now(get_zone(self.settings.timezone)).strftime('%Y-%m-%d')
-                            elif command=='/yesterday':
-                                from datetime import timedelta
-                                data='d:'+(datetime.now(get_zone(self.settings.timezone))-timedelta(days=1)).strftime('%Y-%m-%d')
-                            elif command=='/recent':
-                                data='recent:0'
-                            else:
-                                data='root'
+                            mapping={'/today':'today','/yesterday':'yesterday','/last6h':'last6h','/recent':'recent:0','/trash':'trash:0',
+                                     '📅 Hôm nay':'today','Hôm nay':'today','📆 Hôm qua':'yesterday','Hôm qua':'yesterday',
+                                     '🕕 6 giờ trước':'last6h','6 giờ trước':'last6h','6 giờ gần nhất':'last6h',
+                                     '📷 Camera':'root','🕐 Video gần đây':'recent:0','🗑 Thùng rác':'trash:0','⚙ Trạng thái':'status'}
+                            data=mapping.get(message.get('text','').strip(),mapping.get(command,'root'))
                             text,buttons=self.menu(archive,data)
-                    self.request('sendMessage',{'chat_id':chat_id,'text':text,'reply_markup':{'inline_keyboard':buttons}})
+                    self.request('sendMessage',{'chat_id':chat_id,'text':text,
+                                               'reply_markup':self.reply_keyboard() if persistent_keyboard else {'inline_keyboard':buttons}})
                 except (ValueError,KeyError,IndexError):
                     self.request('sendMessage',{'chat_id':chat_id,'text':'Mục lựa chọn đã thay đổi. Dùng /archive để chọn lại.'})
             except ApiRejected as exc:

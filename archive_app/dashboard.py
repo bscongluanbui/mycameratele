@@ -37,7 +37,7 @@ class DashboardServer(ThreadingHTTPServer):
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    server_version='EZVIZDashboard/2.0'
+    server_version='EZVIZDashboard/2.2'
     def setup(self):
         super().setup();self.connection.settimeout(15)
     def log_message(self,*args):pass  # Requests can contain cookies; do not log headers/tokens.
@@ -91,7 +91,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed=urlsplit(self.path);path=parsed.path
         try:
             if path=='/healthz' and method=='GET':
-                self.send(200,{'healthy':True,'service':'dashboard','version':'2.0'});return
+                self.send(200,{'healthy':True,'service':'dashboard','version':'2.2'});return
             if not path.startswith('/api/'):
                 assets={'/':('index.html','text/html'),'/app.js':('app.js','text/javascript'),'/style.css':('style.css','text/css')}
                 if method!='GET' or path not in assets:self.send(404,{'error':'Not found'});return

@@ -225,7 +225,9 @@ class TelegramTests(unittest.TestCase):
         self.assertRegex(callback, r"^p:2026-10-03:[0-9a-f]{12}:0$")
         title, clips = self.telegram.menu(self.archive, callback)
         self.assertIn("Front_Camera", title)
-        self.assertEqual(clips, [[{"text": "10:00:00 ▶", "callback_data": "v:"+key[:32]}]])
+        self.assertEqual(clips, [[{"text": "10:00:00 ▶", "callback_data": "v:"+key[:32]},
+                                 {"text": "⬇ Tải", "callback_data": "f:"+key[:32]},
+                                 {"text": "🗑 Xóa", "callback_data": "x:"+key[:32]}]])
         self.assertEqual(self.telegram.menu(self.archive, callback), (title, clips))
 
     def test_old_camera_callback_stays_bound_after_alphabetically_earlier_camera_is_added(self):

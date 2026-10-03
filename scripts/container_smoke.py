@@ -14,6 +14,7 @@ from pathlib import Path
 
 from archive_app.core import Archive, Settings, get_zone, parse_time
 from archive_app.telegram import Telegram
+from archive_app.telegram_menu import TimeMenus
 
 assert os.getuid() == 10001, "Image must run as its non-root application user"
 settings = Settings.from_env()
@@ -86,6 +87,24 @@ try:
     after = dict(archive.conn.execute('SELECT * FROM recordings WHERE key=?', (row['key'],)).fetchone())
     assert before == after  # Replay does not replace owner archive metadata.
     assert archive.telegram_url(after).endswith('start=play_'+row['key'][:32])
+    # Shared trash hides old selections for everyone, then restores the same ID.
+    assert archive.soft_delete(row['key'],77)
+    assert archive.browse(status='all')['total']==0
+    assert archive.find_recording(row['key'][:32]) is None
+    assert archive.telegram_url(archive.trash()['recordings'][0]) is None
+    try: telegram.replay(archive,row['key'][:32],88,purpose='download')
+    except ValueError: pass
+    else: raise AssertionError('Deleted clip remained downloadable through old bot link')
+    assert archive.restore_recording(row['key'],88)
+    assert telegram.replay(archive,row['key'][:32],77,purpose='download')=='replayed'
+    assert calls[-1][1]['video']=='fixture-file-id' and not calls[-1][2]
+    # Frozen shortcut -> camera -> filtered clip includes view/download/delete.
+    anchor=int(parse_time('2026-10-03T12:00:00+07:00').timestamp())
+    _,cameras=TimeMenus(telegram).menu(archive,f'w:h:{anchor}:a:0')
+    callback=next(b['callback_data'] for buttons in cameras for b in buttons if b['callback_data'].startswith('wc:'))
+    _,videos=TimeMenus(telegram).menu(archive,callback)
+    actions=[b['callback_data'] for buttons in videos for b in buttons]
+    assert all(prefix+row['key'][:32] in actions for prefix in ('v:','f:','x:'))
     assert archive.backup_daily().is_file()
     assert archive.backup_daily() is None
     assert hashlib.sha256(source.read_bytes()).hexdigest() == original
@@ -95,4 +114,5 @@ print(json.dumps({"result": "OK", "machine": platform.machine(), "uid": os.getui
                   "ffmpeg": "h264+aac-remux-decode", "sqlite": "durable-idempotent",
                   "source": "unchanged", "timezone": "+07:00", "telegram_posts": 0,
                   "private_bot": "owner+2-viewers-file-id-replay", "cache": "24h-cleanup",
+                  "bot_controls": "download+shared-trash-restore+time-camera-video",
                   "daily_backup": "atomic-sqlite"}, sort_keys=True))

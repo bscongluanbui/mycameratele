@@ -238,9 +238,16 @@ class Archive:
         try:
             columns = {row[1] for row in self.conn.execute('PRAGMA table_info(recordings)')}
             for name, kind in (('file_unique_id', 'TEXT'), ('media_type', 'TEXT'),
-                               ('bot_id', 'INTEGER'), ('uploaded_at', 'REAL'), ('cleaned_at', 'REAL')):
+                               ('bot_id', 'INTEGER'), ('uploaded_at', 'REAL'), ('cleaned_at', 'REAL'),
+                               ('deleted_at', 'REAL'), ('deleted_by', 'INTEGER')):
                 if name not in columns:
                     self.conn.execute(f'ALTER TABLE recordings ADD COLUMN {name} {kind}')
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS recording_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, recording_key TEXT NOT NULL,
+                actor INTEGER NOT NULL, action TEXT NOT NULL CHECK(action IN ('delete','restore')),
+                created_at REAL NOT NULL)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS by_active_window
+                ON recordings(status,deleted_at,start_ms,end_ms,camera)''')
             # Old rows have no known upload timestamp. Start their retention
             # clock at the first migration rather than deleting them early.
             self.conn.execute("INSERT OR IGNORE INTO state(name,value) VALUES('cleanup_legacy_hold_since',?)", (str(time.time()),))
@@ -294,7 +301,8 @@ class Archive:
     def cameras(self):
         rows=self.conn.execute('''SELECT c.*,COUNT(r.key) record_count,
             COALESCE(SUM(r.status='uploaded'),0) uploaded_count FROM cameras c
-            LEFT JOIN recordings r ON r.camera=c.id GROUP BY c.id ORDER BY c.name COLLATE NOCASE,c.id''')
+            LEFT JOIN recordings r ON r.camera=c.id AND r.deleted_at IS NULL
+            GROUP BY c.id ORDER BY c.name COLLATE NOCASE,c.id''')
         results=[]
         for row in rows:
             item=dict(row);item['enabled']=bool(item['enabled'])
@@ -354,11 +362,16 @@ class Archive:
             return None
         if row['status'] != 'uploaded' or not row['file_id'] or not re.fullmatch(r'[a-f0-9]{64}', row['key']):
             return None
+        # Check the durable row too: a stale menu/row must not produce a replay
+        # link after another allowed viewer has moved this clip to trash.
+        current = self.conn.execute('SELECT deleted_at FROM recordings WHERE key=?', (row['key'],)).fetchone()
+        if current is not None and current['deleted_at'] is not None:
+            return None
         return f"https://t.me/{username}?start=play_{row['key'][:32]}"
 
     def calendar(self,camera):
         zone=get_zone(self.settings.timezone);tree={}
-        for start,end in self.conn.execute("SELECT start_ms,end_ms FROM recordings WHERE camera=? AND status='uploaded'",(camera,)):
+        for start,end in self.conn.execute("SELECT start_ms,end_ms FROM recordings WHERE camera=? AND status='uploaded' AND deleted_at IS NULL",(camera,)):
             first=datetime.fromtimestamp(start/1000,zone).date()
             last=datetime.fromtimestamp((end-1)/1000,zone).date()
             while first<=last:
@@ -368,8 +381,8 @@ class Archive:
 
     def browse(self,camera=None,year=None,month=None,day=None,order='asc',status='uploaded',offset=0,limit=25):
         if order not in ('asc','desc') or status not in ('uploaded','all'):raise ValueError('Invalid archive filter')
-        if not 0<=offset<=1000000 or not 1<=limit<=100:raise ValueError('Invalid pagination')
-        clauses=[];params=[]
+        self._pagination(offset, limit)
+        clauses=['r.deleted_at IS NULL'];params=[]
         if status!='all':clauses.append('r.status=?');params.append(status)
         if camera:clauses.append('r.camera=?');params.append(camera)
         if day is not None and month is None or month is not None and year is None:raise ValueError('Date filters require year/month')
@@ -390,6 +403,115 @@ class Archive:
         recordings=[{**{k:row[k] for k in public},'telegram_url':self.telegram_url(row),
                      'telegram_available':row['status']=='uploaded' and bool(row['file_id'])} for row in rows]
         return {'recordings':recordings,'total':total,'offset':offset,'limit':limit}
+
+    @staticmethod
+    def _pagination(offset, limit):
+        if type(offset) is not int or type(limit) is not int or not 0 <= offset <= 1000000 or not 1 <= limit <= 100:
+            raise ValueError('Invalid pagination')
+
+    @staticmethod
+    def _window(start_ms, end_ms):
+        # UTC milliseconds remain independent of the display timezone. Limit
+        # menu windows so malformed callbacks cannot run unbounded catalogs.
+        if type(start_ms) is not int or type(end_ms) is not int:
+            raise ValueError('Window bounds must be integer UTC milliseconds')
+        maximum = 4133980800000  # 2101-01-01T00:00:00Z; includes all of 2100.
+        if not 0 <= start_ms < end_ms <= maximum or end_ms - start_ms > 31 * 86400000:
+            raise ValueError('Invalid archive window')
+
+    def list_window(self, start_ms, end_ms, camera=None, order='asc', offset=0, limit=10):
+        """Return bot-internal metadata for uploaded clips overlapping [start,end)."""
+        self._window(start_ms, end_ms)
+        self._pagination(offset, limit)
+        if order not in ('asc', 'desc'):
+            raise ValueError('Invalid archive sort order')
+        if camera is not None and (not isinstance(camera, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', camera)):
+            raise ValueError('Invalid camera ID')
+        clauses = ["r.status='uploaded'", 'r.deleted_at IS NULL', 'r.start_ms<?', 'r.end_ms>?']
+        values = [end_ms, start_ms]
+        if camera is not None:
+            clauses.append('r.camera=?')
+            values.append(camera)
+        where = ' WHERE ' + ' AND '.join(clauses)
+        total = self.conn.execute('SELECT COUNT(*) FROM recordings r' + where, values).fetchone()[0]
+        direction = 'ASC' if order == 'asc' else 'DESC'
+        rows = self.conn.execute('''SELECT r.*,COALESCE(c.name,r.camera) camera_name
+            FROM recordings r LEFT JOIN cameras c ON c.id=r.camera''' + where +
+            ' ORDER BY r.start_ms ' + direction + ',r.key ' + direction + ' LIMIT ? OFFSET ?',
+            (*values, limit, offset))
+        return {'recordings': [dict(row) for row in rows], 'total': total, 'offset': offset, 'limit': limit}
+
+    def window_cameras(self, start_ms, end_ms, offset=0, limit=10):
+        self._window(start_ms, end_ms)
+        self._pagination(offset, limit)
+        rows = self.conn.execute('''SELECT r.camera id,COALESCE(c.name,r.camera) name,COUNT(*) count
+            FROM recordings r LEFT JOIN cameras c ON c.id=r.camera
+            WHERE r.status='uploaded' AND r.deleted_at IS NULL AND r.start_ms<? AND r.end_ms>?
+            GROUP BY r.camera''', (end_ms, start_ms))
+        # SQLite NOCASE handles ASCII only; casefold also orders Vietnamese
+        # names deterministically without changing stable camera IDs.
+        cameras = sorted((dict(row) for row in rows), key=lambda item: (item['name'].casefold(), item['id']))
+        return {'cameras': cameras[offset:offset+limit], 'total': len(cameras), 'offset': offset, 'limit': limit}
+
+    def find_recording(self, prefix, include_deleted=False):
+        if not isinstance(prefix, str) or not re.fullmatch(r'[a-f0-9]{32}(?:[a-f0-9]{32})?', prefix):
+            return None
+        if type(include_deleted) is not bool:
+            raise ValueError('Invalid deleted filter')
+        sql = "SELECT r.*,COALESCE(c.name,r.camera) camera_name FROM recordings r LEFT JOIN cameras c ON c.id=r.camera WHERE r.status='uploaded' AND r.key LIKE ?"
+        if not include_deleted:
+            sql += ' AND r.deleted_at IS NULL'
+        rows = self.conn.execute(sql + ' LIMIT 2', (prefix+'%',)).fetchall()
+        return dict(rows[0]) if len(rows) == 1 else None
+
+    def _archive_actor(self, actor):
+        allowed = {value for value in self.settings.allowed_users if type(value) is int and value > 0}
+        if self.settings.effective_owner:
+            allowed.add(self.settings.effective_owner)
+        if type(actor) is not int or actor <= 0 or actor not in allowed:
+            raise PermissionError('Archive access requires an allowed private user ID')
+
+    def _recording_mutation(self, key, actor, restore):
+        self._archive_actor(actor)
+        if not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{64}', key):
+            raise ValueError('A full stable recording key is required')
+        self.conn.execute('BEGIN IMMEDIATE')
+        try:
+            row = self.conn.execute("SELECT deleted_at FROM recordings WHERE key=? AND status='uploaded'", (key,)).fetchone()
+            changed = row is not None and (row['deleted_at'] is not None if restore else row['deleted_at'] is None)
+            if changed:
+                now = time.time()
+                if restore:
+                    self.conn.execute('UPDATE recordings SET deleted_at=NULL,deleted_by=NULL WHERE key=?', (key,))
+                else:
+                    self.conn.execute('UPDATE recordings SET deleted_at=?,deleted_by=? WHERE key=?', (now, actor, key))
+                self.conn.execute('INSERT INTO recording_audit(recording_key,actor,action,created_at) VALUES(?,?,?,?)',
+                                  (key, actor, 'restore' if restore else 'delete', now))
+            self.conn.commit()
+            return changed
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def soft_delete(self, key, actor):
+        """Hide one shared clip atomically, retaining Telegram IDs for undo."""
+        return self._recording_mutation(key, actor, False)
+
+    def restore_recording(self, key, actor):
+        return self._recording_mutation(key, actor, True)
+
+    def trash(self, offset=0, limit=10, order='desc'):
+        """Bot-internal trash metadata; the caller authenticates its private chat."""
+        self._pagination(offset, limit)
+        if order not in ('asc', 'desc'):
+            raise ValueError('Invalid archive sort order')
+        where = " WHERE r.status='uploaded' AND r.deleted_at IS NOT NULL"
+        total = self.conn.execute('SELECT COUNT(*) FROM recordings r'+where).fetchone()[0]
+        direction = 'ASC' if order == 'asc' else 'DESC'
+        rows = self.conn.execute('''SELECT r.*,COALESCE(c.name,r.camera) camera_name FROM recordings r
+            LEFT JOIN cameras c ON c.id=r.camera''' + where + ' ORDER BY r.deleted_at '+direction+',r.key '+direction+' LIMIT ? OFFSET ?',
+            (limit, offset))
+        return {'recordings': [dict(row) for row in rows], 'total': total, 'offset': offset, 'limit': limit}
 
     def ingest_entry(self, entry, dry_run=False):
         key = record_key(entry)
@@ -462,7 +584,7 @@ class Archive:
             raise ValueError('Expected YYYY-MM-DD')
         begin = local.replace(tzinfo=get_zone(self.settings.timezone))
         finish = begin + timedelta(days=1)
-        sql = "SELECT * FROM recordings WHERE status='uploaded' AND start_ms<? AND end_ms>?"
+        sql = "SELECT * FROM recordings WHERE status='uploaded' AND deleted_at IS NULL AND start_ms<? AND end_ms>?"
         values = [int(finish.timestamp()*1000), int(begin.timestamp()*1000)]
         if camera is not None:
             sql += ' AND camera=?'
@@ -647,5 +769,7 @@ class Archive:
                 'owner_started':bool(self.settings.effective_owner) and self.state(f'telegram_owner_started:{self.settings.effective_owner}')=='1',
                 'allowed_users_count':len(set(self.settings.allowed_users) | ({self.settings.effective_owner} if self.settings.effective_owner else set())),
                 'cache_retention_hours':self.settings.cache_retention_hours,'api_mode':self.settings.api_mode,
-                'version':'2.1','counts':{'cameras':self.conn.execute('SELECT COUNT(*) FROM cameras').fetchone()[0],
-                'recordings':self.conn.execute('SELECT COUNT(*) FROM recordings').fetchone()[0]}}
+                'version':'2.2','counts':{'cameras':self.conn.execute('SELECT COUNT(*) FROM cameras').fetchone()[0],
+                'recordings':self.conn.execute('SELECT COUNT(*) FROM recordings WHERE deleted_at IS NULL').fetchone()[0],
+                'uploaded':self.conn.execute("SELECT COUNT(*) FROM recordings WHERE status='uploaded' AND deleted_at IS NULL").fetchone()[0],
+                'deleted':self.conn.execute('SELECT COUNT(*) FROM recordings WHERE deleted_at IS NOT NULL').fetchone()[0]}}

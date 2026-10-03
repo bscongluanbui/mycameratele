@@ -116,6 +116,8 @@ def main():
             poll_archive=Archive(settings)
             try:
                 while not heartbeat_stop.is_set():
+                    try:telegram.register_commands(poll_archive)
+                    except Exception as exc:emit('telegram_menu_error',error_type=type(exc).__name__)
                     try:telegram.poll(poll_archive)
                     except Exception as exc:emit('telegram_poll_error',error_type=type(exc).__name__)
                     heartbeat_stop.wait(2)

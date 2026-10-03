@@ -159,6 +159,8 @@ Owner mở bot trên Telegram và bấm **Start / gửi `/start` trong private c
 cho automatic upload. [Telegram yêu cầu người dùng bắt đầu cuộc trò chuyện](https://core.telegram.org/bots#how-are-bots-different-from-users).
 Viewer được cho phép cũng mở bot và `/start`, sau đó duyệt `/archive` trong chat
 riêng của mình. Viewer không được thay owner và không mở gate upload của owner.
+Mọi ID trong allowlist được **xem, tải, xóa khỏi kho chung và khôi phục** video;
+quyền xóa này áp dụng cả video do camera khác ghi, không chỉ bản tin của viewer.
 
 Khi owner `/start` thành công, sửa `.env` thành `ENABLE_UPLOAD=true` rồi recreate:
 
@@ -177,7 +179,41 @@ kiểm tra người dùng được phép và private chat của chính người 
 Dashboard và `/archive` duyệt **Camera → Năm → Tháng → Ngày → Video**, phân trang
 và Cũ → Mới / Mới → Cũ theo thời gian ghi hình. Video qua nửa đêm có thể xuất hiện
 ở cả hai ngày; end đúng 00:00 không tính sang ngày mới. `/today`, `/yesterday`,
-`/recent`, `/status` là các shortcut.
+`/last6h`, `/recent`, `/trash`, `/status` là các shortcut. Worker đăng ký Menu
+commands của Telegram; gửi `/start` để nhận bàn phím nhanh phía dưới chat:
+
+```text
+Hôm nay / Hôm qua / 6 giờ trước → chọn Camera → danh sách video
+                              → Xem / Tải / Xóa
+```
+
+Hôm nay/Hôm qua theo ngày lịch của `DISPLAY_TIMEZONE`. “6 giờ trước” là **6 giờ
+gần nhất đến thời điểm bấm**, không phải một thời điểm đơn lẻ. Bot chỉ liệt kê
+camera có video trong khoảng đã chọn, 10 camera/video mỗi trang; có Cũ → Mới /
+Mới → Cũ. Video giao với khoảng thời gian được tính, gồm video qua nửa đêm;
+video kết thúc đúng đầu khoảng không được tính. Phân trang/sort/quay lại giữ
+nguyên khoảng ban đầu; bấm shortcut lại để lấy khoảng mới.
+
+### Xem, tải và Thùng rác chung
+
+- **Xem:** bot gửi video vào chat riêng của người được phép.
+- **Tải:** bot gửi lại media gốc và hướng dẫn dùng nút tải / menu Telegram
+  `Lưu video` hoặc `Save to Downloads`. Video vẫn dùng sendVideo, document vẫn
+  dùng sendDocument; không đổi loại file_id hay re-upload binary. Đây là tải
+  bằng client Telegram, không phát đường dẫn download chứa bot token.
+- **Xóa:** nút đầu chỉ mở xác nhận; xác nhận gắn với ID người bấm, hết hạn sau
+  5 phút. Xác nhận đưa video vào **Thùng rác kho chung**: mọi người mất quyền
+  truy cập video đó qua catalog/menu/link bot cũ. Worker không tự nhập lại hay
+  re-upload video đã xóa khi quét manifest cũ.
+- **Khôi phục:** `/trash` hoặc nút `Khôi phục` đưa cùng video trở lại kho, giữ
+  tên camera, thời gian, khóa và file_id; mọi người được phép có thể khôi phục.
+  SQLite ghi audit xóa/khôi phục; click lặp không tạo thêm lần xóa.
+
+Thùng rác là **xóa logic khỏi ứng dụng**, giữ metadata để khôi phục, không xóa
+bản tin Telegram đã gửi hoặc bản đã tải về thiết bị. Telegram giới hạn
+[deleteMessage ở bản tin dưới 48 giờ](https://core.telegram.org/bots/api#deletemessage);
+tính năng này không tuyên bố xóa vật lý mọi bản sao media trên Telegram.
+Cache đã upload vẫn theo retention hiện có; file nguồn `input` giữ nguyên.
 
 Bot lưu message ID, `file_id` và `file_unique_id` sau upload được xác nhận/commit.
 Chọn video gửi lại bằng `sendVideo`/`sendDocument` với **file_id**, không tải về
