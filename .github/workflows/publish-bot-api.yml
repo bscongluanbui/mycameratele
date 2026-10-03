@@ -50,8 +50,7 @@ jobs:
           context: .
           file: Dockerfile.bot-api
           platforms: ${{ matrix.platform }}
-          tags: ${{ steps.meta.outputs.image }}
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ steps.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           build-args: BUILD_JOBS=2
           cache-from: type=gha,scope=bot-api-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=bot-api-${{ matrix.arch }}

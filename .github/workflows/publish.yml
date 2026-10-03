@@ -80,8 +80,7 @@ jobs:
           file: Dockerfile
           target: final
           platforms: linux/amd64,linux/arm64,linux/arm/v7
-          tags: ${{ steps.meta.outputs.image }}
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ steps.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=app-multiarch
           cache-to: type=gha,mode=max,scope=app-multiarch
           provenance: mode=max
