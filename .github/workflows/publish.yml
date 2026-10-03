@@ -96,8 +96,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          index="$RUNNER_TEMP/app-smoke-index.json"
+          docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" > "$index"
+          python scripts/ci_validate_manifest.py "$index" linux/amd64 linux/arm64 linux/arm/v7
           for platform in linux/amd64 linux/arm64 linux/arm/v7; do
             echo "Container smoke: $platform"
+            # Classic Docker stores cannot reuse one index digest for multiple
+            # local architectures. Run the exact matching image child instead.
+            child="$(python scripts/ci_platform_digest.py "$index" "$platform")"
             docker run --rm --platform "$platform" --read-only --cap-drop ALL \
               --security-opt no-new-privileges \
               --tmpfs /tmp:rw,nosuid,mode=1777 \
@@ -105,7 +111,7 @@ jobs:
               --tmpfs /data:rw,nosuid,uid=10001,gid=10001 \
               --tmpfs /cache:rw,nosuid,uid=10001,gid=10001 \
               -e DISPLAY_TIMEZONE=Asia/Ho_Chi_Minh -e ENABLE_UPLOAD=false \
-              --entrypoint python "$IMAGE@$DIGEST" \
+              --entrypoint python "$IMAGE@$child" \
               -c "$(cat scripts/container_smoke.py)"
           done
       - name: Publish SHA/version tags; latest moves only from main

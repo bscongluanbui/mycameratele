@@ -32,11 +32,17 @@ jobs:
           set -euo pipefail
           mkdir -p "$DOCKER_CONFIG"
           echo '{}' > "$DOCKER_CONFIG/config.json"
-          image=ghcr.io/bscongluanbui/mycameratele:latest
+          image=ghcr.io/bscongluanbui/mycameratele
+          index="$RUNNER_TEMP/anonymous-app-index.json"
+          docker manifest inspect "$image:latest" > "$index"
+          python scripts/ci_validate_manifest.py "$index" linux/amd64 linux/arm64 linux/arm/v7
           for platform in linux/arm64 linux/arm/v7 linux/amd64; do
-            docker pull --platform "$platform" "$image"
-            docker run --rm --platform "$platform" --read-only "$image" doctor
+            child="$(python scripts/ci_platform_digest.py "$index" "$platform")"
+            docker pull --platform "$platform" "$image@$child"
+            docker run --rm --platform "$platform" --read-only "$image@$child" doctor
           done
+          # Keep one native index/tag pull for the real Compose first-install.
+          docker pull "$image:latest"
       - name: First-install Compose health and persistent volumes
         env:
           DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
@@ -58,10 +64,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          image=ghcr.io/bscongluanbui/mycameratele-bot-api
+          index="$RUNNER_TEMP/anonymous-bot-api-index.json"
+          docker manifest inspect "$image:latest" > "$index"
+          python scripts/ci_validate_manifest.py "$index" linux/amd64 linux/arm64
           for platform in linux/arm64 linux/amd64; do
-            image=ghcr.io/bscongluanbui/mycameratele-bot-api:latest
-            docker pull --platform "$platform" "$image"
-            docker run --rm --platform "$platform" --read-only "$image" --help
+            child="$(python scripts/ci_platform_digest.py "$index" "$platform")"
+            docker pull --platform "$platform" "$image@$child"
+            docker run --rm --platform "$platform" --read-only "$image@$child" --help
           done
           echo 'ANONYMOUS_PULL: bot_api=2_platforms credentials=none result=OK' >> "$GITHUB_STEP_SUMMARY"
       - name: Show diagnostics and stop isolated CI services
