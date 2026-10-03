@@ -234,6 +234,46 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self.run_job()['code'],'rate_limited');self.assertEqual(self.telegram.request.call_count,1)
         self.assertEqual(self.run_job()['code'],'rate_limited');self.assertEqual(self.telegram.request.call_count,1)
 
+    def test_remux_upload_pause_survives_sd_and_final_upload_phases(self):
+        self.settings.media_mode='remux_copy'
+        self.archive.ingest_entry(self.entry())
+        def sd_sync(*,progress=None):
+            snapshot={'backend':'hcnetsdk','searched':2,'downloaded':2,'imported':1,'already_known':0,'deferred':0,'backlog':0}
+            progress(snapshot)
+            snapshot={**snapshot,'imported':2}
+            progress(snapshot)
+            return snapshot
+        self.sd_mock.side_effect=sd_sync
+        for result in ('rate_limited','upload_unknown','storage_blocked'):
+            with self.subTest(result=result),patch.object(self.archive,'remux_pending_cache',side_effect=[
+                    {'converted':1,'failed':0},{'converted':0,'failed':0}]),patch.object(
+                    self.telegram,'upload_one',return_value=result) as upload:
+                self.run_job()
+                self.assertEqual(upload.call_count,1)
+
+    def test_remux_upload_exception_still_imports_sd_without_retry(self):
+        self.settings.media_mode='remux_copy'
+        self.archive.ingest_entry(self.entry())
+        with patch.object(self.archive,'remux_pending_cache',side_effect=[
+                {'converted':1,'failed':0},{'converted':0,'failed':0}]),patch.object(
+                self.telegram,'upload_one',side_effect=OSError('synthetic secret')) as upload:
+            job=self.run_job()
+        self.assertEqual(upload.call_count,1)
+        self.sd_mock.assert_called_once()
+        self.assertEqual(job['code'],'upload_failed')
+        self.assertNotIn('synthetic secret',json.dumps(job))
+
+    def test_remux_budget_block_is_preserved_and_reported(self):
+        self.settings.media_mode='remux_copy'
+        self.archive.ingest_entry(self.entry())
+        with patch.object(self.archive,'remux_pending_cache',return_value={
+                'converted':0,'failed':0,'budget_blocked':1}),patch.object(
+                self.telegram,'upload_one',return_value='needs_review'):
+            job=self.run_job()
+        self.assertEqual(job['code'],'remux_cache_budget')
+        self.assertEqual(job['statistics']['remux_budget_blocked'],1)
+        self.sd_mock.assert_not_called()
+
     def test_ambiguous_upload_not_retried_on_second_job(self):
         self.manifest();self.telegram.request=unittest.mock.Mock(side_effect=TimeoutError('password'))
         self.assertEqual(self.run_job()['code'],'upload_unknown');self.assertEqual(self.telegram.request.call_count,1)

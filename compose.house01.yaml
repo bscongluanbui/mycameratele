@@ -1,0 +1,28 @@
+# NEW installations only: isolate House01 project-prefixed volumes.
+# Existing /home/ubuntu/mycameratele deployments KEEP their current project
+# and volumes; set House01 fields in .env and DO NOT add this overlay there.
+# New install: docker compose -f compose.yaml -f compose.house01.yaml up -d
+name: ${HOUSE01_PROJECT_NAME:-mycameratele-house01}
+
+services:
+  archive:
+    environment:
+      TENANT_ID: house01
+      TELEGRAM_DESTINATION: channel
+      TELEGRAM_STORAGE_CHANNEL_ID: ${TELEGRAM_STORAGE_CHANNEL_ID:-}
+      MEDIA_MODE: ${MEDIA_MODE:-remux_copy}
+      KEEP_CACHE: "false"
+      CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-1}
+      SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-900}
+      PASSTHROUGH_PROBE_METADATA: "false"
+
+  dashboard:
+    environment:
+      TENANT_ID: house01
+      TELEGRAM_DESTINATION: channel
+      TELEGRAM_STORAGE_CHANNEL_ID: ${TELEGRAM_STORAGE_CHANNEL_ID:-}
+      MEDIA_MODE: ${MEDIA_MODE:-remux_copy}
+      KEEP_CACHE: "false"
+      CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-1}
+      SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-900}
+      PASSTHROUGH_PROBE_METADATA: "false"

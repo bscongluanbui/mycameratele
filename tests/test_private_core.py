@@ -29,7 +29,7 @@ class PrivateSettingsTests(unittest.TestCase):
         self.assertEqual(settings.effective_owner, 42)
         self.assertEqual(settings.chat_id, '42')
         self.assertEqual(settings.allowed_users, (42,))
-        self.assertEqual(settings.cache_retention_hours, 24)
+        self.assertEqual(settings.cache_retention_hours, 1)
 
     def test_positive_legacy_chat_alias_is_accepted(self):
         settings = self.load(TELEGRAM_CHAT_ID='42')

@@ -69,7 +69,7 @@
       return values[job?.state] || ["Chưa Start", "neutral"];
     },
     syncPhase(job) {
-      const phases = { sd_search: "Tìm recording SD", sd_complete: "Đã xử lý SD", scanning: "Kiểm tra nguồn", finished: "Kết thúc", queued: "Hàng đợi", probing: "Kiểm tra đường đến camera", preflight: "Kiểm tra nguồn SD", sd_download: "Tải SD", downloading: "Tải SD", download: "Tải SD", ingesting: "Lập chỉ mục", ingest: "Lập chỉ mục", normalize: "Chép nguyên bản", uploading: "Upload Telegram", upload: "Upload Telegram", completed: "Kết thúc", done: "Kết thúc" };
+      const phases = { sd_search: "Tìm recording SD", sd_complete: "Đã xử lý SD", scanning: "Kiểm tra nguồn", finished: "Kết thúc", queued: "Hàng đợi", probing: "Kiểm tra đường đến camera", preflight: "Kiểm tra nguồn SD", sd_download: "Tải SD", downloading: "Tải SD", download: "Tải SD", ingesting: "Lập chỉ mục", ingest: "Lập chỉ mục", normalize: "Chuẩn bị media (không encode)", uploading: "Upload Telegram", upload: "Upload Telegram", completed: "Kết thúc", done: "Kết thúc" };
       return phases[job?.phase] || job?.phase || "—";
     },
     syncHelp(job) {
@@ -377,7 +377,7 @@
     for (const [label, value] of details) { const row = node("div"); row.append(node("dt", "", label), node("dd", "", typeof value === "object" ? "Có dữ liệu" : value)); $("system-details").append(row); }
     const adapter = typeof status.sd_adapter === "object" ? (status.sd_adapter.status || status.sd_adapter.name || "auto") : String(status.sd_adapter || "auto");
     $("system-sd-status").textContent = "Theo dõi tiến trình sync";
-    $("system-sd-description").textContent = `Nguồn SD: ${adapter}. Worker chọn ISAPI hoặc HCNetSDK theo cấu hình camera, giữ nguyên byte và upload document; không transcode, remux hoặc decode. HCNetSDK cần compose.sdk.yaml / HCNETSDK_DIR và SDK đúng kiến trúc tại /opt/hcnetsdk. VPS cần route camera LAN qua Tailscale / Armbian; cổng mở không xác nhận đã tải được SD.`;
+    $("system-sd-description").textContent = `Nguồn SD: ${adapter}. Worker chọn ISAPI hoặc HCNetSDK theo cấu hình camera; House01 dùng MP4 remux-copy (không encode/AAC/full decode) rồi lưu private channel. Bot trả media khi có yêu cầu. Cache trung chuyển mặc định 1 giờ. HCNetSDK cần compose.sdk.yaml / HCNETSDK_DIR và SDK đúng kiến trúc tại /opt/hcnetsdk. VPS cần route camera LAN qua Tailscale / Armbian; cổng mở không xác nhận đã tải được SD.`;
     renderProbes();
   }
   function renderProbes() {

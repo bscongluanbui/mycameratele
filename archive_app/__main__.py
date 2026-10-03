@@ -15,7 +15,7 @@ from .sync import SyncQueue
 
 
 def emit(event, **data):
-    print(json.dumps({'event':event,**data},ensure_ascii=False),flush=True)
+    print(json.dumps({'tenant':os.environ.get('TENANT_ID','house01'),'event':event,**data},ensure_ascii=False),flush=True)
 
 
 @contextmanager
@@ -34,7 +34,7 @@ def mutation_lock(settings):
 
 
 def main():
-    parser=argparse.ArgumentParser(description='Camera SD sync, exported clip ingest and private Telegram archive.')
+    parser=argparse.ArgumentParser(description='House-scoped SD sync, MP4 stream-copy and Telegram archive.')
     subs=parser.add_subparsers(dest='command',required=True)
     doctor=subs.add_parser('doctor');doctor.add_argument('--network',action='store_true')
     dashboard=subs.add_parser('dashboard');dashboard.add_argument('--host',default=os.environ.get('DASHBOARD_HOST','0.0.0.0'));dashboard.add_argument('--port',type=int,default=int(os.environ.get('DASHBOARD_PORT','8080')))
@@ -54,7 +54,9 @@ def main():
     if args.command=='doctor':
         data={'machine':platform.machine(),'sd_adapter':'per-camera-native-or-isapi','automatic_sd_download':'requires_device_credentials_and_compatible_backend',
               'input_dir':str(settings.input_dir),'upload_enabled':settings.enable_upload,'api_mode':settings.api_mode,
-              'telegram_destination':'owner_private_chat','owner_configured':bool(settings.effective_owner),
+              'tenant_id':settings.tenant_id,'media_mode':settings.media_mode,
+              'telegram_destination':'channel' if settings.telegram_destination=='channel' or settings.storage_channel_id else 'owner_private_chat',
+              'storage_channel_configured':bool(settings.storage_channel_id),'owner_configured':bool(settings.effective_owner),
               'allowed_users_count':len(settings.allowed_users)}
         if args.network:
             host=os.environ.get('CAMERA_HOST','192.168.1.10');data['tcp']={}
@@ -93,8 +95,9 @@ def main():
         if args.command=='reconcile':
             row=archive.conn.execute('SELECT status FROM recordings WHERE key=?',(args.key,)).fetchone()
             if row is None or row[0]!='upload_unknown':raise ValueError('Reconcile requires upload_unknown recording and confirmed Message metadata')
-            if not settings.effective_owner or str(args.chat_id)!=str(settings.effective_owner):
-                raise ValueError('Confirmed upload must belong to the configured owner private chat')
+            allowed_destinations={str(value) for value in (settings.effective_owner,settings.storage_channel_id) if value}
+            if str(args.chat_id) not in allowed_destinations:
+                raise ValueError('Confirmed upload must belong to a configured storage destination')
             archive.mark_uploaded(args.key,args.chat_id,args.message_id,args.file_id,args.file_unique_id,args.media_type)
             archive.cleanup(args.key)
             emit('reconciled',key=args.key);return 0

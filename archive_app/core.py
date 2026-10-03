@@ -83,11 +83,17 @@ class Settings:
     owner_user_id: int = 0
     bot_username: str = ''
     # Direct constructors retain the original immediate-cleanup behavior. The
-    # deployment environment defaults to a 24-hour post-upload retention.
+    # deployment environment defaults to a one-hour post-upload retention.
     cache_retention_hours: float = 0.0
-    # Metadata probing is optional and disabled by default. In either mode the
-    # archive copies the original bytes: no remux, decode, resize or transcode.
+    # Raw-mode metadata probing is optional and disabled by default. MP4
+    # stream-copy mode never invokes a probe or decode-validation process.
     passthrough_probe: bool = False
+    tenant_id: str = 'house01'
+    telegram_destination: str = 'owner_private'
+    storage_channel_id: int = 0
+    # Library/test constructors remain byte-preserving. A deployment may
+    # explicitly select MP4 container remuxing with video/audio stream copy.
+    media_mode: str = 'raw'
 
     @property
     def effective_owner(self):
@@ -120,9 +126,23 @@ class Settings:
         username = os.environ.get('TELEGRAM_BOT_USERNAME', '').strip().lstrip('@')
         if username and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', username):
             raise ValueError('Invalid TELEGRAM_BOT_USERNAME')
-        retention = float(os.environ.get('CACHE_RETENTION_HOURS', '24'))
+        tenant = os.environ.get('TENANT_ID', 'house01').strip()
+        if not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', tenant):
+            raise ValueError('TENANT_ID must be a stable lowercase tenant slug')
+        destination = os.environ.get('TELEGRAM_DESTINATION', 'owner_private').strip()
+        if destination not in ('owner_private', 'channel'):
+            raise ValueError('TELEGRAM_DESTINATION must be owner_private or channel')
+        channel_value = os.environ.get('TELEGRAM_STORAGE_CHANNEL_ID', '').strip()
+        if channel_value and (not re.fullmatch(r'-[0-9]+', channel_value) or int(channel_value)>=0):
+            raise ValueError('TELEGRAM_STORAGE_CHANNEL_ID must be a negative numeric channel ID')
+        channel = int(channel_value) if channel_value else 0
+        if channel:destination='channel'
+        retention = float(os.environ.get('CACHE_RETENTION_HOURS', '1'))
         if not math.isfinite(retention) or retention < 0:
             raise ValueError('CACHE_RETENTION_HOURS must be a nonnegative finite number')
+        media_mode = os.environ.get('MEDIA_MODE', 'raw').strip().lower()
+        if media_mode not in ('raw', 'remux_copy'):
+            raise ValueError('MEDIA_MODE must be raw or remux_copy')
         result = cls(
             Path(os.environ.get('STATE_DIR', './data')).resolve(),
             Path(os.environ.get('CACHE_DIR', './cache')).resolve(),
@@ -139,6 +159,8 @@ class Settings:
             max(1, int(os.environ.get('SCAN_INTERVAL_SECONDS', '15'))),
             owner, username, retention,
             os.environ.get('PASSTHROUGH_PROBE_METADATA', 'false').lower() == 'true',
+            tenant_id=tenant, telegram_destination=destination, storage_channel_id=channel,
+            media_mode=media_mode,
         )
         get_zone(result.timezone)
         limit = 2000000000 if mode == 'local' else 50000000
@@ -146,12 +168,21 @@ class Settings:
             raise ValueError('TELEGRAM_MAX_BYTES exceeds configured API mode limit')
         if result.cache_max_bytes <= 0 or result.min_free_bytes < 0:
             raise ValueError('Invalid cache budget')
-        if result.enable_upload and (not result.token or not result.effective_owner):
-            raise ValueError('ENABLE_UPLOAD needs TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_USER_ID')
+        if result.enable_upload and (not result.token or (result.telegram_destination=='owner_private' and not result.effective_owner)):
+            raise ValueError('ENABLE_UPLOAD needs bot credentials and a configured destination')
         return result
 
 
 def normalize(source, dest, settings):
+    """Select original-byte transfer or explicitly approved MP4 stream copy."""
+    if settings.media_mode == 'remux_copy':
+        return _remux_copy(source, dest, settings)
+    if settings.media_mode != 'raw':
+        raise ValueError('MEDIA_MODE must be raw or remux_copy')
+    return _copy_original(source, dest, settings)
+
+
+def _copy_original(source, dest, settings, *, force_extension=None, probe_metadata=None):
     """Compatibility name for a byte-for-byte copy, never media conversion.
 
     A camera's SDK can return a proprietary container despite its filename.
@@ -167,7 +198,7 @@ def normalize(source, dest, settings):
         header = handle.read(4096)
     container, extension = _media_header(header)
     probe_status, duration, video, audio = 'disabled', None, None, None
-    if settings.passthrough_probe:
+    if settings.passthrough_probe if probe_metadata is None else probe_metadata:
         probe_status = 'unavailable'
         try:
             probe = subprocess.run([
@@ -210,6 +241,8 @@ def normalize(source, dest, settings):
     suffix = source.suffix.lower()
     if re.fullmatch(r'\.[a-z0-9]{1,10}', suffix) and suffix not in ('.source', '.part', '.partial'):
         extension = suffix
+    if force_extension is not None:
+        extension = force_extension
     dest = dest.with_suffix(extension)
     partial = dest.with_suffix('.part' + extension)
     _confined_path(dest, dest.parent.resolve(), allow_missing=True)
@@ -248,6 +281,70 @@ def normalize(source, dest, settings):
     finally:
         if created and partial.exists():
             _confined_path(partial, dest.parent.resolve()).unlink()
+
+
+def _remux_copy(source, dest, settings):
+    """MP4 output without any encoder, audio conversion or decode validation.
+
+    Existing MP4 bytes are copied intact. Camera PS/TS packets are remuxed
+    with FFmpeg's stream-copy path; unsupported codecs fail rather than being
+    re-encoded. The source remains read-only and no FFprobe process is started.
+    """
+    source, dest = Path(source), Path(dest).with_suffix('.mp4')
+    before = source.stat()
+    if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+        raise ValueError('Source must be a nonempty regular file')
+    with source.open('rb') as handle:
+        container, extension = _media_header(handle.read(4096))
+    if extension == '.mp4':
+        info = _copy_original(source, dest, settings, force_extension='.mp4', probe_metadata=False)
+        return dict(info, processing_method='remux_copy', container='mov,mp4', probe_status='disabled')
+    if container not in ('mpeg', 'mpegts'):
+        raise ValueError('Stream-copy MP4 input must be an existing MP4 or camera PS/TS file; source was retained')
+    partial = dest.with_suffix('.part.mp4')
+    root = dest.parent.resolve()
+    _confined_path(dest, root, allow_missing=True)
+    _confined_path(partial, root, allow_missing=True)
+    created = False
+    try:
+        descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        os.close(descriptor)
+        created = True
+        environment = dict(os.environ)
+        # Vendor HCNetSDK OpenSSL libraries must not replace FFmpeg's system
+        # libraries. The SDK runs separately and keeps its own environment.
+        environment.pop('LD_LIBRARY_PATH', None)
+        command = [settings.ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+                   '-probesize', '1048576', '-analyzeduration', '1000000',
+                   '-i', str(source), '-map', '0:v:0', '-map', '0:a?', '-c', 'copy',
+                   '-movflags', '+faststart', str(partial)]
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=300, env=environment)
+        except (OSError, subprocess.SubprocessError):
+            raise ValueError('Stream-copy MP4 remux did not complete; source was retained') from None
+        if result.returncode:
+            raise ValueError('Stream-copy MP4 remux failed; source was retained')
+        current = source.stat()
+        if (current.st_size != before.st_size or current.st_mtime_ns != before.st_mtime_ns
+                or (current.st_ino, current.st_dev) != (before.st_ino, before.st_dev)):
+            raise ValueError('Source changed during stream-copy remux; source was retained')
+        output = _confined_path(partial, root)
+        output_size = output.stat().st_size
+        with output.open('rb') as handle:
+            _, output_extension = _media_header(handle.read(4096))
+            handle.seek(0)
+            digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+        if output_size <= 0 or output_extension != '.mp4' or output_size > before.st_size * 2:
+            raise ValueError('Stream-copy remux did not produce an MP4 container; source was retained')
+        _confined_path(dest, root, allow_missing=True)
+        output.replace(dest)
+        return {'duration': None, 'codec_video': None, 'codec_audio': None,
+                'bytes': output_size, 'sha256': digest, 'path': str(dest),
+                'container': 'mov,mp4', 'probe_status': 'disabled',
+                'file_extension': '.mp4', 'processing_method': 'remux_copy'}
+    finally:
+        if created and partial.exists():
+            _confined_path(partial, root).unlink()
 
 
 def _media_header(header):
@@ -302,6 +399,8 @@ def _confined_path(path, root, *, allow_missing=False):
 
 class Archive:
     def __init__(self, settings):
+        if not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', settings.tenant_id):
+            raise ValueError('Invalid archive tenant identity')
         self.settings = settings
         settings.state_dir.mkdir(parents=True, exist_ok=True)
         settings.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -340,7 +439,9 @@ class Archive:
                                ('deleted_at', 'REAL'), ('deleted_by', 'INTEGER'),
                                ('processing_method', "TEXT NOT NULL DEFAULT 'legacy'"),
                                ('media_container', 'TEXT'), ('media_probe_status', 'TEXT'),
-                               ('media_extension', 'TEXT')):
+                               ('media_extension', 'TEXT'),
+                               ('storage_kind', "TEXT NOT NULL DEFAULT 'owner_private'"),
+                               ('storage_chat_id', 'INTEGER'), ('storage_message_id', 'INTEGER')):
                 if name not in columns:
                     self.conn.execute(f'ALTER TABLE recordings ADD COLUMN {name} {kind}')
             camera_columns = {row[1] for row in self.conn.execute('PRAGMA table_info(cameras)')}
@@ -361,6 +462,9 @@ class Archive:
             # Old rows have no known upload timestamp. Start their retention
             # clock at the first migration rather than deleting them early.
             self.conn.execute("INSERT OR IGNORE INTO state(name,value) VALUES('cleanup_legacy_hold_since',?)", (str(time.time()),))
+            self.conn.execute("INSERT OR IGNORE INTO state(name,value) VALUES('archive_tenant_id',?)", (settings.tenant_id,))
+            if self.conn.execute("SELECT value FROM state WHERE name='archive_tenant_id'").fetchone()[0] != settings.tenant_id:
+                raise ValueError('Archive database belongs to a different tenant')
             self.conn.execute('''INSERT OR IGNORE INTO cameras(id,name,created_at)
                 SELECT DISTINCT camera,camera,? FROM recordings''',(time.time(),))
             self.conn.commit()
@@ -733,7 +837,7 @@ class Archive:
                     raise ValueError('Closed recording end_time changed; operator review required')
                 return dict(old, record_key=key)
         in_cache = sum(p.stat().st_size for p in self.settings.cache_dir.rglob('*') if p.is_file())
-        needed = source.stat().st_size  # One exact cached copy, no conversion working file.
+        needed = source.stat().st_size * (2 if self.settings.media_mode == 'remux_copy' else 1)
         free = shutil.disk_usage(self.settings.cache_dir).free
         if in_cache + needed > self.settings.cache_max_bytes or free - needed < self.settings.min_free_bytes:
             raise ValueError('Cache budget reached; source was retained')
@@ -744,18 +848,7 @@ class Archive:
                 (key, entry['camera'], str(entry['record_id']), start_ms, end_ms, str(source), time.time()))
         try:
             info = normalize(source, dest, self.settings)
-            dest = _confined_path(info.get('path', dest), self._cache_root)
-            digest = info.get('sha256')
-            if not digest:
-                with dest.open('rb') as handle:
-                    digest = hashlib.file_digest(handle, 'sha256').hexdigest()
-            duration = info['duration'] if info.get('duration') is not None else (end-start).total_seconds()
-            with self.conn:
-                self.conn.execute('''UPDATE recordings SET local_path=?,status='downloaded',duration=?,codec_video=?,
-                    codec_audio=?,file_size=?,sha256=?,last_error=NULL,processing_method='passthrough',
-                    media_container=?,media_probe_status=?,media_extension=? WHERE key=?''',
-                    (str(dest), duration, info['codec_video'], info['codec_audio'], info['bytes'], digest,
-                     info.get('container'), info.get('probe_status', 'disabled'), info.get('file_extension', dest.suffix), key))
+            dest = self._store_media(key, info, dest, (end-start).total_seconds())
             # Remove only this row's prior managed converted copy, after the
             # original-byte copy and its durable catalog reference exist.
             if (old and old['local_path'] and old['local_path'] != str(dest)
@@ -764,10 +857,45 @@ class Archive:
                 if prior.exists():
                     prior.unlink()
         except Exception as exc:
+            if self.settings.media_mode == 'remux_copy':
+                try:
+                    self._retain_raw_remux_failure(key, source, (end-start).total_seconds())
+                except Exception:
+                    with self.conn:
+                        self.conn.execute("UPDATE recordings SET status='needs_review',last_error='failed_remux' WHERE key=?", (key,))
+                raise
             with self.conn:
                 self.conn.execute("UPDATE recordings SET status='failed',last_error=? WHERE key=?", (type(exc).__name__, key))
             raise
         return dict(self.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone(), record_key=key)
+
+    def _store_media(self, key, info, fallback_path, fallback_duration, *, status='downloaded', error=None):
+        """Persist one confirmed local artifact without changing stable identity."""
+        if status not in ('downloaded', 'needs_review'):
+            raise ValueError('Invalid ingested media status')
+        processing = info.get('processing_method', 'passthrough')
+        if processing not in ('passthrough', 'remux_copy'):
+            raise ValueError('Invalid media processing method')
+        path = _confined_path(info.get('path', fallback_path), self._cache_root)
+        digest = info.get('sha256')
+        if not digest:
+            with path.open('rb') as handle:
+                digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+        duration = info['duration'] if info.get('duration') is not None else fallback_duration
+        with self.conn:
+            self.conn.execute('''UPDATE recordings SET local_path=?,status=?,duration=?,codec_video=?,
+                codec_audio=?,file_size=?,sha256=?,last_error=?,processing_method=?,
+                media_container=?,media_probe_status=?,media_extension=? WHERE key=?''',
+                (str(path), status, duration, info.get('codec_video'), info.get('codec_audio'), info['bytes'], digest,
+                 error, processing, info.get('container'), info.get('probe_status', 'disabled'),
+                 info.get('file_extension', path.suffix), key))
+        return path
+
+    def _retain_raw_remux_failure(self, key, source, duration):
+        """Keep an original cached copy when MP4 cannot retain its codecs."""
+        dest = _confined_path(self._cache_root/(key+'.mp4'), self._cache_root, allow_missing=True)
+        info = _copy_original(source, dest, self.settings, probe_metadata=False)
+        return self._store_media(key, info, dest, duration, status='needs_review', error='failed_remux')
 
     def ingest_manifest(self, path, dry_run=False, continue_on_error=False, camera=None):
         if camera is not None and (not isinstance(camera,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',camera)):
@@ -824,7 +952,8 @@ class Archive:
             self.conn.rollback()
             raise
 
-    def mark_uploaded(self, key, chat_id, message_id, file_id, file_unique_id=None, media_type=None, bot_id=None):
+    def mark_uploaded(self, key, chat_id, message_id, file_id, file_unique_id=None, media_type=None, bot_id=None,
+                      *, storage_kind=None, storage_chat_id=None, storage_message_id=None):
         if not chat_id or int(message_id) <= 0 or not isinstance(file_id, str) or not file_id.strip():
             raise ValueError('Confirmed Telegram metadata required')
         if file_unique_id is not None and (not isinstance(file_unique_id, str) or not file_unique_id.strip()):
@@ -833,11 +962,26 @@ class Archive:
             raise ValueError('Telegram media_type must be video or document')
         if bot_id is not None and (type(bot_id) is not int or bot_id <= 0):
             raise ValueError('Invalid Telegram bot identity')
+        placement = storage_kind or ('channel' if int(chat_id)<0 else 'owner_private')
+        if placement not in ('channel', 'owner_private'):
+            raise ValueError('Invalid Telegram storage kind')
+        if placement == 'channel':
+            source_chat = int(chat_id) if storage_chat_id is None else storage_chat_id
+            source_message = int(message_id) if storage_message_id is None else storage_message_id
+            if (type(source_chat) is not int or source_chat>=0 or source_chat!=int(chat_id)
+                    or type(source_message) is not int or source_message<=0 or source_message!=int(message_id)):
+                raise ValueError('Confirmed channel placement is inconsistent')
+        else:
+            if int(chat_id)<=0 or storage_chat_id is not None or storage_message_id is not None:
+                raise ValueError('Private placement is inconsistent')
+            source_chat=source_message=None
         with self.conn:
             changed = self.conn.execute("""UPDATE recordings SET status='uploaded',chat_id=?,message_id=?,file_id=?,
                 file_unique_id=COALESCE(?,file_unique_id),media_type=COALESCE(?,media_type),bot_id=COALESCE(?,bot_id),
-                uploaded_at=COALESCE(uploaded_at,?),last_error=NULL WHERE key=?""",
-                (str(chat_id),int(message_id),file_id,file_unique_id,media_type,bot_id,time.time(),key)).rowcount
+                uploaded_at=COALESCE(uploaded_at,?),last_error=NULL,
+                storage_kind=?,storage_chat_id=?,storage_message_id=? WHERE key=?""",
+                (str(chat_id),int(message_id),file_id,file_unique_id,media_type,bot_id,time.time(),
+                 placement,source_chat,source_message,key)).rowcount
         if not changed:
             raise ValueError('Unknown record key')
 
@@ -869,16 +1013,85 @@ class Archive:
         """
         if camera is not None and (not isinstance(camera, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', camera)):
             raise ValueError('Invalid camera filter')
-        sql = """UPDATE recordings SET status='failed',last_error='raw_reingest_required'
-            WHERE processing_method!='passthrough' AND status IN ('downloaded','failed')
+        current_modes = ('remux_copy',) if self.settings.media_mode == 'remux_copy' else ('passthrough', 'remux_copy')
+        placeholders = ','.join('?' for _ in current_modes)
+        sql = f"""UPDATE recordings SET status='failed',last_error='raw_reingest_required'
+            WHERE processing_method NOT IN ({placeholders}) AND status IN ('downloaded','failed')
             AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL
             AND COALESCE(last_error,'')!='raw_reingest_required'"""
-        values = []
+        values = list(current_modes)
         if camera is not None:
             sql += ' AND camera=?'
             values.append(camera)
         with self.conn:
             return self.conn.execute(sql, values).rowcount
+
+    def remux_pending_cache(self, camera=None, limit=5):
+        """Exclusive-worker migration: reuse unposted raw cache, not the SD card.
+
+        Posted/in-flight/uncertain/deleted rows never enter this operation. A
+        row is atomically made non-uploadable before starting FFmpeg; failure
+        retains its original bytes and goes to explicit operator review.
+        """
+        result = {'converted': 0, 'failed': 0}
+        if camera is not None and (not isinstance(camera, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', camera)):
+            raise ValueError('Invalid camera filter')
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('Invalid pending remux batch size')
+        if self.settings.media_mode != 'remux_copy':
+            return result
+        where = """processing_method='passthrough' AND status IN ('downloaded','failed')
+            AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL
+            AND local_path IS NOT NULL AND local_path!=''"""
+        values = []
+        if camera is not None:
+            where += ' AND camera=?'
+            values.append(camera)
+        rows = self.conn.execute('SELECT * FROM recordings WHERE '+where+' ORDER BY start_ms,key LIMIT ?', [*values, limit]).fetchall()
+        for row in rows:
+            if not re.fullmatch(r'[0-9a-f]{64}', row['key']):
+                raise ValueError('Invalid managed recording key')
+            # Reserve worst-case MP4 working space before taking the row away
+            # from its current pending state. A full disk is backpressure, not
+            # an unsupported-codec failure, and must not strand valid raw data
+            # in needs_review or repeatedly claim it in a limit=1 caller loop.
+            try:
+                existing_source = _confined_path(row['local_path'], self._cache_root)
+                source_size = existing_source.stat().st_size
+            except (OSError, TypeError, ValueError):
+                # The existing claim/error path below diagnoses missing or
+                # invalid paths atomically and preserves uncertain row guards.
+                pass
+            else:
+                used = sum(path.stat().st_size for path in self._cache_root.rglob('*') if path.is_file())
+                reserved = source_size * 2
+                free = shutil.disk_usage(self._cache_root).free
+                if used + reserved > self.settings.cache_max_bytes or free - reserved < self.settings.min_free_bytes:
+                    return dict(result, budget_blocked=1)
+            with self.conn:
+                claimed = self.conn.execute("UPDATE recordings SET status='ingesting' WHERE key=? AND "+where,
+                                            [row['key'], *values]).rowcount
+            if not claimed:
+                continue
+            try:
+                source = _confined_path(row['local_path'], self._cache_root)
+                dest = _confined_path(self._cache_root/(row['key']+'.mp4'), self._cache_root, allow_missing=True)
+                info = normalize(source, dest, self.settings)
+                saved = self._store_media(row['key'], info, dest, (row['end_ms']-row['start_ms'])/1000)
+                if source != saved and re.fullmatch(re.escape(row['key'])+r'\.[a-z0-9]{1,10}', source.name):
+                    _confined_path(source, self._cache_root).unlink()
+                result['converted'] += 1
+            except FileNotFoundError:
+                with self.conn:
+                    self.conn.execute("UPDATE recordings SET status='failed',last_error='raw_reingest_required',local_path=NULL WHERE key=?", (row['key'],))
+                result['failed'] += 1
+            except Exception:
+                # The previous raw local_path and its SHA remain referenced;
+                # never retry it as a document or alter Telegram references.
+                with self.conn:
+                    self.conn.execute("UPDATE recordings SET status='needs_review',last_error='failed_remux' WHERE key=?", (row['key'],))
+                result['failed'] += 1
+        return result
 
     def cleanup(self, key):
         row = self.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone()
@@ -1021,7 +1234,11 @@ class Archive:
                 'sd_adapter':'hcnetsdk-or-isapi+exported-file-ingest', 'sd_auto_download':'per_camera_configured',
                 'sd_sources':camera_sources,
                 'upload_enabled':self.settings.enable_upload, 'timezone':self.settings.timezone,
-                'telegram_destination':'owner_private_chat','owner_configured':bool(self.settings.effective_owner),
+                'tenant_id':self.settings.tenant_id,
+                'telegram_destination':'channel' if self.settings.telegram_destination=='channel' or self.settings.storage_channel_id else 'owner_private_chat',
+                'storage_channel_configured':bool(self.settings.storage_channel_id),
+                'media_mode':self.settings.media_mode,
+                'owner_configured':bool(self.settings.effective_owner),
                 'owner_started':bool(self.settings.effective_owner) and self.state(f'telegram_owner_started:{self.settings.effective_owner}')=='1',
                 'allowed_users_count':len(set(self.settings.allowed_users) | ({self.settings.effective_owner} if self.settings.effective_owner else set())),
                 'cache_retention_hours':self.settings.cache_retention_hours,'api_mode':self.settings.api_mode,

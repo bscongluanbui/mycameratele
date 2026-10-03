@@ -23,6 +23,9 @@ from archive_app.dashboard import DashboardServer
 
 assert os.getuid() == 10001, "Image must run as its non-root application user"
 settings = Settings.from_env()
+settings.media_mode='raw'  # Backward-compatibility fixture; House01 has its own smoke.
+settings.telegram_destination='owner_private'
+settings.storage_channel_id=0
 assert not settings.enable_upload
 settings.min_free_bytes = 0  # Synthetic tmpfs smoke must not require 5 GB free RAM.
 source = settings.input_dir / "synthetic-smoke.mp4"

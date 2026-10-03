@@ -18,7 +18,8 @@ TERMINAL_STATES = ('completed', 'blocked', 'failed')
 
 def _statistics():
     return {'manifests': 0, 'matched': 0, 'imported': 0, 'already_known': 0,
-            'uploaded': 0, 'failed': 0, 'ready': 0, 'pending': 0,
+            'uploaded': 0, 'failed': 0, 'ready': 0, 'pending': 0, 'remuxed': 0, 'remux_failed': 0,
+            'remux_budget_blocked': 0,
             'needs_review': 0, 'upload_unknown': 0, 'deleted': 0,
             'failed_records': 0, 'probe_tcp_open': 0, 'probe_error_type': None,
             'sd_backend': None, 'sd_searched': 0, 'sd_downloaded': 0, 'sd_deferred': 0,
@@ -219,7 +220,14 @@ class SyncQueue:
         settings = self.archive.settings
         if not settings.enable_upload:
             return 'upload_disabled', 'Upload toàn cục đang tắt; video đã nhập được giữ trong cache'
-        if not settings.token or not settings.effective_owner:
+        channel_mode = settings.telegram_destination=='channel' or bool(settings.storage_channel_id)
+        if not settings.token:
+            return 'telegram_not_configured', 'Chưa cấu hình bot token'
+        if channel_mode:
+            if type(settings.storage_channel_id) is not int or settings.storage_channel_id>=0:
+                return 'channel_not_configured', 'House01 cần private storage channel có bot admin quyền đăng bài'
+            return None
+        if not settings.effective_owner:
             return 'telegram_not_configured', 'Chưa cấu hình bot token và ID owner hợp lệ'
         if self.archive.state(f'telegram_owner_started:{settings.effective_owner}') != '1':
             return 'owner_not_started', 'Owner cần mở bot và gửi /start trước khi upload'
@@ -253,13 +261,46 @@ class SyncQueue:
         except Exception as error:
             statistics['probe_error_type'] = self._error_type(error)
         sd_error=None
+        upload_paused=False
+        upload_error_type=None
+        def upload_ready():
+            nonlocal upload_paused,upload_error_type
+            if upload_paused or statistics['uploaded']>=MAX_UPLOADS_PER_JOB or self._gate(slug):
+                return None
+            try:
+                result=telegram.upload_one(self.archive,camera=slug)
+            except Exception as error:
+                upload_paused=True
+                upload_error_type=self._error_type(error)
+                return None
+            if result=='uploaded':statistics['uploaded']+=1
+            elif result is not None:upload_paused=True
+            return result
+        if self.archive.settings.media_mode=='remux_copy':
+            # Migrate only confirmed unposted raw cache, one file at a time.
+            # Heartbeat and Telegram polling already run in their own threads.
+            for _ in range(MAX_UPLOADS_PER_JOB):
+                current=self._camera(slug)
+                if current is None or not current['enabled']:break
+                self._progress(job,statistics,'remuxing','Đang chuyển container sang MP4 bằng stream-copy; không transcode')
+                converted=self.archive.remux_pending_cache(camera=slug,limit=1)
+                statistics['remuxed']+=converted['converted']
+                statistics['remux_failed']+=converted['failed']
+                statistics['remux_budget_blocked']+=converted.get('budget_blocked',0)
+                if not (converted['converted'] or converted['failed']):break
+                if converted['converted'] and not upload_paused and statistics['uploaded']<MAX_UPLOADS_PER_JOB and not self._gate(slug):
+                    self._progress(job,statistics,'uploading','Đang upload MP4 vào storage channel')
+                    upload_ready()
+            if statistics['remux_budget_blocked']:
+                self._finish(job,statistics,'blocked','remux_cache_budget',
+                             'Cache cần thêm dung lượng để chuyển container MP4; file nguồn vẫn được giữ')
+                return
         self._progress(job, statistics, 'sd_search', 'Đang tìm và tải recording SD của camera')
         try:
             from .sd_source import SDSource, SDSourceError
             last_imported=0
-            early_upload_paused=False
             def sd_progress(snapshot):
-                nonlocal last_imported,early_upload_paused
+                nonlocal last_imported
                 statistics['sd_backend']=snapshot.get('backend')
                 for output,source in (('sd_searched','searched'),('sd_downloaded','downloaded'),
                                       ('sd_imported','imported'),('sd_deferred','deferred'),('sd_backlog','backlog')):
@@ -270,19 +311,15 @@ class SyncQueue:
                 phase=snapshot.get('phase','sd_download')
                 if phase not in ('sd_search','sd_download','sd_complete'):phase='sd_download'
                 self._progress(job,statistics,phase,'Đang xử lý recording SD; số liệu cập nhật sau từng file')
-                # A raw file can upload immediately; do not wait for the whole SD batch.
+                # Upload each ready file without waiting for the whole SD batch.
+                # A failed attempt pauses uploads across ALL phases of this job.
                 imported=snapshot.get('imported',0)
                 is_new=imported>last_imported
                 last_imported=max(last_imported,imported)
-                if is_new and not early_upload_paused and statistics['uploaded']<MAX_UPLOADS_PER_JOB and not self._gate(slug):
-                    self._progress(job,statistics,'uploading','Đang upload file gốc vừa tải từ SD')
-                    try:result=telegram.upload_one(self.archive,camera=slug)
-                    except Exception:
-                        early_upload_paused=True
-                    else:
-                        if result=='uploaded':statistics['uploaded']+=1
-                        elif result is not None:early_upload_paused=True
-                    self._progress(job,statistics,phase,'Đã xử lý file gốc; tiếp tục tải recording SD')
+                if is_new and not upload_paused and statistics['uploaded']<MAX_UPLOADS_PER_JOB and not self._gate(slug):
+                    self._progress(job,statistics,'uploading','Đang upload video vừa tải từ SD')
+                    upload_ready()
+                    self._progress(job,statistics,phase,'Đã xử lý video; tiếp tục tải recording SD')
             sd_result=SDSource(self.archive,slug).sync(progress=sd_progress)
             sd_progress(sd_result)
         except Exception as error:
@@ -346,6 +383,7 @@ class SyncQueue:
             return
         self._progress(job, statistics, 'uploading', 'Đang xử lý hàng đợi upload của camera')
         for _ in range(max(0,MAX_UPLOADS_PER_JOB-statistics['uploaded'])):
+            if upload_paused:break
             gate = self._gate(slug)
             if gate:
                 self._finish(job, statistics, 'blocked', *gate)
@@ -353,24 +391,25 @@ class SyncQueue:
             _, delayed = self._counts(slug, statistics)
             if not statistics['ready']:
                 break
-            try:
-                result = telegram.upload_one(self.archive, camera=slug)
-            except Exception as error:
-                self._finish(job, statistics, 'failed', 'upload_failed',
-                             'Upload gặp lỗi (' + self._error_type(error) + '); cần kiểm tra trạng thái trước khi thử lại')
-                return
+            result=upload_ready()
             if result == 'uploaded':
-                statistics['uploaded'] += 1
                 self._progress(job, statistics, 'uploading', 'Đang upload các video sẵn sàng của camera')
             else:
                 break
         _, delayed = self._counts(slug, statistics)
         gate = self._gate(slug) if statistics['pending'] else None
-        if gate:
+        if upload_error_type:
+            self._finish(job, statistics, 'failed', 'upload_failed',
+                         'Upload gặp lỗi (' + upload_error_type + '); cần kiểm tra trạng thái trước khi thử lại')
+        elif gate:
             self._finish(job, statistics, 'blocked', *gate)
         elif statistics['upload_unknown']:
             self._finish(job, statistics, 'blocked', 'upload_unknown', 'Có video upload chưa được xác nhận; cần đối soát, không tự gửi lại')
-        elif statistics['needs_review'] or statistics['failed_records']:
+        elif statistics['needs_review']:
+            self._finish(job, statistics, 'blocked', 'needs_review', 'Có video cần kiểm tra nguồn hoặc trạng thái Telegram trước khi xử lý tiếp')
+        elif statistics['remux_budget_blocked']:
+            self._finish(job, statistics, 'blocked', 'remux_cache_budget', 'Cache cần thêm dung lượng để chuyển container MP4; file nguồn vẫn được giữ')
+        elif statistics['failed_records']:
             self._finish(job, statistics, 'blocked', 'needs_review', 'Có video cần kiểm tra nguồn hoặc trạng thái Telegram trước khi xử lý tiếp')
         elif delayed:
             self._finish(job, statistics, 'blocked', 'rate_limited', 'Telegram đang giới hạn tốc độ; video được giữ để thử sau thời gian retry')

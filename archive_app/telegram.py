@@ -1,5 +1,6 @@
 import json
 import hashlib
+import math
 import re
 import secrets
 from pathlib import Path
@@ -14,8 +15,12 @@ from .telegram_menu import TimeMenus
 
 
 class ApiRejected(Exception):
-    def __init__(self, code, retry_after=0):
+    def __init__(self, code, retry_after=0, description=''):
         self.code, self.retry_after = code, retry_after
+        # Keep only a classification, never arbitrary API text in logs/state.
+        self.source_missing = code == 400 and isinstance(description, str) and description.lower() in (
+            'bad request: message to copy not found', 'bad request: message not found',
+            'bad request: message_id_invalid')
         super().__init__('Telegram API rejected request')
 
 
@@ -23,6 +28,7 @@ class Telegram:
     def __init__(self, settings):
         self.settings = settings
         self._menu_retry_at = 0
+        self._storage_verified = None
 
     def register_commands(self, archive):
         """Configure the Telegram Menu once per token/schema, with bounded retries."""
@@ -72,15 +78,89 @@ class Telegram:
         end = datetime.fromtimestamp(row['end_ms']/1000, zone)
         return f"{archive.camera_name(row['camera'])} | {start.isoformat()} → {end.isoformat()}\nArchive: {row['key']}"
 
-    def validate_media_message(self, message, field, chat_id=None):
+    @property
+    def channel_mode(self):
+        return (getattr(self.settings, 'telegram_destination', 'owner_private') == 'channel'
+                or getattr(self.settings, 'storage_channel_id', 0) != 0)
+
+    def verify_storage(self, archive):
+        """Validate the exact tenant channel before claiming any upload."""
+        channel = getattr(self.settings, 'storage_channel_id', 0)
+        if type(channel) is not int or channel >= 0:
+            raise ValueError('A negative storage channel ID is required')
+        identity = (getattr(self.settings, 'tenant_id', 'house01'), channel,
+                    hashlib.sha256(self.settings.token.encode()).hexdigest())
+        if self._storage_verified and self._storage_verified[0] == identity and self._storage_verified[1] > time.time():
+            return channel, self._storage_verified[2]
+        me = self.request('getMe', {})
+        if not isinstance(me, dict) or type(me.get('id')) is not int or me['id'] <= 0 or me.get('is_bot') is not True:
+            raise ValueError('Bot identity was not confirmed')
+        chat = self.request('getChat', {'chat_id':channel})
+        if (not isinstance(chat, dict) or type(chat.get('id')) is not int
+                or chat['id'] != channel or chat.get('type') != 'channel'
+                or chat.get('username') or chat.get('active_usernames')):
+            raise ValueError('Storage channel identity was not confirmed')
+        membership = self.request('getChatMember', {'chat_id':channel, 'user_id':me['id']})
+        member_user = membership.get('user', {}) if isinstance(membership, dict) else {}
+        if (not isinstance(membership, dict) or not isinstance(member_user, dict)
+                or type(member_user.get('id')) is not int or member_user['id'] != me['id']
+                or member_user.get('is_bot') is not True
+                or membership.get('status') != 'administrator' or membership.get('can_post_messages') is not True):
+            raise ValueError('Bot channel posting rights were not confirmed')
+        archive.state('telegram_bot_id', me['id'])
+        self._storage_verified = (identity, time.time()+60, me['id'])
+        return channel, me['id']
+
+    def _upload_backoff_key(self):
+        token_prefix, separator, _ = self.settings.token.partition(':')
+        bot = ('id:'+(token_prefix.lstrip('0') or '0') if separator and token_prefix.isdecimal()
+               else 'token:'+hashlib.sha256(self.settings.token.encode()).hexdigest())
+        destination = getattr(self.settings, 'storage_channel_id', 0) if self.channel_mode else self.owner
+        scope = [getattr(self.settings, 'tenant_id', 'house01'), bot,
+                 'channel' if self.channel_mode else 'owner_private', destination]
+        return 'telegram_upload_retry_until:'+hashlib.sha256(json.dumps(scope,separators=(',',':')).encode()).hexdigest()
+
+    def upload_retry_until(self, archive):
+        """Persistent upload-only pause, shared by all cameras and workers."""
+        try:
+            value = float(archive.state(self._upload_backoff_key()) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return value if math.isfinite(value) and value > 0 else 0.0
+
+    def _pause_uploads(self, archive, retry_after, record_key=None):
+        delay = 1.0
+        try:
+            if type(retry_after) in (int,float):
+                value=float(retry_after)
+                if math.isfinite(value):delay=max(1.0,value)
+        except (ValueError,OverflowError):
+            pass
+        key = self._upload_backoff_key()
+        archive.conn.execute('BEGIN IMMEDIATE')
+        try:
+            until = max(self.upload_retry_until(archive), time.time()+delay)
+            archive.conn.execute('INSERT INTO state(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',
+                                 (key,str(until)))
+            if record_key is not None:
+                archive.conn.execute("UPDATE recordings SET status='downloaded',retry_at=?,last_error='rate_limited' WHERE key=? AND status='uploading'",
+                                     (until,record_key))
+            archive.conn.commit()
+            return until
+        except Exception:
+            archive.conn.rollback()
+            raise
+
+    def validate_media_message(self, message, field, chat_id=None, *, chat_type='private'):
         expected_chat = self.owner if chat_id is None else chat_id
         if not isinstance(message, dict):
             raise ValueError('Invalid Telegram media response')
         chat = message.get('chat', {})
         message_id = message.get('message_id')
         media = message.get(field, {})
-        if (not isinstance(chat, dict) or chat.get('type') != 'private' or
-            type(chat.get('id')) is not int or chat['id'] != expected_chat or expected_chat <= 0 or
+        if (chat_type not in ('private', 'channel') or not isinstance(chat, dict) or chat.get('type') != chat_type or
+            type(chat.get('id')) is not int or chat['id'] != expected_chat or
+            (expected_chat <= 0 if chat_type == 'private' else expected_chat >= 0) or
             type(message_id) is not int or message_id <= 0 or not isinstance(media, dict) or
             not isinstance(media.get('file_id'), str) or not media['file_id'].strip() or
             not isinstance(media.get('file_unique_id'), str) or not media['file_unique_id'].strip() or
@@ -93,9 +173,7 @@ class Telegram:
             raise ValueError('Bot token is not configured')
         url = self.settings.api_base + '/bot' + self.settings.token + '/' + method
         headers = {'Content-Type':'application/json'}
-        if file_path is None or self.settings.api_mode == 'local':
-            if file_path is not None:
-                fields = dict(fields, **{file_field:Path(file_path).resolve().as_uri()})
+        if file_path is None:
             body = json.dumps(fields).encode()
         else:
             boundary = 'ezviz-archive-'+secrets.token_hex(16)
@@ -126,12 +204,26 @@ class Telegram:
             except Exception:
                 raise ApiRejected(exc.code) from None
         if not result.get('ok'):
-            raise ApiRejected(result.get('error_code',0),result.get('parameters',{}).get('retry_after',0))
+            raise ApiRejected(result.get('error_code',0),result.get('parameters',{}).get('retry_after',0),result.get('description',''))
         return result['result']
 
     def upload_one(self, archive, camera=None):
-        if (not self.settings.enable_upload or not self.settings.token or not self.owner or
-            archive.state(f'telegram_owner_started:{self.owner}') != '1'):
+        if not self.settings.enable_upload or not self.settings.token:
+            return None
+        if self.upload_retry_until(archive) > time.time():
+            return 'rate_limited'
+        destination, bot_id = self.owner, None
+        if self.channel_mode:
+            try:
+                destination, bot_id = self.verify_storage(archive)
+            except ApiRejected as error:
+                if error.code == 429:
+                    self._pause_uploads(archive,error.retry_after)
+                    return 'rate_limited'
+                return 'storage_blocked'
+            except Exception:
+                return 'storage_blocked'
+        elif not self.owner or archive.state(f'telegram_owner_started:{self.owner}') != '1':
             return None
         row = archive.claim_upload() if camera is None else archive.claim_upload(camera)
         if row is None:
@@ -141,24 +233,34 @@ class Telegram:
             with archive.conn:
                 archive.conn.execute("UPDATE recordings SET status='needs_review',last_error='missing_or_oversize_file' WHERE key=?", (row['key'],))
             return 'needs_review'
+        if (getattr(self.settings, 'media_mode', 'raw') == 'remux_copy'
+                and (row.get('processing_method') != 'remux_copy' or path.suffix.lower() != '.mp4')):
+            with archive.conn:
+                archive.conn.execute("UPDATE recordings SET status='needs_review',last_error='mp4_remux_required' WHERE key=?", (row['key'],))
+            return 'needs_review'
         caption = self.caption(archive, row)
         # Preserve raw bytes: do not request Telegram's video processing path.
-        method,field='sendDocument','document'
-        fields={'chat_id':self.owner,'caption':caption,'disable_notification':True,
-                'disable_content_type_detection':True}
+        video = row.get('processing_method') == 'remux_copy' and path.suffix.lower() == '.mp4'
+        method,field=('sendVideo','video') if video else ('sendDocument','document')
+        fields={'chat_id':destination,'caption':caption,'disable_notification':True}
+        if video:fields['supports_streaming']=True
+        else:fields['disable_content_type_detection']=True
         try:
             message = self.request(method,fields,file_path=path,file_field=field)
-            media = self.validate_media_message(message, field)
+            media = self.validate_media_message(message, field, destination,
+                                                chat_type='channel' if self.channel_mode else 'private')
             bot_value = archive.state('telegram_bot_id')
-            bot_id = int(bot_value) if bot_value and bot_value.isdecimal() and int(bot_value)>0 else None
-            archive.mark_uploaded(row['key'],self.owner,message['message_id'],media['file_id'],
-                                  file_unique_id=media['file_unique_id'],media_type=field,bot_id=bot_id)
+            if bot_id is None:bot_id = int(bot_value) if bot_value and bot_value.isdecimal() and int(bot_value)>0 else None
+            placement = ({'storage_kind':'channel','storage_chat_id':destination,
+                          'storage_message_id':message['message_id']} if self.channel_mode else {})
+            archive.mark_uploaded(row['key'],destination,message['message_id'],media['file_id'],
+                                  file_unique_id=media['file_unique_id'],media_type=field,bot_id=bot_id,**placement)
         except ApiRejected as exc:
+            if exc.code == 429:
+                self._pause_uploads(archive,exc.retry_after,row['key'])
+                return 'api_rejected'
             with archive.conn:
-                if exc.code == 429:
-                    archive.conn.execute("UPDATE recordings SET status='downloaded',retry_at=?,last_error='rate_limited' WHERE key=?",
-                                         (time.time()+max(1,exc.retry_after),row['key']))
-                elif 400 <= exc.code < 500:
+                if 400 <= exc.code < 500:
                     archive.conn.execute("UPDATE recordings SET status='needs_review',last_error='api_rejected' WHERE key=?", (row['key'],))
                 else:
                     archive.conn.execute("UPDATE recordings SET status='upload_unknown',last_error='server_error_after_send' WHERE key=?", (row['key'],))
@@ -184,9 +286,14 @@ class Telegram:
             return {}
 
     @staticmethod
-    def _save_replay_attempt(archive, update_id, phase, *, advance=False, retry_at=0):
+    def _save_replay_attempt(archive, update_id, phase, *, advance=False, retry_at=0, details=None):
         # Two fixed-size state rows, not one ever-growing row per button click.
-        attempt=json.dumps({'update_id':update_id,'phase':phase}) if phase else '{}'
+        context = details or {}
+        if not details:
+            previous=Telegram._replay_attempt(archive)
+            if previous.get('update_id')==update_id:
+                context={key:value for key,value in previous.items() if key not in ('update_id','phase')}
+        attempt=json.dumps({**context,'update_id':update_id,'phase':phase}) if phase else '{}'
         with archive.conn:
             for name,value in (('telegram_replay_attempt',attempt),('telegram_replay_retry_at',str(retry_at))):
                 archive.conn.execute('INSERT INTO state(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',
@@ -224,15 +331,49 @@ class Telegram:
             fields['caption']+='\n⬇ Tải bản gốc: dùng nút tải hoặc menu Telegram → Lưu video / Save to Downloads.'
         if field == 'video':
             fields['supports_streaming'] = True
+        storage_chat = row.get('storage_chat_id') or row.get('chat_id')
+        storage_message = row.get('storage_message_id') or row.get('message_id')
+        # Old private-mode installations may contain historical channel file IDs.
+        # Their established file-ID replay remains valid without enabling a new
+        # channel placement or automatically uploading anything to owner chat.
+        is_channel = self.channel_mode and (row.get('storage_kind') == 'channel' or str(storage_chat).startswith('-'))
+        if is_channel:
+            if (not re.fullmatch(r'-[1-9][0-9]*',str(storage_chat))
+                    or type(storage_message) is not int or storage_message <= 0
+                    or int(storage_chat) != getattr(self.settings,'storage_channel_id',0)):
+                raise ValueError('Channel placement does not belong to configured storage')
+        method = 'copyMessage' if is_channel else ('sendVideo' if field == 'video' else 'sendDocument')
+        details=None
+        if is_channel:
+            details={'tenant_id':getattr(self.settings,'tenant_id','house01'),'record_key':row['key'],
+                     'recipient':recipient,'method':method,'source_chat_id':int(storage_chat),
+                     'source_message_id':storage_message}
         if update_id is not None:
             previous=self._replay_attempt(archive)
             if previous.get('update_id')==update_id and previous.get('phase') in ('pending','unknown','done','rejected'):
                 self._save_replay_attempt(archive,update_id,'unknown' if previous['phase']=='pending' else previous['phase'],advance=True)
                 return 'consumed_without_retry'
-            self._save_replay_attempt(archive,update_id,'pending')
+            self._save_replay_attempt(archive,update_id,'pending',details=details)
         try:
-            message = self.request('sendVideo' if field == 'video' else 'sendDocument', fields)
-            self.validate_media_message(message,field,recipient)
+            if is_channel:
+                copy_fields={key:value for key,value in fields.items() if key not in (field,'supports_streaming')}
+                copy_fields.update(from_chat_id=int(storage_chat),message_id=storage_message)
+                try:
+                    message=self.request('copyMessage',copy_fields)
+                except ApiRejected as error:
+                    if not error.source_missing:raise
+                    if self.archive_visibility(archive,row['key']) is False:
+                        raise ValueError('Recording was removed during retrieval')
+                    details['method']='sendVideo' if field == 'video' else 'sendDocument'
+                    if update_id is not None:self._save_replay_attempt(archive,update_id,'pending',details=details)
+                    message=self.request(details['method'],fields)
+                    self.validate_media_message(message,field,recipient)
+                else:
+                    if not isinstance(message,dict) or set(message)!= {'message_id'} or type(message['message_id']) is not int or message['message_id'] <= 0:
+                        raise ValueError('Copy result MessageId was not confirmed')
+            else:
+                message = self.request(method, fields)
+                self.validate_media_message(message,field,recipient)
         except ApiRejected as exc:
             if update_id is None:
                 raise
@@ -255,6 +396,10 @@ class Telegram:
             self._save_replay_attempt(archive,update_id,'done',advance=True)
         return 'replayed'
 
+    @staticmethod
+    def archive_visibility(archive,key):
+        return archive.conn.execute("SELECT 1 FROM recordings WHERE key=? AND status='uploaded' AND deleted_at IS NULL",(key,)).fetchone() is not None
+
     def start_viewer(self, archive, actor):
         if actor == self.owner:
             archive.state(f'telegram_owner_started:{self.owner}', '1')
@@ -268,6 +413,32 @@ class Telegram:
                 archive.state('telegram_bot_id',me['id'])
         except Exception:
             pass
+
+    def channel_setup(self, actor, message=None):
+        """Owner-only discovery helper; it never changes destination/config."""
+        if type(actor) is not int or actor <= 0 or actor != self.owner:
+            raise ValueError('Channel setup requires the owner')
+        channel = None
+        message = message if isinstance(message, dict) else {}
+        origin = message.get('forward_origin')
+        if origin is not None:
+            chat = origin.get('chat') if isinstance(origin, dict) and origin.get('type') == 'channel' else None
+        else:
+            chat = message.get('forward_from_chat')
+        if (isinstance(chat, dict) and chat.get('type') == 'channel'
+                and type(chat.get('id')) is int and chat['id'] < 0):
+            channel = chat['id']
+        if channel is not None:
+            text=(f'Channel ID: {channel}\n\nĐiền TELEGRAM_STORAGE_CHANNEL_ID={channel} '
+                  'và TELEGRAM_DESTINATION=channel trong cấu hình, sau đó khởi động lại worker. '
+                  'Bot chỉ hiển thị ID; cấu hình và upload chưa được thay đổi.')
+        else:
+            text=('Thiết lập kho channel riêng tư:\n1. Tạo một channel Private.\n'
+                  '2. Thêm bot làm administrator và bật quyền Post Messages.\n'
+                  '3. Gửi một tin nhắn văn bản trong channel rồi Forward tin đó vào chat riêng với bot này.\n'
+                  'Bot sẽ hiển thị Channel ID để bạn điền TELEGRAM_STORAGE_CHANNEL_ID. '
+                  'Bot không tự chọn channel hoặc tự bật upload.')
+        return text, [[{'text':'↩ Camera','callback_data':'root'}]]
 
     def recent_menu(self, archive, page=0):
         if page < 0 or page > 100000:
@@ -606,7 +777,11 @@ class Telegram:
                     else:
                         words=message.get('text','').split()
                         command=words[0].split('@')[0] if words else ''
-                        if command == '/start':
+                        if actor == self.owner and (command == '/channel' or
+                                isinstance(message.get('forward_origin'), dict) and message['forward_origin'].get('type') == 'channel' or
+                                isinstance(message.get('forward_from_chat'), dict) and message['forward_from_chat'].get('type') == 'channel'):
+                            text,buttons=self.channel_setup(actor,message)
+                        elif command == '/start':
                             self.start_viewer(archive,actor)
                             if len(words)>1:
                                 if not words[1].startswith('play_'):
@@ -614,7 +789,8 @@ class Telegram:
                                 self.replay(archive,words[1][5:],chat_id,update_id=update['update_id'])
                                 archive.state('telegram_offset',update['update_id']+1)
                                 continue
-                            text=('Đã kết nối owner. Video mới được gửi trực tiếp trong chat riêng này.' if actor==self.owner else
+                            text=('Đã kết nối owner. Video mới lưu vào channel riêng; chat này chỉ hiện video khi bạn chọn xem.' if actor==self.owner and self.channel_mode else
+                                  'Đã kết nối owner. Video mới được gửi trực tiếp trong chat riêng này.' if actor==self.owner else
                                   'Đã kết nối viewer. Video đã lưu được phát lại trong chat riêng này.')+'\nDùng /archive hoặc /recent để xem lại.'
                             buttons=[[{'text':'📷 Camera','callback_data':'root'},
                                       {'text':'🕐 Video gần đây','callback_data':'recent:0'}]]

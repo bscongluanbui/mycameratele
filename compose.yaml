@@ -14,6 +14,11 @@ services:
       CACHE_DIR: /cache
       INPUT_DIR: /input
       DISPLAY_TIMEZONE: ${DISPLAY_TIMEZONE:-Asia/Ho_Chi_Minh}
+      TENANT_ID: ${TENANT_ID:-house01}
+      TELEGRAM_DESTINATION: ${TELEGRAM_DESTINATION:-channel}
+      TELEGRAM_STORAGE_CHANNEL_ID: ${TELEGRAM_STORAGE_CHANNEL_ID:-}
+      MEDIA_MODE: ${MEDIA_MODE:-remux_copy}
+      PASSTHROUGH_PROBE_METADATA: ${PASSTHROUGH_PROBE_METADATA:-false}
       CAMERA_HOST: ${CAMERA_HOST:-HOST}
       CAMERA_DEVICE_PORT: ${CAMERA_DEVICE_PORT:-8000}
       CAMERA_RTSP_PORT: ${CAMERA_RTSP_PORT:-554}
@@ -28,8 +33,8 @@ services:
       TELEGRAM_API_MODE: ${TELEGRAM_API_MODE:-cloud}
       TELEGRAM_MAX_BYTES: ${TELEGRAM_MAX_BYTES:-50000000}
       ENABLE_UPLOAD: ${ENABLE_UPLOAD:-false}
-      KEEP_CACHE: ${KEEP_CACHE:-true}
-      CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-24}
+      KEEP_CACHE: ${KEEP_CACHE:-false}
+      CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-1}
       SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-900}
       HCNETSDK_DIR: /opt/hcnetsdk
     volumes:
@@ -68,6 +73,11 @@ services:
       CACHE_DIR: /cache
       INPUT_DIR: /input
       DISPLAY_TIMEZONE: ${DISPLAY_TIMEZONE:-Asia/Ho_Chi_Minh}
+      TENANT_ID: ${TENANT_ID:-house01}
+      TELEGRAM_DESTINATION: ${TELEGRAM_DESTINATION:-channel}
+      TELEGRAM_STORAGE_CHANNEL_ID: ${TELEGRAM_STORAGE_CHANNEL_ID:-}
+      MEDIA_MODE: ${MEDIA_MODE:-remux_copy}
+      PASSTHROUGH_PROBE_METADATA: ${PASSTHROUGH_PROBE_METADATA:-false}
       TELEGRAM_OWNER_USER_ID: ${TELEGRAM_OWNER_USER_ID:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
@@ -77,8 +87,8 @@ services:
       TELEGRAM_API_MODE: ${TELEGRAM_API_MODE:-cloud}
       TELEGRAM_MAX_BYTES: ${TELEGRAM_MAX_BYTES:-50000000}
       ENABLE_UPLOAD: ${ENABLE_UPLOAD:-false}
-      KEEP_CACHE: ${KEEP_CACHE:-true}
-      CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-24}
+      KEEP_CACHE: ${KEEP_CACHE:-false}
+      CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-1}
       SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-900}
       HCNETSDK_DIR: /opt/hcnetsdk
       DASHBOARD_COOKIE_SECURE: ${DASHBOARD_COOKIE_SECURE:-false}
@@ -109,7 +119,8 @@ services:
         max-size: 10m
         max-file: "3"
 
-  # Optional local Bot API; storage paths/UID match archive and dashboard.
+  # Optional local Bot API; upload arrives as streamed multipart, not file://.
+  # Only the Bot API working-state volume is shared with its own restarts.
   telegram-bot-api:
     profiles: [local-api]
     image: ${BOT_API_IMAGE:-ghcr.io/bscongluanbui/mycameratele-bot-api:latest}
@@ -126,7 +137,6 @@ services:
       - --temp-dir=/tmp
     volumes:
       - bot-api-state:/var/lib/telegram-bot-api
-      - archive-cache:/cache:ro
     expose:
       - "8081"
     read_only: true

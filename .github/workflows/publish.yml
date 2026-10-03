@@ -118,6 +118,10 @@ jobs:
               --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,mode=1777 \
               --entrypoint python "$IMAGE@$child" \
               -c "$(cat scripts/sd_pipeline_smoke.py)"
+            docker run --rm --platform "$platform" --read-only --cap-drop ALL \
+              --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,mode=1777 \
+              --entrypoint python "$IMAGE@$child" \
+              -c "$(cat scripts/house01_smoke.py)"
           done
       - name: Publish SHA/version tags; latest moves only from main
         env:

@@ -15,7 +15,10 @@ result, cloud = render()
 assert result.returncode == 0, 'Cloud test config failed'
 for service in ('archive', 'dashboard'):
     settings = cloud['services'][service]['environment']
-    assert settings['ENABLE_UPLOAD'] == 'false' and settings['KEEP_CACHE'] == 'true'
+    assert settings['ENABLE_UPLOAD'] == 'false' and settings['KEEP_CACHE'] == 'false'
+    assert settings['TENANT_ID']=='house01' and settings['TELEGRAM_DESTINATION']=='channel'
+    assert settings['MEDIA_MODE']=='remux_copy' and settings['CACHE_RETENTION_HOURS']=='1'
+    assert settings['SD_SYNC_INTERVAL_SECONDS']=='900'
     assert settings['TELEGRAM_API_MODE'] == 'cloud'
     assert 'build' not in cloud['services'][service]
 assert cloud['services']['dashboard']['ports'][0]['host_ip']=='0.0.0.0'
@@ -38,6 +41,7 @@ for service in ('archive', 'dashboard'):
     assert settings['TELEGRAM_OWNER_USER_ID'] == '42' and settings['TELEGRAM_ALLOWED_USER_IDS'] == '77,88'
     assert settings['TELEGRAM_API_MODE'] == 'local' and settings['TELEGRAM_API_BASE'] == 'http://telegram-bot-api:8081'
     assert settings['TELEGRAM_MAX_BYTES'] == '2000000000'
-    assert settings['KEEP_CACHE'] == 'false' and settings['CACHE_RETENTION_HOURS'] == '24'
+    assert settings['KEEP_CACHE'] == 'false' and settings['CACHE_RETENTION_HOURS'] == '1'
     assert settings['ENABLE_UPLOAD'] == 'false' and 'build' not in local['services'][service]
-print('PRIVATE_COMPOSE: cloud=OK local=OK required_credentials=OK owner+viewers=OK volumes=preserved dashboard=public-ip:8080 configurable=OK exit=0')
+assert all(v.get('target')!='/cache' for v in local['services']['telegram-bot-api'].get('volumes',[]))
+print('HOUSE01_COMPOSE: cloud=OK local=OK channel=required-at-upload remux=streamcopy retention=1h SD=900s volumes=preserved API_cache_mount=none exit=0')

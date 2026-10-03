@@ -1,24 +1,28 @@
-# MyCameraTele — Telegram Private Archive
+# MyCameraTele — House01 Private Channel Archive
 
-Một bot lưu recording vào **private chat của owner**; owner và các viewer được
-cho phép duyệt lại lịch sử ngay trong private chat riêng của mỗi người.
-Không cần channel/group. SQLite là mục lục, Telegram chứa media, bot là browser.
+**House01 MVP** dùng một private channel làm kho video, SQLite làm mục lục và
+bot hiện có làm giao diện tra cứu. Recording mới chỉ upload vào private channel;
+owner/viewer nhận phản hồi trong private chat **khi chủ động yêu cầu**, không nhận
+mỗi recording mới. Mục lục: **Camera → Năm → Tháng → Ngày → Video**, có Cũ → Mới.
 
 ```text
-Camera SD → lịch quét tự động / Start sync
-  → HCNetSDK native hoặc ISAPI của thiết bị → download file đã đóng
-  → chép nguyên byte + SHA-256 → cache + SQLite → sendDocument vào private chat owner
-  → Camera → Năm → Tháng → Ngày → Video
-  → phát lại bằng file_id trong private chat của người được cho phép
+Camera SD → lịch 15 phút / Start sync
+  → HCNetSDK hoặc ISAPI → tải recording đã đóng
+  → MP4 remux-copy (-c copy, không encode) → cache trung chuyển + SQLite
+  → private storage channel House01 → file_id
+  → người được phép yêu cầu bot → phản hồi trong private chat
 ```
 
-**Lấy SD có điều kiện theo giao thức thực tế của camera, không theo tên model.**
-Adapter native dùng Linux HCNetSDK chính thức, đúng kiến trúc máy chạy Docker;
-ISAPI dùng Digest và chỉ chấp nhận kết quả search recording thật. Thư viện SDK
-không đi kèm image; xem mục 2. SDK Linux ARM64 đã khởi tạo và tìm/tải recording
-C6N trên VPS ARM64 qua tuyến Tailscale; H6c vẫn cần kiểm thử riêng. Kết quả của
-một model không chứng minh tương thích model khác. Cổng mở / RTSP live không
-chứng minh đã truy cập được SD. File/manifest xuất từ Studio vẫn là nguồn nhập tùy chọn.
+`MEDIA_MODE=remux_copy` là mặc định triển khai mới: thay container thành MP4,
+giữ compressed video/audio stream, không AAC conversion, không full decode.
+Tùy chọn `raw` (passthrough) giữ nguyên byte và gửi document. House01 là tenant duy
+nhất của MVP hiện tại; dashboard quản trị nhiều nhà/control database tập trung
+là giai đoạn tiếp theo, không được coi là đã triển khai chỉ vì có `TENANT_ID`.
+
+SDK Linux ARM64 đã khởi tạo và tìm/tải C6N trên VPS qua Tailscale; H6c vẫn cần
+kiểm thử riêng. Cổng mở/RTSP live không chứng minh lịch sử SD hoạt động. SDK
+chính hãng không bundle trong image, phải mount đúng CPU máy chạy Docker.
+File/manifest Studio vẫn là nguồn nhập tùy chọn.
 
 ## 1. Cài đặt trên Ubuntu / Armbian
 
@@ -57,11 +61,32 @@ Compose mặc định **pull-only**, không build trên board:
 - `BOT_API_IMAGE=ghcr.io/bscongluanbui/mycameratele-bot-api:latest` cho local API.
 - Có thể pin tag/digest của phiên bản đã kiểm chứng trong `.env`.
 
-Mặc định cloud test, `ENABLE_UPLOAD=false`, `KEEP_CACHE=true`; một cài đặt chưa
-có credential vẫn khởi động dashboard/worker mà chưa gửi Telegram. Image dùng
+Mặc định cloud, `ENABLE_UPLOAD=false`, `KEEP_CACHE=false`, retention 1 giờ;
+thiếu bot/channel ID/quyền post vẫn mở dashboard nhưng chưa upload recording. Image dùng
 UID/GID `10001:10001`; `input` chỉ đọc. SQLite/cache/tài khoản dashboard nằm trong
 named volumes. Giữ project **`ezviz-telegram-archive`** và volume keys
 `archive-state`, `archive-cache`, `bot-api-state` khi cập nhật để dùng lại dữ liệu.
+
+### House01 mới và dữ liệu VPS hiện có
+
+Base `compose.yaml` giữ tên project **`ezviz-telegram-archive`** và volume keys
+cũ. Với VPS hiện có tại `/home/ubuntu/mycameratele`, giữ nguyên project/volume và
+cấu hình House01 trong `.env`; **không thêm `compose.house01.yaml`** khi di trú.
+Đổi tenant hoặc destination không tạo cớ reset SQLite/tài khoản/file_id cũ.
+
+Chỉ **cài mới, thư mục/volume mới** mới dùng overlay cô lập House01:
+
+```bash
+# New installation only; verify the rendered project name before starting.
+docker compose --env-file .env -f compose.yaml -f compose.house01.yaml config --quiet
+docker compose --env-file .env -f compose.yaml -f compose.house01.yaml pull archive dashboard
+docker compose --env-file .env -f compose.yaml -f compose.house01.yaml up -d archive dashboard
+```
+
+Overlay dùng project `mycameratele-house01`, tạo volume có prefix project riêng.
+Cài thứ hai trên cùng VPS phải chọn `DASHBOARD_PORT` khác và bot token khác;
+không chạy hai consumer polling cùng token. Nếu thêm SDK hoặc Local API, giữ
+cùng toàn bộ tập file Compose trong mọi lệnh update. Không dùng `down -v`.
 
 ### Dashboard
 
@@ -133,7 +158,8 @@ Dashboard cho thêm camera, đổi tên, địa chỉ, cổng và thông tin SD:
   Mặc định 900 giây tương đương **15 phút**, không quét SD liên tục.
 - Telegram có `/sync`, nút **Start sync** ở menu chính và từng mục camera,
   công tắc upload và nút cập nhật trạng thái. Allowlist được kiểm tra trước
-  thao tác; các gate owner `/start` và `ENABLE_UPLOAD=true` vẫn giữ nguyên.
+  thao tác. Upload channel cần `ENABLE_UPLOAD=true` cùng bot/channel/quyền post
+  đã kiểm chứng; không phụ thuộc owner `/start` và không fallback private chat.
 
 Trạng thái hiển thị đang xếp hàng / kiểm tra / tải SD / upload / hoàn tất hoặc
 lý do dừng. Không có worker heartbeat thì job vẫn queued; xem `docker compose
@@ -141,43 +167,44 @@ ps` và logs worker. Thiếu credential, SDK, tuyến mạng, giao thức không
 file chưa đóng, cache đầy, Telegram chưa cấu hình đều phải hiện rõ, không giả
 báo thành công. Nếu search SD thực sự trả 0 clip, job ghi nhận kết quả rỗng.
 
-### Trung chuyển nguyên bản: không chuyển đổi định dạng
+### MP4 remux-copy và cache trung chuyển
 
-Worker **chỉ tải → chép nguyên byte vào cache → upload file gốc**. Không gọi
-FFmpeg trong pipeline; không transcode, encode, remux, đổi container, faststart,
-resample hoặc chạy decode toàn bộ. Đuôi file từ nguồn được giữ khi xác định được;
-recording SDK chưa rõ container dùng đuôi nhận diện hoặc `.bin`, không giả gán
-`.mp4`. Mặc định chỉ đọc header nhỏ để nhận diện đuôi: **không gọi cả FFmpeg
-lẫn ffprobe**. `PASSTHROUGH_PROBE_METADATA=false` là mặc định. Chỉ khi bạn chủ
-động bật tùy chọn này, ffprobe đọc metadata tối đa 5 giây, không ghi media; lỗi
-probe hoặc định dạng chưa nhận diện vẫn cho phép upload file nguyên byte.
+Mặc định **`MEDIA_MODE=remux_copy`**: FFmpeg chỉ remux container thành MP4 với
+`-c copy`. Compressed video/audio streams được giữ nguyên; không encode video,
+không đổi audio sang AAC, không resample, không chạy decode toàn bộ để "kiểm tra"
+file. Không gọi FFprobe hoặc decode-validation trong remux-copy; header nhỏ và
+thời gian recording SDK/manifest đủ cho tên file/mục lục. Nếu stream gốc không mux được vào MP4, lỗi
+`failed_remux`/cần xem lại giữ nguồn và không gửi file giả MP4. Không bỏ audio,
+không âm thầm transcode hoặc chuyển sang raw để lách lỗi.
 
-SHA-256 và kích thước được ghi cho cache trước khi upload. File mới gửi bằng
-`sendDocument` để lưu như tài liệu; codec/container gốc có thể cần tải về rồi
-mở bằng VLC hoặc phần mềm tương thích. Việc xem lại dùng file_id của cùng bot,
-không tải xuống rồi upload lại. Cache chỉ là trung chuyển, theo retention hiện có;
-SQLite giữ mục lục Camera → Năm → Tháng → Ngày và file_id Telegram.
+MP4 remux-copy có thể đổi byte/container/SHA-256 dù codec không đổi; vì vậy
+không gọi nó là byte-identical. Upload dùng file MP4 đã remux; caption/mục lục
+lấy thời gian recording SDK/manifest, không suy giờ ghi hình từ PTS hoặc tên file.
 
-Các bản đã upload trước khi nâng cấp giữ nguyên file_id/loại media hiện có.
-Metadata `processing_method=legacy` phân biệt bản cũ với `passthrough`; một file
-đã được bản cũ remux không tự trở lại byte SD gốc. Cache cũ chưa gửi và chưa có
-lượt gửi mơ hồ được đưa về `raw_reingest_required` để lấy lại nguyên bản trước
-upload. Bản `upload_unknown` vẫn chờ đối soát, không tự tải/gửi lại gây trùng.
+Tùy chọn **`MEDIA_MODE=raw`** (passthrough) chép nguyên byte, SHA-256 source/cache/upload
+trùng nhau, không gọi FFmpeg hoặc FFprobe mặc định. Header nhỏ chỉ gợi ý đuôi
+file; format chưa rõ dùng `.bin`. `PASSTHROUGH_PROBE_METADATA=false` là mặc định;
+chỉ bật tùy chọn đọc metadata giới hạn nếu thật sự cần. Raw file gửi document,
+không được đổi container để ép Telegram preview.
 
-### Vì sao ít file nhỏ vẫn có thể lâu?
+Worker chỉ dùng cache làm trung chuyển. `KEEP_CACHE=false` và
+`CACHE_RETENTION_HOURS=1` xóa cache **sau upload đã xác nhận và metadata đã
+commit** được 1 giờ. Đặt retention `0` để xóa ngay sau bước xác nhận/commit.
+Recording chưa gửi, lỗi, `upload_unknown` hoặc chưa commit không bị timer này
+xóa; database/file_id vẫn giữ để tra cứu/khôi phục. File nguồn Studio không xóa.
 
-Dung lượng không phải thời gian duy nhất: camera SD/HCNetSDK có thời gian mở
-phiên/tìm recording/khởi động từng lượt tải; tuyến VPS → Tailscale → Armbian
-thêm độ trễ. Worker xử lý lần lượt để tránh tải chồng và upload trùng. Theo dõi
-`phase`, `sd_searched`, `sd_downloaded`, `sd_imported`, `uploaded` và thời gian
-**Cập nhật ... trước** của job (dashboard): bộ đếm tải
-thay đổi chứng minh đang tiến lên; kiểm tra đúng giai đoạn tải hay upload và
-lỗi hiện tại của job. Không coi "27 file nhẹ" hoặc số upload tạm thời bằng 0 là bằng chứng worker bị treo.
+Các bản đã lưu trước nâng cấp giữ nguyên file_id/loại media hiện có và lịch sử.
+Không re-upload toàn bộ bản cũ. Khi cần lấy lại file chưa gửi để đổi media mode,
+phải xử lý riêng trạng thái rõ ràng; không retry một lượt gửi mơ hồ.
 
-Nếu bộ đếm/thời điểm cập nhật không đổi, đối chiếu log worker và lỗi SDK/Telegram
-của đúng job trước khi retry. Start gửi yêu cầu vào hàng đợi, không tạo thêm một
-worker để vượt qua job đang chạy. Tắt upload một camera vẫn tiếp tục tải cache;
-tắt camera dừng xử lý nguồn của camera đó ở điểm kiểm tra tiếp theo.
+### Theo dõi tiến trình thay vì suy từ dung lượng
+
+HCNetSDK có độ trễ mở phiên/tìm recording/khởi động từng file, ngoài thời gian
+truyền byte qua VPS → Tailscale → Armbian. Theo dõi `phase`, `sd_searched`,
+`sd_downloaded`, `sd_imported`, `uploaded` và **Cập nhật ... trước** trên dashboard.
+Số file nhẹ không tự chứng minh job đang treo; bộ đếm và log của đúng job mới
+phân biệt tải SD, remux-copy, upload và lỗi. Start chỉ xếp job, không tạo thêm
+worker tải chồng. Tắt upload vẫn tải cache; tắt camera dừng nguồn ở điểm kiểm tra.
 
 ### Native HCNetSDK trong Docker
 
@@ -207,6 +234,12 @@ Với Local Bot API, giữ thêm `-f compose.local.yaml --profile local-api` tro
 các lệnh trên. SDK chỉ mount vào worker, read-only; `/input` vẫn read-only,
 download SD dùng `/cache/sd-stage`, không ghi vào thư mục Studio nguồn.
 Sau lần cài SDK đầu, các lần update chỉ pull/up với cùng tập file Compose.
+
+SDK native chạy trong **child process cô lập**. `LD_LIBRARY_PATH` và các đường
+dẫn CA/library riêng của SDK chỉ đặt cho child, không đặt global trên worker:
+Telegram HTTPS của parent dùng OpenSSL/CA hệ thống. Giữ overlay SDK mới khi
+update để tránh library SDK ghi đè TLS của Python/Telegram. Không thêm thư viện
+SDK vào `LD_LIBRARY_PATH` của toàn container.
 
 ### VPS → Tailscale → Armbian → LAN camera
 
@@ -268,57 +301,49 @@ SQLite đối chiếu khóa camera/source/record ID; upload mơ hồ vào `uploa
 để đối soát, không gửi lại mù. Cache giữ nguyên file chưa upload hoặc chưa commit
 metadata thành công. Chỉnh `CACHE_MAX_GB`/`CACHE_MIN_FREE_GB` theo dung lượng ổ.
 
-## 3. Owner, viewers và cloud test
+## 3. Private channel House01, owner và allowlist
 
-Tạo bot qua [BotFather](https://core.telegram.org/bots/features#botfather).
-**Owner ID là số nguyên dương của tài khoản người dùng**, không phải bot token,
-username, số điện thoại hoặc ID channel/group âm. Cấu hình owner rõ ràng;
-ứng dụng không nhận người nhắn đầu tiên làm owner.
-
-Sửa `.env` trên máy triển khai; thay các slot bằng giá trị thật:
+Dùng **bot hiện có**, không tạo lại bot hoặc đổi token trong migration. Tạo/chọn
+một **private channel House01** trong Telegram, thêm bot làm administrator và
+cho quyền **Post messages**. Lấy numeric channel ID dạng `-100...`; đó là
+`TELEGRAM_STORAGE_CHANNEL_ID`, không phải USER ID của owner.
 
 ```dotenv
-TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
-TELEGRAM_OWNER_USER_ID=YOUR_POSITIVE_TELEGRAM_USER_ID
+TENANT_ID=house01
+TELEGRAM_DESTINATION=channel
+TELEGRAM_STORAGE_CHANNEL_ID=YOUR_NEGATIVE_PRIVATE_CHANNEL_ID
+TELEGRAM_BOT_TOKEN=YOUR_EXISTING_BOT_TOKEN
+TELEGRAM_OWNER_USER_ID=YOUR_POSITIVE_USER_ID
 TELEGRAM_BOT_USERNAME=YOUR_BOT_USERNAME_WITHOUT_AT
 TELEGRAM_ALLOWED_USER_IDS=OWNER_ID,VIEWER_ID_2,VIEWER_ID_3
 TELEGRAM_CHAT_ID=
-TELEGRAM_API_BASE=https://api.telegram.org
-TELEGRAM_API_MODE=cloud
-TELEGRAM_MAX_BYTES=50000000
+MEDIA_MODE=remux_copy
+KEEP_CACHE=false
+CACHE_RETENTION_HOURS=1
+SD_SYNC_INTERVAL_SECONDS=900
 ENABLE_UPLOAD=false
-KEEP_CACHE=true
 ```
 
-Các ID trong allowlist phải là **số nguyên dương thật**, ngăn bằng dấu phẩy.
-Owner được tự thêm vào quyền truy cập nếu không xuất hiện trong danh sách.
-Để trống allowlist thì chỉ owner được truy cập; thêm ID để cho người khác xem.
-`TELEGRAM_CHAT_ID` chỉ là alias cũ cho **cùng ID owner dương**; cấu hình mới để trống.
-Username bot không có `@`; có thể để trống để `/start` lấy qua `getMe` và lưu lại.
+Thay slot bằng số thật. Bot/channel identity và quyền post được kiểm chứng trước
+upload. Channel ID trống/sai, bot thiếu quyền hoặc channel không truy cập được
+**chặn upload**, không tự post recording vào private chat owner. Sau khi cấu hình
+và quyền post đạt, đặt `ENABLE_UPLOAD=true` rồi recreate cùng project/volumes.
+Channel automatic upload không cần owner `/start`; đó là gate khác với private
+reply. Một token chỉ có một polling worker.
 
-```bash
-docker compose up -d --force-recreate archive dashboard
-```
+Owner/viewer dùng USER ID dương trong allowlist, owner được tự thêm. Mỗi người
+mở bot `/start` để nhận phản hồi riêng; bot chỉ gửi media khi người đó yêu cầu
+Xem/Tải qua menu. Viewer không nhận toàn bộ recording mới. Private-channel
+membership riêng không thay thế allowlist của bot và ngược lại.
 
-Owner mở bot trên Telegram và bấm **Start / gửi `/start` trong private chat**.
-Ứng dụng lưu trạng thái owner đã bắt đầu; chỉ `/start` đúng owner mới mở gate
-cho automatic upload. [Telegram yêu cầu người dùng bắt đầu cuộc trò chuyện](https://core.telegram.org/bots#how-are-bots-different-from-users).
-Viewer được cho phép cũng mở bot và `/start`, sau đó duyệt `/archive` trong chat
-riêng của mình. Viewer không được thay owner và không mở gate upload của owner.
-Mọi ID trong allowlist được **xem, tải, xóa khỏi kho chung và khôi phục** video;
-quyền xóa này áp dụng cả video do camera khác ghi, không chỉ bản tin của viewer.
+MVP giữ quyền chung hiện có: mọi ID được phép có thể xem/tải/xóa logic/khôi phục
+recording trong kho House01. Dashboard bootstrap admin/admin vẫn yêu cầu đổi
+mật khẩu và giữ tài khoản trong state volume. Cơ chế tài khoản/roles quản trị
+nhiều nhà là công việc tiếp theo, không được suy ra là hoàn tất từ House01 MVP.
 
-Khi owner `/start` thành công, sửa `.env` thành `ENABLE_UPLOAD=true` rồi recreate:
-
-```bash
-docker compose up -d --force-recreate archive dashboard
-docker compose logs --tail=100 archive
-```
-
-Automatic upload **chỉ đến private chat owner**. Viewer chỉ nhận video khi chủ
-động chọn xem, không nhận mọi recording mới. Một worker là consumer polling duy
-nhất của bot; không chạy hai cài đặt cùng token. Lệnh/callback và replay đều
-kiểm tra người dùng được phép và private chat của chính người đó.
+Chế độ cũ `TELEGRAM_DESTINATION=owner_private` vẫn là lựa chọn rõ ràng để dùng private
+chat owner; USER ID phải dương, owner `/start` mở gate của chế độ này.
+`TELEGRAM_CHAT_ID` chỉ là alias owner cũ, không dùng thay storage channel ID.
 
 ### Tra cứu/phát lại
 
@@ -342,12 +367,12 @@ nguyên khoảng ban đầu; bấm shortcut lại để lấy khoảng mới.
 
 ### Xem, tải và Thùng rác chung
 
-- **Xem:** bot gửi lại file vào chat riêng của người được phép. Telegram hoặc
-  phần mềm trên máy người xem quyết định phát được định dạng gốc hay không;
-  worker không chuyển đổi file để ép phát trong Telegram.
+- **Xem:** bot gửi lại media qua file_id vào private chat người được phép
+  khi có yêu cầu. MP4 phù hợp có thể preview; định dạng/codec khác có thể cần
+  tải về phần mềm tương thích, không encode lại chỉ để ép preview.
 - **Tải:** bot gửi lại media gốc và hướng dẫn dùng nút tải / menu Telegram
-  `Save to Downloads`. File mới lưu bằng **sendDocument** để giữ nguyên bản.
-  Bản lưu cũ dùng sendVideo tiếp tục phát lại bằng sendVideo, document tiếp tục
+  `Save to Downloads`. Loại lưu (video/document) theo media phù hợp và giữ khi
+  replay: video dùng sendVideo, document tiếp tục
   dùng sendDocument; không đổi loại file_id hay re-upload binary. Đây là tải
   bằng client Telegram, không phát đường dẫn download chứa bot token.
 - **Xóa:** nút đầu chỉ mở xác nhận; xác nhận gắn với ID người bấm, hết hạn sau
@@ -366,7 +391,8 @@ Cache đã upload vẫn theo retention hiện có; file nguồn `input` giữ ng
 
 Bot lưu message ID, `file_id` và `file_unique_id` sau upload được xác nhận/commit.
 Chọn video gửi lại bằng `sendVideo`/`sendDocument` với **file_id**, không tải về
-rồi upload binary lần nữa. Theo [Telegram Sending files](https://core.telegram.org/bots/api#sending-files),
+rồi upload binary lần nữa. Recording tự động ở channel, không ở owner chat.
+Theo [Telegram Sending files](https://core.telegram.org/bots/api#sending-files),
 file_id có thể tái sử dụng bởi **cùng bot**, không chuyển sang bot khác.
 Dashboard mở link bot dạng `https://t.me/BOT_USERNAME?start=play_RECORD_KEY`;
 người mở vẫn phải được phép. Khi username chưa được cấu hình/lấy từ getMe,
@@ -374,9 +400,8 @@ dashboard không đoán link channel. Cây thư mục là virtual filesystem tro
 SQLite, không phải thư mục vật lý trên Telegram.
 
 Cloud mode chỉ dành cho kiểm tra clip nhỏ, giới hạn binary upload 50 MB;
-file vượt ngưỡng được giữ để xử lý, không tự chia/transcode. Mọi file mới dùng
-**sendDocument** và tắt nhận diện nội dung tự động; không gửi sendVideo để ép
-Telegram xử lý như video. File nguồn, cache và payload upload có cùng SHA-256.
+file vượt ngưỡng được giữ để xử lý, không tự chia/transcode. MP4 remux-copy và
+raw passthrough tuân thủ MEDIA_MODE; không đổi codec để vượt giới hạn API.
 Sau khi chuyển sang Local API, bản ghi `needs_review` vì file thiếu/vượt ngưỡng
 cũ cần lệnh rõ ràng; worker không tự retry các upload mơ hồ:
 
@@ -393,7 +418,7 @@ Lệnh chỉ đưa bản ghi chưa có file_id và lỗi `missing_or_oversize_fi
 
 Local API dùng nguồn chính thức `tdlib/telegram-bot-api`, pin commit trong
 `Dockerfile.bot-api`; `compose.local.yaml` chọn endpoint local, tối đa
-`2000000000` bytes, `KEEP_CACHE=false`, retention 24 giờ cho cả worker/dashboard.
+`2000000000` bytes, `KEEP_CACHE=false`, retention mặc định 1 giờ cho worker/dashboard.
 Không âm thầm đổi sang cloud nếu local API ngừng hoạt động.
 
 Lấy application `api_id`/`api_hash` theo
@@ -407,7 +432,7 @@ ENABLE_UPLOAD=false
 
 Owner/token/application credentials là trường bắt buộc trong production
 Compose override. `ENABLE_UPLOAD` vẫn do bạn chọn trong `.env`; override không
-tự bật upload. Nếu bot đang dùng cloud, gọi `logOut` trên cloud trước chuyển
+tự bật upload hoặc đổi destination. Nếu bot đang dùng cloud, gọi `logOut` trên cloud trước chuyển
 endpoint theo [hướng dẫn migration chính thức](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server).
 
 ```bash
@@ -417,19 +442,21 @@ docker compose -f compose.yaml -f compose.local.yaml --profile local-api up -d
 docker compose -f compose.yaml -f compose.local.yaml --profile local-api ps
 ```
 
-Owner `/start` với endpoint mới; xác nhận trạng thái, rồi đặt `ENABLE_UPLOAD=true`
+Xác nhận bot/channel/quyền post với endpoint mới, rồi đặt `ENABLE_UPLOAD=true`
 và chạy lại lệnh `up -d --force-recreate archive dashboard` với **cùng hai file
 Compose và profile**. Khi đã chọn local, luôn giữ các cờ này trong lệnh cập nhật;
 lệnh chỉ dùng `compose.yaml` sẽ chọn lại cấu hình cloud mặc định.
 
-Local API chỉ trong mạng Compose, **không publish 8081**; đọc `/cache:ro` cùng
-đường dẫn worker, trạng thái API ở volume writable riêng. Theo
+Local API chỉ trong mạng Compose, **không publish 8081**. Worker stream multipart
+bytes qua HTTP; không dùng `file://`, không mount cache worker vào API. Volume
+`bot-api-state` giữ working-state của API qua restart, không đổi tên/xóa khi update. Theo
 [Telegram Local Bot API](https://core.telegram.org/bots/api#using-a-local-bot-api-server),
 local mode hỗ trợ upload tới 2000 MB. Không cần VPS hoặc middleware.
 
 RAM runtime tùy workload/TDLib; không có một mức cố định suy ra từ dung lượng
 file. Theo dõi **min/max/peak** trước và trong upload thực bằng `docker stats`
-và log/OOM của host. File URI không có nghĩa toàn bộ server không dùng RAM.
+và log/OOM của host. Multipart stream tránh nạp cả file vào RAM của worker;
+Bot API/TDLib vẫn có working-state, buffer và cache riêng của server.
 Build TDLib là bài toán khác: compiler/job/architecture thay đổi bộ nhớ, có
 [hướng dẫn chính thức cho low-memory build](https://github.com/tdlib/td#building).
 Pull image có sẵn tránh compile trên board nhỏ. Test 100 MB, 500 MB, 1 GB là các
@@ -438,8 +465,8 @@ mock API, kiểm tra config hoặc unit test thành công.
 
 ## 5. Retention và daily SQLite backup
 
-Cloud/debug mặc định `KEEP_CACHE=true`. Production override đặt
-`KEEP_CACHE=false`, `CACHE_RETENTION_HOURS=24`: chỉ xóa cache đã upload xác nhận,
+House01/cloud/local mặc định `KEEP_CACHE=false`, `CACHE_RETENTION_HOURS=1`;
+đặt retention `0` để cleanup ngay. Chỉ xóa cache đã upload xác nhận,
 có metadata Telegram, SQLite commit thành công và đủ thời gian retention.
 File thất bại/mơ hồ/chưa upload được giữ; nguồn `input` không bị cleanup.
 
@@ -464,21 +491,32 @@ local-api` ở mọi lệnh trên. Backup `.env`, cache/media nguồn riêng n�
 sao video độc lập. Telegram là nơi gửi/lưu media, không thay thế chính sách
 backup của bạn.
 
-## 6. Migration từ cấu hình channel cũ
+## 6. Migration VPS hiện có sang House01
 
-1. Giữ **cùng bot/token, project và volumes**, backup trước cập nhật.
-2. Đặt `TELEGRAM_OWNER_USER_ID` rõ ràng; xóa giá trị channel âm khỏi alias
-   `TELEGRAM_CHAT_ID`, đặt alias trống hoặc bằng owner. Owner được tự cấp quyền;
-   các viewer cũ vẫn phải có ID dương trong allowlist mới.
-3. Owner `/start`; chọn cloud test hoặc production override; chỉ bật upload
-   sau khi gate của owner đã được xác nhận.
+1. Giữ bot/token, thư mục `/home/ubuntu/mycameratele`, project
+   `ezviz-telegram-archive` và toàn bộ volumes hiện có; backup `/data` trước.
+2. Chọn private channel và thêm bot admin/quyền post. Nhập `TENANT_ID=house01`,
+   `TELEGRAM_DESTINATION=channel`, channel ID thật; giữ owner/allowlist dương.
+3. Giữ API mode hiện tại (cloud/local), không đồng thời đổi endpoint khi đổi
+   storage destination. Cấu hình Local API là bước riêng, có cloud logOut.
+4. Chọn `MEDIA_MODE=remux_copy`, retention 1 giờ, SD 900; giữ `ENABLE_UPLOAD=false`
+   trong bước kiểm tra channel/media. Chỉ bật sau khi gate được xác nhận.
+5. Dùng **base + SDK overlay hiện có**, không thêm overlay project House01 mới:
 
-Bản ghi cũ cùng message/file ID vẫn ở SQLite; **không reset DB, xóa lịch sử,
-reupload toàn bộ hay đổi chủ recording**. `file_id` cũ hợp lệ với cùng bot có
-thể gửi lại vào private chat người được phép. Message đã gửi trước đây không
-bị xóa/chỉnh sửa; UI mới không tạo link private-channel từ chat ID cũ.
-Nếu đổi sang bot khác, file_id của bot cũ không dùng chung; đó là migration
-khác, không được coi là replay cùng bot.
+```bash
+cd /home/ubuntu/mycameratele
+git pull --ff-only
+docker compose -f compose.yaml -f compose.sdk.yaml config --quiet
+docker compose -f compose.yaml -f compose.sdk.yaml pull archive dashboard
+docker compose -f compose.yaml -f compose.sdk.yaml up -d archive dashboard
+```
+
+Nếu VPS đang Local API, giữ thêm `-f compose.local.yaml --profile local-api`
+trong mọi lệnh; không thêm nếu VPS đang cloud. Database tự migration tại chỗ,
+không reset cameras/dashboard login/catalog/file_id/message metadata cũ. Bản
+upload cũ ở owner chat vẫn replay bằng cùng bot; không chuyển/re-upload tất cả
+vào channel mới. Recording mới dùng destination mới; `upload_unknown` cần đối
+soát trước bất kỳ retry nào. Không dùng `down -v` hoặc đổi project để "update".
 
 ### Update/rollback giữ dữ liệu
 
