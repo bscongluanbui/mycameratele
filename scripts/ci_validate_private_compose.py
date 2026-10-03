@@ -3,7 +3,7 @@ from pathlib import Path
 import json, os, subprocess
 
 root = Path(__file__).resolve().parents[1]
-env = {k: v for k, v in os.environ.items() if not k.startswith(('TELEGRAM_', 'ENABLE_UPLOAD', 'KEEP_CACHE', 'CACHE_RETENTION_', 'COMPOSE_'))}
+env = {k: v for k, v in os.environ.items() if not k.startswith(('TELEGRAM_', 'DASHBOARD_', 'ENABLE_UPLOAD', 'KEEP_CACHE', 'CACHE_RETENTION_', 'COMPOSE_'))}
 def render(local=False, values=None):
     args = ['docker', 'compose', '--env-file', '.env.example', '-f', 'compose.yaml']
     if local: args += ['-f', 'compose.local.yaml', '--profile', 'local-api']
@@ -18,6 +18,12 @@ for service in ('archive', 'dashboard'):
     assert settings['ENABLE_UPLOAD'] == 'false' and settings['KEEP_CACHE'] == 'true'
     assert settings['TELEGRAM_API_MODE'] == 'cloud'
     assert 'build' not in cloud['services'][service]
+assert cloud['services']['dashboard']['ports'][0]['host_ip']=='0.0.0.0'
+assert cloud['services']['dashboard']['ports'][0]['published']=='8080'
+assert cloud['services']['dashboard']['environment']['DASHBOARD_COOKIE_SECURE']=='false'
+_,custom=render(values={'DASHBOARD_BIND_IP':'127.0.0.1','DASHBOARD_PORT':'8090'})
+assert custom['services']['dashboard']['ports'][0]['host_ip']=='127.0.0.1'
+assert custom['services']['dashboard']['ports'][0]['published']=='8090'
 assert render(local=True)[0].returncode != 0, 'Production must require explicit credentials'
 fixture = {'TELEGRAM_BOT_TOKEN': 'synthetic-not-a-real-token', 'TELEGRAM_OWNER_USER_ID': '42',
            'TELEGRAM_ALLOWED_USER_IDS': '77,88', 'TELEGRAM_API_ID': '123',
@@ -34,4 +40,4 @@ for service in ('archive', 'dashboard'):
     assert settings['TELEGRAM_MAX_BYTES'] == '2000000000'
     assert settings['KEEP_CACHE'] == 'false' and settings['CACHE_RETENTION_HOURS'] == '24'
     assert settings['ENABLE_UPLOAD'] == 'false' and 'build' not in local['services'][service]
-print('PRIVATE_COMPOSE: cloud=OK local=OK required_credentials=OK owner+viewers=OK volumes=preserved exit=0')
+print('PRIVATE_COMPOSE: cloud=OK local=OK required_credentials=OK owner+viewers=OK volumes=preserved dashboard=public-ip:8080 configurable=OK exit=0')

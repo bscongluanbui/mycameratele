@@ -16,14 +16,35 @@
       <p class="eyebrow">EZVIZ ARCHIVE</p>
       <h1 id="login-title">Một nơi cho mọi camera.</h1>
       <p class="muted">Đăng nhập dashboard để quản lý camera và tìm lại video đã lưu trên Telegram.</p>
-      <form id="login-form">
-        <label for="login-token">Dashboard token</label>
-        <input id="login-token" name="token" type="password" autocomplete="current-password" required placeholder="Nhập token trong cấu hình Docker">
-        <p class="field-hint">Token dashboard khác với token bot Telegram.</p>
-        <p id="login-error" class="form-error" role="alert" hidden></p>
-        <button class="button primary full-width" type="submit">Mở dashboard <span aria-hidden="true">→</span></button>
+      <form id="login-form" novalidate>
+        <div class="field"><label for="login-username">Tên đăng nhập</label><input id="login-username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required minlength="3" maxlength="64" placeholder="Tên đăng nhập" aria-describedby="login-error"></div>
+        <div class="field"><label for="login-password">Mật khẩu</label><div class="password-control"><input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="128" placeholder="Mật khẩu" aria-describedby="login-error"><button class="password-toggle" type="button" data-password-target="login-password" aria-label="Hiện mật khẩu" aria-pressed="false">Hiện</button></div></div>
+        <p class="field-hint">Cài đặt lần đầu: <strong>admin / admin</strong>. Đổi tên đăng nhập và mật khẩu sau khi đăng nhập.</p>
+        <p id="login-error" class="form-error" role="alert" hidden tabindex="-1"></p>
+        <p id="login-status" class="form-status" role="status" aria-live="polite" hidden></p>
+        <button id="login-submit" class="button primary full-width" type="submit">Đăng nhập <span aria-hidden="true">→</span></button>
       </form>
-      <p class="login-footnote">Phiên đăng nhập dùng cookie · Không lưu token trong trình duyệt</p>
+      <p class="login-footnote">Phiên đăng nhập dùng cookie · Không lưu mật khẩu trong ứng dụng trình duyệt</p>
+    </div>
+  </section>
+
+  <section id="account-screen" class="login-screen account-screen" hidden aria-labelledby="account-title">
+    <div class="login-card account-card">
+      <p class="eyebrow">DASHBOARD ACCOUNT</p>
+      <h1 id="account-title">Tài khoản quản trị.</h1>
+      <p id="account-intro" class="muted">Đổi tên đăng nhập và mật khẩu cho dashboard.</p>
+      <div id="account-required-note" class="account-required-note" hidden>Thiết lập tài khoản trước khi mở dashboard. Mật khẩu mới cần có ít nhất 8 ký tự.</div>
+      <form id="account-form" novalidate>
+        <div class="field"><label for="account-username">Tên đăng nhập</label><input id="account-username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required minlength="3" maxlength="64" pattern="[A-Za-z0-9_.\-]{3,64}" aria-describedby="account-username-hint account-error"><p id="account-username-hint" class="field-hint">3–64 ký tự: chữ, số, dấu gạch dưới, dấu chấm hoặc dấu gạch ngang.</p></div>
+        <div class="field"><label for="account-current-password">Mật khẩu hiện tại</label><div class="password-control"><input id="account-current-password" name="current_password" type="password" autocomplete="current-password" required maxlength="128" aria-describedby="account-error"><button class="password-toggle" type="button" data-password-target="account-current-password" aria-label="Hiện mật khẩu hiện tại" aria-pressed="false">Hiện</button></div></div>
+        <div class="field"><label for="account-new-password">Mật khẩu mới</label><div class="password-control"><input id="account-new-password" name="new_password" type="password" autocomplete="new-password" required minlength="8" maxlength="128" aria-describedby="account-password-hint account-error"><button class="password-toggle" type="button" data-password-target="account-new-password" aria-label="Hiện mật khẩu mới" aria-pressed="false">Hiện</button></div><p id="account-password-hint" class="field-hint">8–128 ký tự. Có thể dán hoặc sử dụng trình quản lý mật khẩu.</p></div>
+        <div class="field"><label for="account-confirm-password">Nhập lại mật khẩu mới</label><div class="password-control"><input id="account-confirm-password" name="confirm_password" type="password" autocomplete="new-password" required minlength="8" maxlength="128" aria-describedby="account-error"><button class="password-toggle" type="button" data-password-target="account-confirm-password" aria-label="Hiện mật khẩu nhập lại" aria-pressed="false">Hiện</button></div></div>
+        <p id="account-error" class="form-error" role="alert" hidden tabindex="-1"></p>
+        <p id="account-status" class="form-status" role="status" aria-live="polite" hidden></p>
+        <div class="account-actions"><button id="account-cancel" class="button secondary" type="button">Hủy</button><button id="account-save" class="button primary" type="submit">Lưu tài khoản</button></div>
+      </form>
+      <p class="login-footnote">Sau khi lưu, mọi phiên đăng nhập kết thúc. Đăng nhập lại bằng tài khoản vừa đổi.</p>
+      <button id="account-logout" class="button ghost full-width" type="button">Đăng xuất</button>
     </div>
   </section>
 
@@ -41,7 +62,7 @@
     </aside>
 
     <div class="workspace">
-      <header class="topbar"><div class="topbar-crumb"><span>Workspace</span><span aria-hidden="true">/</span><strong id="topbar-page">Camera</strong></div><div class="topbar-actions"><span class="session-badge">Phiên quản trị</span><button id="refresh-button" class="button ghost compact" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-2L20 8M4 16l2.3 3A7 7 0 0 0 17.9 17"/></svg>Làm mới</button><button id="logout-button" class="button ghost compact" type="button">Đăng xuất</button></div></header>
+      <header class="topbar"><div class="topbar-crumb"><span>Workspace</span><span aria-hidden="true">/</span><strong id="topbar-page">Camera</strong></div><div class="topbar-actions"><span id="session-username" class="session-badge">Phiên quản trị</span><button id="account-button" class="button ghost compact" type="button">Tài khoản</button><button id="refresh-button" class="button ghost compact" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-2L20 8M4 16l2.3 3A7 7 0 0 0 17.9 17"/></svg>Làm mới</button><button id="logout-button" class="button ghost compact" type="button">Đăng xuất</button></div></header>
       <main id="main" tabindex="-1">
         <div id="global-error" class="notice error-notice" role="alert" hidden></div>
 
@@ -74,7 +95,7 @@
           <div id="archive-empty" class="empty-state" hidden><span class="empty-glyph" aria-hidden="true">▤</span><h3>Chưa có video phù hợp</h3><p>Chọn khoảng thời gian khác hoặc chuyển trạng thái sang “Tất cả trạng thái”. Video mới xuất từ Studio cần được nhập và upload trước khi có liên kết Telegram.</p></div>
           <div id="archive-table-wrap" class="table-wrap" hidden tabindex="0" aria-label="Bảng video, cuộn ngang trên màn hình nhỏ"><table><thead><tr><th scope="col">Camera / Video</th><th scope="col">Bắt đầu</th><th scope="col">Thời lượng</th><th scope="col">Dung lượng</th><th scope="col">Trạng thái</th><th scope="col" class="align-right">Telegram</th></tr></thead><tbody id="archive-rows"></tbody></table></div>
           <nav id="archive-pagination" class="pagination" aria-label="Phân trang video" hidden><span id="pagination-summary" class="muted small"></span><div><button id="previous-page" class="button secondary compact" type="button">← Trước</button><button id="next-page" class="button secondary compact" type="button">Tiếp →</button></div></nav>
-          <p class="small muted archive-footnote">Liên kết Telegram mở bài đăng gốc; tài khoản của bạn cần là thành viên kênh riêng tư tương ứng.</p>
+          <p class="small muted archive-footnote">Liên kết Telegram mở video trong bot; ID Telegram của bạn cần nằm trong danh sách được phép truy cập.</p>
         </section>
 
         <section id="view-system" class="view" hidden aria-labelledby="system-title">

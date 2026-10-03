@@ -56,28 +56,56 @@ Compose mặc định **pull-only**, không build trên board:
 
 Mặc định cloud test, `ENABLE_UPLOAD=false`, `KEEP_CACHE=true`; một cài đặt chưa
 có credential vẫn khởi động dashboard/worker mà chưa gửi Telegram. Image dùng
-UID/GID `10001:10001`; `input` chỉ đọc. SQLite/cache/token dashboard nằm trong
+UID/GID `10001:10001`; `input` chỉ đọc. SQLite/cache/tài khoản dashboard nằm trong
 named volumes. Giữ project **`ezviz-telegram-archive`** và volume keys
 `archive-state`, `archive-cache`, `bot-api-state` khi cập nhật để dùng lại dữ liệu.
 
 ### Dashboard
 
-```bash
-docker compose exec dashboard cat /data/dashboard_token
+Mở **`http://IP_VPS:8080`**, thay `IP_VPS` bằng IP public của máy chạy Docker.
+Compose mặc định publish `0.0.0.0:8080`; không cần SSH tunnel hay nhập token.
+Với máy trong LAN, dùng `http://IP_MAY_DOCKER:8080`. VPS có firewall/security
+group thì cho phép TCP ở cổng đã chọn để truy cập từ máy của bạn.
+
+- Lần đầu đăng nhập: **username `admin`, password `admin`**.
+- Sau lần đăng nhập đầu, form **Đổi tài khoản** xuất hiện trước các chức năng
+  quản lý. Đặt mật khẩu mới từ 8 đến 128 ký tự; có thể giữ username `admin`
+  hoặc đổi tên (3–64 ký tự, chữ/số/dấu `.`, `_`, `-`).
+- Sau khi lưu, đăng nhập lại bằng tài khoản mới. Các phiên cũ bị hủy.
+- Các lần sau, nút **Tài khoản** trên thanh trên cùng cho phép đổi username
+  và mật khẩu với xác nhận mật khẩu hiện tại.
+- Tài khoản chỉ được tạo **một lần** tại `/data/dashboard_auth.sqlite` trong
+  volume `archive-state`. Restart, recreate, pull image mới giữ tài khoản đã
+  đổi; không tự reset về `admin/admin`. `DASHBOARD_TOKEN` và file token cũ
+  không còn cấp quyền đăng nhập.
+
+Mật khẩu lưu dạng hash có salt riêng bằng PBKDF2-HMAC-SHA256/600.000 vòng, theo
+[OWASP Password Storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
+Cookie có HttpOnly/SameSite/CSRF; giới hạn lần đăng nhập; Đăng xuất hủy phiên.
+Đặt `DASHBOARD_COOKIE_SECURE=true` khi triển khai qua HTTPS; giữ `false` khi
+dùng trực tiếp HTTP IP:port. Không đưa mật khẩu thật vào source/image.
+
+Port và interface có thể đổi trong `.env`:
+
+```dotenv
+DASHBOARD_BIND_IP=0.0.0.0
+DASHBOARD_PORT=8080
+DASHBOARD_COOKIE_SECURE=false
 ```
 
-Mở `http://127.0.0.1:8080` và đăng nhập bằng token. Token dashboard khác token bot,
-tự tạo và lưu `/data`; `DASHBOARD_TOKEN` có thể override với chuỗi ngẫu nhiên ít
-nhất 24 ký tự. Để mở dashboard từ PC qua SSH, thay hai slot bằng máy thật:
+Nếu nâng cấp từ bản dashboard token, `.env` cũ có thể vẫn bind `127.0.0.1`.
+Đổi `DASHBOARD_BIND_IP=0.0.0.0` rồi cập nhật:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 USER@DOCKER_HOST
+git pull --ff-only
+sed -i 's/^DASHBOARD_BIND_IP=.*/DASHBOARD_BIND_IP=0.0.0.0/' .env
+docker compose pull archive dashboard
+docker compose up -d archive dashboard
 ```
 
-Rồi mở `http://127.0.0.1:8080` trên PC. Truy cập LAN trực tiếp chỉ khi bạn đặt
-`DASHBOARD_BIND_IP` bằng địa chỉ LAN của máy Docker và recreate dashboard.
-Mặc định bind loopback. Cookie đăng nhập có HttpOnly/SameSite/CSRF; Đăng xuất hủy
-phiên. Không đưa token/mật khẩu/Wi-Fi vào source, manifest, image hay build args.
+Nếu dùng local Bot API, giữ cả hai file Compose và profile trong lệnh cập nhật
+như mục production bên dưới. Thay đổi tài khoản dashboard không đổi token bot,
+allowlist, camera hay kho video. Backup toàn bộ volume `/data` giữ cả tài khoản.
 
 ## 2. Thêm camera và nhập recording
 

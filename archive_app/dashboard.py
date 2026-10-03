@@ -3,15 +3,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import urlsplit,parse_qs,unquote
-import hashlib
 import hmac
 import json
 import os
 import secrets
+import ssl
 import threading
 import time
 
-from .core import Archive,Settings,secret
+from .core import Archive,Settings
+from .dashboard_auth import DashboardAuth
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -19,25 +20,19 @@ class DashboardServer(ThreadingHTTPServer):
     def __init__(self,address,settings,token=None):
         self.settings=settings
         settings.state_dir.mkdir(parents=True,exist_ok=True)
-        if token is None:
-            token=secret('DASHBOARD_TOKEN')
-            if not token:
-                path=settings.state_dir/'dashboard_token'
-                try:
-                    with path.open('x',encoding='utf-8') as handle:
-                        os.chmod(path,0o600);handle.write(secrets.token_urlsafe(32)+'\n')
-                except FileExistsError:pass
-                token=path.read_text(encoding='utf-8').strip()
-        if not isinstance(token,str) or len(token)<24:raise ValueError('Dashboard token must contain at least 24 characters')
-        self.token_hash=hashlib.sha256(token.encode()).digest()
-        self.sessions={};self.login_attempts={};self.session_lock=threading.Lock()
+        # The obsolete constructor argument remains accepted for callers only;
+        # neither it, DASHBOARD_TOKEN, nor dashboard_token grants access.
+        self.auth=DashboardAuth(settings.state_dir)
+        self.cookie_secure=os.environ.get('DASHBOARD_COOKIE_SECURE','false').strip().lower()=='true'
+        self.sessions={};self.login_attempts={};self.account_attempts={};self.session_lock=threading.Lock()
+        self.auth_lock=threading.Lock()
         self.web=Path(__file__).parent/'web'
         with_archive=Archive(settings);with_archive.close()
         super().__init__(address,DashboardHandler)
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    server_version='EZVIZDashboard/2.2'
+    server_version='EZVIZDashboard/2.3'
     def setup(self):
         super().setup();self.connection.settimeout(15)
     def log_message(self,*args):pass  # Requests can contain cookies; do not log headers/tokens.
@@ -65,7 +60,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
         with self.server.session_lock:
             expired=[key for key,value in self.server.sessions.items() if value['expires']<=now]
             for key in expired:self.server.sessions.pop(key,None)
-            return self.server.sessions.get(sid)
+            session=self.server.sessions.get(sid)
+        if session and session['version']!=self.server.auth.account()['version']:
+            with self.server.session_lock:self.server.sessions.pop(sid,None)
+            return None
+        return session
+
+    def session_cookie(self,sid='',max_age=0):
+        cookie='ezviz_session='+sid+'; HttpOnly; SameSite=Strict; Path=/; Max-Age='+str(max_age)
+        # Forwarded headers are client-controlled unless a trusted proxy strips
+        # them. Only actual TLS or an explicit deployment setting enables this.
+        if self.server.cookie_secure or isinstance(self.connection,ssl.SSLSocket):cookie+='; Secure'
+        return cookie
+
+    def rate_limited(self,store):
+        peer=self.client_address[0];now=time.time()
+        with self.server.session_lock:
+            for address,timestamps in list(store.items()):
+                filtered=[stamp for stamp in timestamps if now-stamp<60]
+                if filtered:store[address]=filtered
+                else:store.pop(address,None)
+            attempts=store.setdefault(peer,[])
+            if len(attempts)>=10:return True
+            # Bound the amount of remote address state retained by the service.
+            if len(store)>10000:store.clear();attempts=store.setdefault(peer,[])
+            attempts.append(now)
+        return False
+
+    @staticmethod
+    def public_account(account):
+        return {'username':account['username'],'password_change_required':account['password_change_required']}
 
     def read_json(self):
         if self.headers.get('Transfer-Encoding'):raise ValueError('Chunked JSON is not accepted')
@@ -91,7 +115,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed=urlsplit(self.path);path=parsed.path
         try:
             if path=='/healthz' and method=='GET':
-                self.send(200,{'healthy':True,'service':'dashboard','version':'2.2'});return
+                self.send(200,{'healthy':True,'service':'dashboard','version':'2.3'});return
             if not path.startswith('/api/'):
                 assets={'/':('index.html','text/html'),'/app.js':('app.js','text/javascript'),'/style.css':('style.css','text/css')}
                 if method!='GET' or path not in assets:self.send(404,{'error':'Not found'});return
@@ -99,30 +123,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send(200,body=(self.server.web/filename).read_bytes(),mime=mime);return
             if not self.same_origin():self.send(403,{'error':'Origin rejected'});return
             if path=='/api/login' and method=='POST':
-                data=self.read_json();token=data.get('token','')
-                if not isinstance(token,str) or len(token)>512:raise ValueError('Invalid login token')
+                data=self.read_json()
                 peer=self.client_address[0];now=time.time()
-                with self.server.session_lock:
-                    attempts=[t for t in self.server.login_attempts.get(peer,[]) if now-t<60]
-                    self.server.login_attempts[peer]=attempts
-                    if len(attempts)>=10:self.send(429,{'error':'Thử lại sau một phút'});return
-                    attempts.append(now)
-                if not hmac.compare_digest(hashlib.sha256(token.encode()).digest(),self.server.token_hash):
-                    self.send(401,{'error':'Token không đúng'});return
-                sid=secrets.token_urlsafe(32);session={'csrf_token':secrets.token_urlsafe(24),'expires':now+43200}
-                with self.server.session_lock:
-                    if len(self.server.sessions)>=100:self.server.sessions.clear()
-                    self.server.sessions[sid]=session;self.server.login_attempts.pop(peer,None)
-                self.send(200,{'authenticated':True,'csrf_token':session['csrf_token']},cookie='ezviz_session='+sid+'; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200');return
+                if self.rate_limited(self.server.login_attempts):
+                    self.send(429,{'error':'Thử lại sau một phút','code':'rate_limited'});return
+                with self.server.auth_lock:
+                    account=self.server.auth.authenticate(data.get('username'),data.get('password'))
+                    if not account or account['version']!=self.server.auth.account()['version']:
+                        self.send(401,{'error':'Tên đăng nhập hoặc mật khẩu không đúng','code':'invalid_credentials'});return
+                    sid=secrets.token_urlsafe(32)
+                    session={'csrf_token':secrets.token_urlsafe(24),'expires':now+43200,'version':account['version']}
+                    with self.server.session_lock:
+                        if len(self.server.sessions)>=100:self.server.sessions.clear()
+                        self.server.sessions[sid]=session;self.server.login_attempts.pop(peer,None)
+                self.send(200,{'authenticated':True,'csrf_token':session['csrf_token'],'account':self.public_account(account)},cookie=self.session_cookie(sid,43200));return
             session=self.session()
-            if not session:self.send(401,{'error':'Đăng nhập dashboard trước'});return
-            if method!='GET' and not hmac.compare_digest(self.headers.get('X-CSRF-Token',''),session['csrf_token']):
+            if not session:self.send(401,{'error':'Đăng nhập dashboard trước','code':'authentication_required'});return
+            account=self.server.auth.account()
+            if account['version']!=session['version']:
+                self.send(401,{'error':'Đăng nhập dashboard trước','code':'authentication_required'});return
+            allowed_setup=(path=='/api/account' and method in ('GET','POST')) or (path=='/api/logout' and method=='POST')
+            if account['password_change_required'] and not allowed_setup:
+                self.send(409,{'error':'Đổi mật khẩu ban đầu trước khi sử dụng dashboard','code':'password_change_required'});return
+            if method!='GET' and not hmac.compare_digest(self.headers.get('X-CSRF-Token','').encode('utf-8'),session['csrf_token'].encode('utf-8')):
                 self.send(403,{'error':'CSRF token required'});return
             if path=='/api/logout' and method=='POST':
                 with self.server.session_lock:
                     for sid,item in list(self.server.sessions.items()):
                         if item is session:self.server.sessions.pop(sid,None)
-                self.send(200,{'authenticated':False},cookie='ezviz_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');return
+                self.send(200,{'authenticated':False},cookie=self.session_cookie());return
+            if path=='/api/account' and method=='GET':
+                self.send(200,{**self.public_account(account),'csrf_token':session['csrf_token']});return
+            if path=='/api/account' and method=='POST':
+                data=self.read_json()
+                if self.rate_limited(self.server.account_attempts):
+                    self.send(429,{'error':'Thử lại sau một phút','code':'rate_limited'});return
+                with self.server.auth_lock:
+                    try:
+                        self.server.auth.change(data.get('current_password'),data.get('username'),data.get('new_password'),session['version'])
+                    except PermissionError:
+                        self.send(401,{'error':'Mật khẩu hiện tại không đúng','code':'current_password_invalid'});return
+                    with self.server.session_lock:
+                        self.server.sessions.clear();self.server.account_attempts.pop(self.client_address[0],None)
+                self.send(200,{'authenticated':False,'credentials_updated':True},cookie=self.session_cookie());return
             archive=Archive(self.server.settings)
             try:
                 if path=='/api/status' and method=='GET':

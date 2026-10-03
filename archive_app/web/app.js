@@ -1,4 +1,4 @@
-/* No CDN, no stored admin token, no credentials in camera metadata. */
+/* No CDN, no stored credentials, no credentials in camera metadata. */
 (() => {
   "use strict";
   const STATUS = {
@@ -59,6 +59,14 @@
         if (edited[key] !== undefined && edited[key] !== original[key]) patch[key] = edited[key];
       }
       return patch;
+    },
+    validUsername(value) { return typeof value === "string" && /^[A-Za-z0-9_.-]{3,64}$/.test(value); },
+    accountValidation(values) {
+      if (!helpers.validUsername(values.username)) return { field: "account-username", message: "Tên đăng nhập cần có 3–64 ký tự: chữ, số, dấu _, dấu . hoặc dấu -." };
+      if (typeof values.current_password !== "string" || !values.current_password) return { field: "account-current-password", message: "Nhập mật khẩu hiện tại để xác nhận thay đổi." };
+      if (typeof values.new_password !== "string" || Array.from(values.new_password).length < 8 || Array.from(values.new_password).length > 128) return { field: "account-new-password", message: "Mật khẩu mới cần có 8–128 ký tự." };
+      if (values.new_password !== values.confirm_password) return { field: "account-confirm-password", message: "Mật khẩu nhập lại chưa khớp với mật khẩu mới." };
+      return null;
     }
   };
   // Export pure helpers for dependency-free Node regression tests.
@@ -66,7 +74,7 @@
   if (typeof document === "undefined") return;
 
   const $ = id => document.getElementById(id);
-  const state = { cameras: [], status: {}, csrf: "", probes: new Map(), calendar: [], offset: 0, limit: 25, total: 0, archiveRequest: 0, calendarRequest: 0, editing: null, view: "cameras", authenticated: false };
+  const state = { cameras: [], status: {}, csrf: "", probes: new Map(), calendar: [], offset: 0, limit: 25, total: 0, archiveRequest: 0, calendarRequest: 0, editing: null, view: "cameras", authenticated: false, sessionRevision: 0, account: null, accountRequired: false, loginBusy: false, accountBusy: false, logoutBusy: false };
   let toastTimer;
   function node(tag, className, text) {
     const item = document.createElement(tag);
@@ -101,11 +109,43 @@
     toastTimer = setTimeout(() => { $("toast").hidden = true; }, error ? 8000 : 4500);
   }
   function globalError(message) { $("global-error").textContent = message || ""; $("global-error").hidden = !message; }
-  function showLogin() {
-    state.authenticated = false; state.archiveRequest++; state.calendarRequest++;
-    $("app-shell").hidden = true; $("boot-loading").hidden = true; $("login-screen").hidden = false;
+  function clearPasswords(form) {
+    for (const input of form.querySelectorAll("input[data-password-field], input[type=password]")) { input.value = ""; input.type = "password"; }
+    for (const toggle of form.querySelectorAll("[data-password-target]")) { toggle.textContent = "Hiện"; toggle.setAttribute("aria-pressed", "false"); toggle.setAttribute("aria-label", toggle.dataset.showLabel); }
+  }
+  function clearFormError(form, errorBox) {
+    errorBox.hidden = true; errorBox.textContent = "";
+    for (const input of form.querySelectorAll("[aria-invalid]")) input.removeAttribute("aria-invalid");
+  }
+  function formError(form, errorBox, message, field = "") {
+    clearFormError(form, errorBox); errorBox.textContent = message; errorBox.hidden = false;
+    if (field && $(field)) { $(field).setAttribute("aria-invalid", "true"); $(field).focus(); } else errorBox.focus();
+  }
+  function showLogin({ username = state.account?.username || "", message = "" } = {}) {
+    state.authenticated = false; state.sessionRevision++; state.archiveRequest++; state.calendarRequest++;
+    state.account = null; state.accountRequired = false; state.csrf = ""; state.cameras = []; state.status = {}; state.calendar = []; state.probes.clear();
+    $("app-shell").hidden = true; $("account-screen").hidden = true; $("boot-loading").hidden = true; $("login-screen").hidden = false;
     if ($("camera-dialog").open) $("camera-dialog").close();
-    $("login-token").focus();
+    clearPasswords($("login-form")); clearPasswords($("account-form"));
+    clearFormError($("login-form"), $("login-error")); clearFormError($("account-form"), $("account-error"));
+    $("login-username").value = username; $("login-status").textContent = message; $("login-status").hidden = !message;
+    (username ? $("login-password") : $("login-username")).focus();
+  }
+  function showAccount(account, required = !!account?.password_change_required) {
+    state.account = account; state.accountRequired = required; state.archiveRequest++; state.calendarRequest++;
+    $("app-shell").hidden = true; $("login-screen").hidden = true; $("boot-loading").hidden = true; $("account-screen").hidden = false;
+    if ($("camera-dialog").open) $("camera-dialog").close();
+    $("account-form").reset(); clearPasswords($("account-form")); clearFormError($("account-form"), $("account-error"));
+    $("account-username").value = account?.username || "admin";
+    $("account-title").textContent = required ? "Thiết lập tài khoản." : "Tài khoản quản trị.";
+    $("account-intro").textContent = required ? "Bạn đã đăng nhập. Đổi mật khẩu mặc định để tiếp tục quản lý camera và thư viện video." : "Đổi tên đăng nhập và mật khẩu cho dashboard.";
+    $("account-required-note").hidden = !required; $("account-cancel").hidden = required; $("account-status").hidden = true;
+    $("account-new-password").focus();
+  }
+  async function acceptAccount(account, csrf) {
+    state.authenticated = true; state.account = account; state.csrf = csrf || state.csrf; state.accountRequired = !!account?.password_change_required;
+    $("session-username").textContent = account?.username || "Phiên quản trị";
+    if (state.accountRequired) showAccount(account, true); else { $("account-screen").hidden = true; await refresh(); }
   }
   async function api(path, options = {}) {
     const method = options.method || "GET";
@@ -118,9 +158,12 @@
     let result;
     try { result = await response.json(); } catch (_) { throw new Error(`Dashboard trả về dữ liệu không hợp lệ (HTTP ${response.status}).`); }
     if (!response.ok) {
-      if (response.status === 401 && path !== "/api/login") showLogin();
-      const error = new Error(result.error || result.message || `Yêu cầu chưa hoàn tất (HTTP ${response.status}).`);
-      error.httpStatus = response.status; throw error;
+      const code = result.code || "";
+      if (response.status === 401 && path !== "/api/login" && code !== "current_password_invalid") showLogin({ message: state.authenticated ? "Phiên đăng nhập đã kết thúc. Đăng nhập lại để tiếp tục." : "" });
+      if (response.status === 409 && code === "password_change_required") showAccount({ ...(state.account || { username: "admin" }), password_change_required: true }, true);
+      const messages = { current_password_invalid: "Mật khẩu hiện tại chưa đúng. Kiểm tra lại rồi thử lưu.", authentication_failed: "Tên đăng nhập hoặc mật khẩu chưa đúng.", invalid_credentials: "Tên đăng nhập hoặc mật khẩu chưa đúng.", authentication_required: "Phiên đăng nhập đã kết thúc. Đăng nhập lại để tiếp tục.", password_change_required: "Đổi mật khẩu mặc định trước khi mở dashboard." };
+      const error = new Error(messages[code] || result.error || result.message || `Yêu cầu chưa hoàn tất (HTTP ${response.status}).`);
+      error.httpStatus = response.status; error.code = code; throw error;
     }
     return result;
   }
@@ -230,17 +273,22 @@
     }
   }
   async function refresh() {
+    if (!state.authenticated || state.accountRequired) return;
+    const revision = state.sessionRevision;
     $("refresh-button").disabled = true; $("camera-loading").hidden = false; globalError("");
     try {
-      const status = await api("/api/status"); state.status = status; state.csrf = status.csrf_token || "";
-      const response = await api("/api/cameras"); state.cameras = Array.isArray(response.cameras) ? response.cameras : [];
-      state.authenticated = true; $("boot-loading").hidden = true; $("login-screen").hidden = true; $("app-shell").hidden = false;
+      const status = await api("/api/status");
+      if (!state.authenticated || state.accountRequired || revision !== state.sessionRevision) return;
+      const response = await api("/api/cameras");
+      if (!state.authenticated || state.accountRequired || revision !== state.sessionRevision) return;
+      state.status = status; state.csrf = status.csrf_token || state.csrf; state.cameras = Array.isArray(response.cameras) ? response.cameras : [];
+      $("boot-loading").hidden = true; $("login-screen").hidden = true; if ($("account-screen").hidden) $("app-shell").hidden = false;
       renderCameras(); refreshCameraOptions(); renderSystem();
       if (state.view === "archive") { await loadCalendar(true); await loadArchive(); }
     } catch (error) {
-      if (error.httpStatus !== 401) {
+      if (error.httpStatus !== 401 && error.code !== "password_change_required") {
         if (!state.authenticated) { $("boot-loading").hidden = true; $("login-screen").hidden = false; $("login-error").hidden = false; $("login-error").textContent = error.message; }
-        else globalError(error.message);
+        else { $("boot-loading").hidden = true; $("login-screen").hidden = true; if ($("account-screen").hidden) $("app-shell").hidden = false; globalError(error.message); }
         $("connection-state").textContent = "Mất kết nối dashboard";
       }
     } finally { $("refresh-button").disabled = false; $("camera-loading").hidden = true; }
@@ -251,7 +299,7 @@
     for (const item of document.querySelectorAll(".view")) item.hidden = item.id !== `view-${name}`;
     for (const link of document.querySelectorAll("[data-view]")) { const active = link.dataset.view === name; link.classList.toggle("active", active); if (active) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current"); }
     $("topbar-page").textContent = { cameras: "Camera", archive: "Thư viện video", system: "Hệ thống" }[name];
-    if (name === "archive" && load && state.authenticated) { loadCalendar(true).then(loadArchive).catch(error => globalError(error.message)); }
+    if (name === "archive" && load && state.authenticated && !state.accountRequired) { loadCalendar(true).then(loadArchive).catch(error => globalError(error.message)); }
     if (name === "system") renderSystem();
   }
   async function openCameraArchive(id) {
@@ -317,6 +365,7 @@
     setOptions($("filter-day"), "Tất cả ngày", days.map(day => [day, `Ngày ${String(day).padStart(2, "0")}`]), oldDay);
   }
   async function loadCalendar(preserve = false) {
+    if (!state.authenticated || state.accountRequired) return;
     const camera = $("filter-camera").value, request = ++state.calendarRequest;
     if (!camera) { state.calendar = []; updateCalendarOptions(false); return; }
     if (!preserve) { state.calendar = []; updateCalendarOptions(false); }
@@ -353,7 +402,7 @@
     $("previous-page").disabled = state.offset === 0; $("next-page").disabled = state.offset + state.limit >= state.total;
   }
   async function loadArchive() {
-    if (!state.authenticated) return;
+    if (!state.authenticated || state.accountRequired) return;
     const request = ++state.archiveRequest, params = new URLSearchParams();
     for (const field of ["camera", "year", "month", "day", "status", "order"]) { const value = $("filter-" + field).value; if (value) params.set(field, value); }
     params.set("offset", String(state.offset)); params.set("limit", String(state.limit));
@@ -368,18 +417,64 @@
   }
 
   $("login-form").addEventListener("submit", async event => {
-    event.preventDefault(); const control = $("login-form").querySelector("button"); control.disabled = true; $("login-error").hidden = true;
-    try { await api("/api/login", { method: "POST", body: { token: $("login-token").value } }); $("login-token").value = ""; await refresh(); }
-    catch (error) { $("login-error").textContent = error.message; $("login-error").hidden = false; $("login-token").focus(); }
-    finally { control.disabled = false; }
+    event.preventDefault(); if (state.loginBusy) return;
+    const form = $("login-form"), errorBox = $("login-error"), username = $("login-username").value.trim(), password = $("login-password").value;
+    clearFormError(form, errorBox);
+    if (!helpers.validUsername(username)) { formError(form, errorBox, "Nhập tên đăng nhập gồm 3–64 ký tự chữ, số, dấu _, dấu . hoặc dấu -.", "login-username"); return; }
+    if (!password) { formError(form, errorBox, "Nhập mật khẩu để đăng nhập.", "login-password"); return; }
+    state.loginBusy = true; $("login-submit").disabled = true; form.setAttribute("aria-busy", "true");
+    $("login-status").textContent = "Đang đăng nhập…"; $("login-status").hidden = false;
+    try {
+      const result = await api("/api/login", { method: "POST", body: { username, password } });
+      if (result.authenticated !== true || !result.account) throw new Error("Dashboard chưa xác nhận phiên đăng nhập. Thử lại.");
+      clearPasswords(form); $("login-status").hidden = true; await acceptAccount(result.account, result.csrf_token);
+    } catch (error) { $("login-status").hidden = true; formError(form, errorBox, error.message, "login-password"); }
+    finally { state.loginBusy = false; $("login-submit").disabled = false; form.removeAttribute("aria-busy"); }
+  });
+  for (const toggle of document.querySelectorAll("[data-password-target]")) {
+    toggle.dataset.showLabel = toggle.getAttribute("aria-label"); $(toggle.dataset.passwordTarget).dataset.passwordField = "true";
+    toggle.addEventListener("click", () => {
+      const input = $(toggle.dataset.passwordTarget), visible = input.type === "password";
+      input.type = visible ? "text" : "password"; toggle.textContent = visible ? "Ẩn" : "Hiện";
+      toggle.setAttribute("aria-pressed", String(visible)); toggle.setAttribute("aria-label", visible ? toggle.dataset.showLabel.replace("Hiện", "Ẩn") : toggle.dataset.showLabel);
+    });
+  }
+  for (const formId of ["login-form", "account-form"]) $(formId).addEventListener("input", event => { event.target.removeAttribute("aria-invalid"); });
+  $("account-button").addEventListener("click", async () => {
+    $("account-button").disabled = true;
+    try { const account = await api("/api/account"); state.csrf = account.csrf_token || state.csrf; showAccount(account); }
+    catch (error) { if (error.httpStatus !== 401) toast(error.message, true); }
+    finally { $("account-button").disabled = false; }
+  });
+  $("account-cancel").addEventListener("click", () => {
+    if (state.accountRequired || state.accountBusy) return;
+    clearPasswords($("account-form")); $("account-screen").hidden = true; $("app-shell").hidden = false; $("account-button").focus();
+  });
+  $("account-form").addEventListener("submit", async event => {
+    event.preventDefault(); if (state.accountBusy) return;
+    const form = $("account-form"), errorBox = $("account-error");
+    const values = { username: $("account-username").value.trim(), current_password: $("account-current-password").value, new_password: $("account-new-password").value, confirm_password: $("account-confirm-password").value };
+    const invalid = helpers.accountValidation(values); clearFormError(form, errorBox);
+    if (invalid) { formError(form, errorBox, invalid.message, invalid.field); return; }
+    state.accountBusy = true; $("account-save").disabled = true; $("account-cancel").disabled = true; $("account-logout").disabled = true; form.setAttribute("aria-busy", "true");
+    $("account-status").textContent = "Đang lưu tài khoản…"; $("account-status").hidden = false;
+    try {
+      const result = await api("/api/account", { method: "POST", body: { username: values.username, current_password: values.current_password, new_password: values.new_password } });
+      if (result.credentials_updated !== true || result.authenticated !== false) throw new Error("Dashboard chưa xác nhận thay đổi tài khoản. Thử lại.");
+      showLogin({ username: values.username, message: "Đã đổi tài khoản. Đăng nhập lại bằng mật khẩu mới." }); toast("Đã lưu tài khoản và kết thúc mọi phiên đăng nhập.");
+    } catch (error) {
+      if (error.httpStatus !== 401 || error.code === "current_password_invalid") formError(form, errorBox, error.message, error.code === "current_password_invalid" ? "account-current-password" : "");
+    } finally { state.accountBusy = false; $("account-save").disabled = false; $("account-cancel").disabled = false; $("account-logout").disabled = false; form.removeAttribute("aria-busy"); $("account-status").hidden = true; }
   });
   $("refresh-button").addEventListener("click", refresh); $("camera-search").addEventListener("input", renderCameras);
-  $("logout-button").addEventListener("click", async () => {
-    $("logout-button").disabled = true;
-    try { await api("/api/logout", { method: "POST", body: {} }); state.csrf = ""; state.cameras = []; state.status = {}; state.probes.clear(); globalError(""); showLogin(); toast("Đã kết thúc phiên quản trị."); }
+  async function logout() {
+    if (state.logoutBusy) return;
+    state.logoutBusy = true; $("logout-button").disabled = true; $("account-logout").disabled = true;
+    try { await api("/api/logout", { method: "POST", body: {} }); globalError(""); showLogin(); toast("Đã kết thúc phiên quản trị."); }
     catch (error) { if (error.httpStatus !== 401) toast(error.message, true); }
-    finally { $("logout-button").disabled = false; }
-  });
+    finally { state.logoutBusy = false; $("logout-button").disabled = false; $("account-logout").disabled = false; }
+  }
+  $("logout-button").addEventListener("click", logout); $("account-logout").addEventListener("click", logout);
   $("add-camera-button").addEventListener("click", () => openCameraForm()); $("empty-add-camera").addEventListener("click", () => openCameraForm());
   for (const id of ["close-camera-dialog", "cancel-camera-dialog"]) $(id).addEventListener("click", () => $("camera-dialog").close());
   $("camera-form").addEventListener("submit", saveCamera);
@@ -391,5 +486,9 @@
   $("previous-page").addEventListener("click", () => { state.offset = Math.max(0, state.offset - state.limit); loadArchive(); });
   $("next-page").addEventListener("click", () => { state.offset += state.limit; loadArchive(); });
   window.addEventListener("hashchange", () => switchView(location.hash.slice(1)));
-  switchView(location.hash.slice(1), false); refresh();
+  async function boot() {
+    try { const account = await api("/api/account"); await acceptAccount(account, account.csrf_token); }
+    catch (error) { if (error.httpStatus !== 401) { showLogin(); formError($("login-form"), $("login-error"), error.message); } }
+  }
+  switchView(location.hash.slice(1), false); boot();
 })();

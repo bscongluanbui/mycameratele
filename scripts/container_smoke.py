@@ -4,17 +4,20 @@ Input is generated color/silence, never camera footage. No network credentials.
 Run with writable /input, /data, /cache tmpfs and a read-only root filesystem.
 """
 import hashlib
+import http.client
 import json
 import os
 import platform
 import subprocess
 import time
+import threading
 from datetime import timedelta
 from pathlib import Path
 
 from archive_app.core import Archive, Settings, get_zone, parse_time
 from archive_app.telegram import Telegram
 from archive_app.telegram_menu import TimeMenus
+from archive_app.dashboard import DashboardServer
 
 assert os.getuid() == 10001, "Image must run as its non-root application user"
 settings = Settings.from_env()
@@ -110,9 +113,43 @@ try:
     assert hashlib.sha256(source.read_bytes()).hexdigest() == original
 finally:
     archive.close()
+
+# Exercise the actual HTTP dashboard inside every target image. The fixture
+# credentials are local CI data only; no VPS/account secrets are supplied.
+dashboard=DashboardServer(('0.0.0.0',0),settings)
+thread=threading.Thread(target=dashboard.serve_forever,daemon=True);thread.start()
+cookie='';csrf=''
+def dashboard_request(method,path,body=None):
+    connection=http.client.HTTPConnection('127.0.0.1',dashboard.server_port,timeout=60)
+    headers={'Cookie':cookie,'X-CSRF-Token':csrf}
+    if body is not None:
+        headers['Content-Type']='application/json';body=json.dumps(body).encode()
+    connection.request(method,path,body=body,headers=headers)
+    response=connection.getresponse();data=json.loads(response.read())
+    result=(response.status,data,response.getheader('Set-Cookie',''))
+    connection.close();return result
+try:
+    assert dashboard.server_address[0]=='0.0.0.0'
+    assert dashboard_request('GET','/api/cameras')[0]==401
+    code,data,header=dashboard_request('POST','/api/login',{'username':'admin','password':'admin'})
+    assert code==200 and data['account']['password_change_required']
+    cookie=header.split(';')[0];csrf=data['csrf_token']
+    assert dashboard_request('GET','/api/cameras')[0]==409
+    code,data,_=dashboard_request('POST','/api/account',{'current_password':'admin','username':'smoke_admin','new_password':'synthetic-smoke-password'})
+    assert code==200 and data['credentials_updated']
+    assert dashboard_request('GET','/api/account')[0]==401
+    assert dashboard_request('POST','/api/login',{'username':'admin','password':'admin'})[0]==401
+    code,data,header=dashboard_request('POST','/api/login',{'username':'smoke_admin','password':'synthetic-smoke-password'})
+    assert code==200 and not data['account']['password_change_required']
+    cookie=header.split(';')[0];csrf=data['csrf_token']
+    assert dashboard_request('GET','/api/cameras')[0]==200
+    assert dashboard.auth.path.stat().st_mode & 0o777==0o600
+finally:
+    dashboard.shutdown();dashboard.server_close();thread.join(2)
 print(json.dumps({"result": "OK", "machine": platform.machine(), "uid": os.getuid(),
                   "ffmpeg": "h264+aac-remux-decode", "sqlite": "durable-idempotent",
                   "source": "unchanged", "timezone": "+07:00", "telegram_posts": 0,
                   "private_bot": "owner+2-viewers-file-id-replay", "cache": "24h-cleanup",
                   "bot_controls": "download+shared-trash-restore+time-camera-video",
+                  "dashboard_login": "admin-once+change+relogin+ip-bind",
                   "daily_backup": "atomic-sqlite"}, sort_keys=True))

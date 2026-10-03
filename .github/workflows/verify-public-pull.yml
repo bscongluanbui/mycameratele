@@ -55,7 +55,11 @@ jobs:
           docker compose ps
           docker compose exec -T dashboard python -c "import urllib.request; print('DASHBOARD_HEALTH: '+urllib.request.urlopen('http://127.0.0.1:8080/healthz').read().decode())"
           docker compose exec -T archive python -m archive_app health
-          docker compose exec -T dashboard python -c "from pathlib import Path; import os; p=Path('/data/dashboard_token'); assert len(p.read_text().strip())>=24; assert os.getuid()==10001; print('DASHBOARD_TOKEN: persisted non-root OK')"
+          python scripts/dashboard_smoke.py bootstrap
+          docker compose restart dashboard
+          docker compose up -d --wait --wait-timeout 120 archive dashboard
+          python scripts/dashboard_smoke.py persisted
+          docker compose exec -T dashboard python -c "from pathlib import Path; import os; p=Path('/data/dashboard_auth.sqlite'); assert p.is_file() and p.stat().st_mode & 0o777 == 0o600; assert os.getuid()==10001; print('DASHBOARD_AUTH: persisted non-root OK')"
           echo 'ANONYMOUS_INSTALL: app=3_platforms compose=healthy credentials=none result=OK' >> "$GITHUB_STEP_SUMMARY"
       - name: Pull optional native Bot API without login
         if: inputs.bot_api

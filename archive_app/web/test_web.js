@@ -45,4 +45,15 @@ equal(helpers.cameraPatch(original, {...original, name: "Sân trước"}), {name
 equal(helpers.cameraPatch(original, {...original, host: "192.168.31.138"}), {host: "192.168.31.138"});
 equal(helpers.cameraPatch(original, {...original, id: "Changed_Id"}), {});
 equal(helpers.cameraPatch(original, {...original, enabled: false}), {enabled: false});
+for (const username of ['admin', 'new.admin_1', 'A'.repeat(64)]) equal(helpers.validUsername(username), true);
+for (const username of ['ab', 'A'.repeat(65), 'bad name', '<admin>', '', null]) equal(helpers.validUsername(username), false);
+const credentials = {username: 'new_admin', current_password: 'admin', new_password: 'new-password-123', confirm_password: 'new-password-123'};
+equal(helpers.accountValidation(credentials), null);
+equal(helpers.accountValidation({...credentials, username: 'x'}).field, 'account-username');
+equal(helpers.accountValidation({...credentials, current_password: ''}).field, 'account-current-password');
+equal(helpers.accountValidation({...credentials, new_password: 'short', confirm_password: 'short'}).field, 'account-new-password');
+equal(helpers.accountValidation({...credentials, new_password: 'x'.repeat(129)}).field, 'account-new-password');
+equal(helpers.accountValidation({...credentials, confirm_password: 'different'}).field, 'account-confirm-password');
+equal(helpers.accountValidation({...credentials, new_password: '🔑'.repeat(128), confirm_password: '🔑'.repeat(128)}), null);
+equal(helpers.accountValidation({...credentials, new_password: '🔑'.repeat(129), confirm_password: '🔑'.repeat(129)}).field, 'account-new-password');
 console.log(`WEB_HELPERS: checks=${checks} passed=${checks} failed=0`);

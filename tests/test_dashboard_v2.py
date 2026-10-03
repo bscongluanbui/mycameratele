@@ -13,7 +13,7 @@ class DashboardTests(unittest.TestCase):
         self.root.mkdir();(self.root/'input').mkdir()
         self.settings=Settings(self.root/'state',self.root/'cache',self.root/'input','UTC+07:00',min_free_bytes=0,bot_username='fixture_archive_bot')
         self.archive=Archive(self.settings)
-        self.server=DashboardServer(('127.0.0.1',0),self.settings,token='synthetic-dashboard-token-123456789')
+        self.server=DashboardServer(('127.0.0.1',0),self.settings)
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
         self.cookie='';self.csrf=''
 
@@ -30,7 +30,11 @@ class DashboardTests(unittest.TestCase):
         conn.close();return result
 
     def login(self):
-        status,body,headers=self.request('POST','/api/login',{'token':'synthetic-dashboard-token-123456789'})
+        status,body,headers=self.request('POST','/api/login',{'username':'admin','password':'admin'})
+        self.assertEqual(status,200);self.cookie=headers['Set-Cookie'].split(';')[0];self.csrf=body['csrf_token']
+        changed,_,_=self.request('POST','/api/account',{'current_password':'admin','username':'fixture_admin','new_password':'synthetic-password-123456789'})
+        self.assertEqual(changed,200)
+        status,body,headers=self.request('POST','/api/login',{'username':'fixture_admin','password':'synthetic-password-123456789'})
         self.assertEqual(status,200);self.cookie=headers['Set-Cookie'].split(';')[0];self.csrf=body['csrf_token']
 
     def add(self,id='h6c',name='Phòng khách'):
@@ -50,9 +54,9 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.request('GET','/api/cameras')[0],401)
         self.assertEqual(self.request('GET','/../core.py')[0],404)
 
-    def test_login_wrong_token_and_cookie_flags(self):
-        self.assertEqual(self.request('POST','/api/login',{'token':'wrong'})[0],401)
-        status,body,headers=self.request('POST','/api/login',{'token':'synthetic-dashboard-token-123456789'})
+    def test_login_wrong_password_and_cookie_flags(self):
+        self.assertEqual(self.request('POST','/api/login',{'username':'admin','password':'wrong'})[0],401)
+        status,body,headers=self.request('POST','/api/login',{'username':'admin','password':'admin'})
         self.assertEqual(status,200);self.assertIn('HttpOnly',headers['Set-Cookie']);self.assertIn('SameSite=Strict',headers['Set-Cookie'])
 
     def test_create_rename_persists_after_connection_reopens(self):
