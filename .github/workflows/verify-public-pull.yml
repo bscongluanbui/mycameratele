@@ -1,0 +1,72 @@
+name: Verify public Docker pull and Compose
+
+# Run after first setting both GHCR packages public. No registry credentials.
+on:
+  workflow_dispatch:
+    inputs:
+      bot_api:
+        description: Also verify the optional Bot API public image
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  anonymous-install:
+    if: github.repository == 'bscongluanbui/mycameratele' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          platforms: arm,arm64
+      - name: Pull and run app for each platform without login
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$DOCKER_CONFIG"
+          echo '{}' > "$DOCKER_CONFIG/config.json"
+          image=ghcr.io/bscongluanbui/mycameratele:latest
+          for platform in linux/arm64 linux/arm/v7 linux/amd64; do
+            docker pull --platform "$platform" "$image"
+            docker run --rm --platform "$platform" --read-only "$image" doctor
+          done
+      - name: First-install Compose health and persistent volumes
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          docker compose pull archive dashboard
+          docker compose up -d --wait --wait-timeout 120 archive dashboard
+          docker compose ps
+          docker compose exec -T dashboard python -c "import urllib.request; print('DASHBOARD_HEALTH: '+urllib.request.urlopen('http://127.0.0.1:8080/healthz').read().decode())"
+          docker compose exec -T archive python -m archive_app health
+          docker compose exec -T dashboard python -c "from pathlib import Path; import os; p=Path('/data/dashboard_token'); assert len(p.read_text().strip())>=24; assert os.getuid()==10001; print('DASHBOARD_TOKEN: persisted non-root OK')"
+          echo 'ANONYMOUS_INSTALL: app=3_platforms compose=healthy credentials=none result=OK' >> "$GITHUB_STEP_SUMMARY"
+      - name: Pull optional native Bot API without login
+        if: inputs.bot_api
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          for platform in linux/arm64 linux/amd64; do
+            image=ghcr.io/bscongluanbui/mycameratele-bot-api:latest
+            docker pull --platform "$platform" "$image"
+            docker run --rm --platform "$platform" --read-only "$image" --help
+          done
+          echo 'ANONYMOUS_PULL: bot_api=2_platforms credentials=none result=OK' >> "$GITHUB_STEP_SUMMARY"
+      - name: Show diagnostics and stop isolated CI services
+        if: always()
+        shell: bash
+        run: |
+          docker compose logs --tail=50 archive dashboard || true
+          docker compose down || true
