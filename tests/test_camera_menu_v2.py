@@ -27,8 +27,10 @@ class CameraFirstMenuTests(unittest.TestCase):
         self.source.write_bytes(b'synthetic-source')
         self.settings = Settings(state_dir=self.root/'state', cache_dir=self.root/'cache', input_dir=source_dir,
                                  timezone='UTC+07:00', min_free_bytes=0, token='fixture',
-                                 chat_id='-1001234567890', enable_upload=True)
+                                 chat_id='42', owner_user_id=42, allowed_users=(42,), enable_upload=True)
         self.archive = Archive(self.settings)
+        self.archive.state('telegram_owner_started:42','1')
+        self.keys_by_message={}
         self.telegram = Telegram(self.settings)
         self.normalizer = patch('archive_app.core.normalize', side_effect=self.fake_normalize)
         self.normalizer.start()
@@ -55,6 +57,7 @@ class CameraFirstMenuTests(unittest.TestCase):
                       'end_time':end or (datetime.fromisoformat(start)+timedelta(minutes=1)).isoformat()}
         self.archive.ingest_entry(descriptor)
         key = record_key(descriptor)
+        self.keys_by_message[message_id]=key
         if uploaded:
             self.archive.mark_uploaded(key, self.settings.chat_id, message_id, 'synthetic-file-id')
         return key
@@ -65,16 +68,19 @@ class CameraFirstMenuTests(unittest.TestCase):
                 if 'callback_data' in b and (kind is None or b['callback_data'].startswith(kind+':'))]
 
     @staticmethod
-    def urls(buttons):
-        return [b['url'] for row in buttons for b in row if 'url' in b]
+    def plays(buttons):
+        return [b['callback_data'] for row in buttons for b in row if b.get('callback_data','').startswith('v:')]
+
+    def play(self,message_id):
+        return 'v:'+self.keys_by_message[message_id][:32]
 
     def test_root_lists_friendly_camera_names_in_name_order(self):
         self.camera('Zulu', 'Zulu phòng ngủ')
         self.camera('Alpha', 'Alpha sân trước')
         title, buttons = self.telegram.menu(self.archive)
         self.assertIn('Camera', title)
-        self.assertEqual([row[0]['text'] for row in buttons], ['Alpha sân trước', 'Zulu phòng ngủ'])
-        self.assertEqual(self.callbacks(buttons), [f'c:{self.telegram.camera_token("Alpha")}:asc',
+        self.assertEqual([row[0]['text'] for row in buttons if row[0]['callback_data'].startswith('c:')], ['Alpha sân trước', 'Zulu phòng ngủ'])
+        self.assertEqual(self.callbacks(buttons,'c'), [f'c:{self.telegram.camera_token("Alpha")}:asc',
                                                   f'c:{self.telegram.camera_token("Zulu")}:asc'])
 
     def test_camera_year_month_day_clip_hierarchy_and_back_buttons(self):
@@ -98,7 +104,7 @@ class CameraFirstMenuTests(unittest.TestCase):
         title, clips = self.telegram.menu(self.archive, day_callback)
         self.assertIn('Cửa trước', title)
         self.assertIn('2026-10-03', title)
-        self.assertEqual(self.urls(clips), ['https://t.me/c/1234567890/17'])
+        self.assertEqual(self.plays(clips), [self.play(17)])
         self.assertIn(month_callback, self.callbacks(clips))
 
     def test_clip_sort_ascending_descending_and_descending_second_page(self):
@@ -108,12 +114,12 @@ class CameraFirstMenuTests(unittest.TestCase):
             self.recording(start=f'2026-10-03T10:{minute:02}:00+07:00', message_id=100+minute)
         _, ascending = self.telegram.menu(self.archive, f'd:{token}:2026-10-03:asc')
         _, descending = self.telegram.menu(self.archive, f'd:{token}:2026-10-03:desc')
-        self.assertEqual(self.urls(ascending)[0], 'https://t.me/c/1234567890/100')
-        self.assertEqual(self.urls(descending)[0], 'https://t.me/c/1234567890/111')
-        self.assertEqual(len(self.urls(ascending)), 10)
+        self.assertEqual(self.plays(ascending)[0], self.play(100))
+        self.assertEqual(self.plays(descending)[0], self.play(111))
+        self.assertEqual(len(self.plays(ascending)), 10)
         next_page = next(c for c in self.callbacks(descending, 'p') if c.endswith(':desc:1'))
         _, second = self.telegram.menu(self.archive, next_page)
-        self.assertEqual(self.urls(second), ['https://t.me/c/1234567890/101', 'https://t.me/c/1234567890/100'])
+        self.assertEqual(self.plays(second), [self.play(101),self.play(100)])
         self.assertIn(f'p:{token}:2026-10-03:asc:0', self.callbacks(second))
 
     def test_year_month_day_sort_toggles(self):
@@ -140,7 +146,7 @@ class CameraFirstMenuTests(unittest.TestCase):
         _, years = self.telegram.menu(self.archive, f'c:{token}:asc')
         self.assertEqual(self.callbacks(years, 'y'), [f'y:{token}:2026:asc'])
         _, clips = self.telegram.menu(self.archive, f'd:{token}:2026-10-03:asc')
-        self.assertEqual(self.urls(clips), ['https://t.me/c/1234567890/17'])
+        self.assertEqual(self.plays(clips), [self.play(17)])
 
     def test_rename_changes_friendly_menu_without_changing_recording_identity(self):
         self.camera()
@@ -151,7 +157,7 @@ class CameraFirstMenuTests(unittest.TestCase):
         self.archive.update_camera('Front_Camera', {'name':'Cửa sau đổi tên'})
         title, clips = self.telegram.menu(self.archive, old_callback)
         self.assertIn('Cửa sau đổi tên', title)
-        self.assertEqual(self.urls(clips), ['https://t.me/c/1234567890/17'])
+        self.assertEqual(self.plays(clips), [self.play(17)])
         _, root = self.telegram.menu(self.archive)
         self.assertEqual(root[0][0]['text'], 'Cửa sau đổi tên')
         after = dict(self.archive.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone())
@@ -162,7 +168,7 @@ class CameraFirstMenuTests(unittest.TestCase):
         self.camera()
         key = self.recording(uploaded=False)
         self.archive.update_camera('Front_Camera', {'name':'Tên mới ✓'})
-        message = {'chat':{'id':int(self.settings.chat_id)}, 'message_id':90, 'video':{'file_id':'new-file-id'}}
+        message = {'chat':{'id':42,'type':'private'}, 'message_id':90, 'video':{'file_id':'new-file-id','file_unique_id':'new-unique-id'}}
         with patch.object(self.telegram, 'request', return_value=message) as request:
             self.assertEqual(self.telegram.upload_one(self.archive), 'uploaded')
         caption = request.call_args.args[1]['caption']
@@ -197,7 +203,7 @@ class CameraFirstMenuTests(unittest.TestCase):
         self.assertEqual(self.callbacks(years, 'y'), [f'y:{token}:2026:asc', f'y:{token}:2027:asc'])
         for day in ['2026-12-31', '2027-01-01']:
             _, clips = self.telegram.menu(self.archive, f'd:{token}:{day}:asc')
-            self.assertEqual(len(self.urls(clips)), 1)
+            self.assertEqual(len(self.plays(clips)), 1)
 
     def test_exact_midnight_end_does_not_create_next_day_or_year(self):
         self.camera()
@@ -206,7 +212,7 @@ class CameraFirstMenuTests(unittest.TestCase):
         _, years = self.telegram.menu(self.archive, f'c:{token}:asc')
         self.assertEqual(self.callbacks(years, 'y'), [f'y:{token}:2026:asc'])
         _, clips = self.telegram.menu(self.archive, f'd:{token}:2027-01-01:asc')
-        self.assertEqual(self.urls(clips), [])
+        self.assertEqual(self.plays(clips), [])
 
     def test_long_camera_id_and_unicode_name_keep_all_callback_payloads_under_64_bytes(self):
         camera_id = 'X'*64
@@ -261,7 +267,7 @@ class CameraFirstMenuTests(unittest.TestCase):
         _, years = self.telegram.menu(self.archive, f'c:{token}:asc')
         self.assertEqual(self.callbacks(years, 'y'), [])
         _, clips = self.telegram.menu(self.archive, f'd:{token}:2026-10-03:asc')
-        self.assertEqual(self.urls(clips), [])
+        self.assertEqual(self.plays(clips), [])
 
 
 if __name__ == '__main__':

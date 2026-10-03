@@ -26,9 +26,10 @@ class TelegramTests(unittest.TestCase):
         self.settings = Settings(
             state_dir=self.root / "state", cache_dir=self.root / "cache", input_dir=self.input,
             timezone="UTC+07:00", keep_cache=False, enable_upload=True,
-            token="fixture", chat_id="-1001234567890", min_free_bytes=0,
+            token="fixture", chat_id="42", owner_user_id=42, allowed_users=(42,), min_free_bytes=0,
         )
         self.archive = Archive(self.settings)
+        self.archive.state('telegram_owner_started:42','1')
         self.telegram = Telegram(self.settings)
         self.normalizer_patch = patch("archive_app.core.normalize", side_effect=self.fake_normalize)
         self.normalizer = self.normalizer_patch.start()
@@ -66,12 +67,14 @@ class TelegramTests(unittest.TestCase):
     def test_success_persists_telegram_identity_and_cleans_only_cache(self):
         key = self.ingest()
         cached = Path(self.row(key)["local_path"])
-        self.request.return_value = {"chat": {"id": int(self.settings.chat_id)}, "message_id": 17, "video": {"file_id": "confirmed-file-id"}}
+        self.request.return_value = {"chat": {"id": 42,"type":"private"}, "message_id": 17, "video": {"file_id": "confirmed-file-id","file_unique_id":"confirmed-unique-id"}}
         self.assertEqual(self.telegram.upload_one(self.archive), "uploaded")
         row = self.row(key)
         self.assertEqual(row["status"], "uploaded")
         self.assertEqual(row["file_id"], "confirmed-file-id")
         self.assertEqual(row["message_id"], 17)
+        self.assertEqual(row['file_unique_id'],'confirmed-unique-id')
+        self.assertEqual(row['media_type'],'video')
         self.assertFalse(cached.exists())
         self.assertTrue(self.source.is_file())
         args, kwargs = self.request.call_args
@@ -168,7 +171,7 @@ class TelegramTests(unittest.TestCase):
         key = self.ingest()
         with self.archive.conn:
             self.archive.conn.execute("UPDATE recordings SET codec_video='hevc' WHERE key=?", (key,))
-        self.request.return_value = {"chat": {"id": int(self.settings.chat_id)}, "message_id": 19, "document": {"file_id": "document-file-id"}}
+        self.request.return_value = {"chat": {"id": 42,"type":"private"}, "message_id": 19, "document": {"file_id": "document-file-id","file_unique_id":"document-unique-id"}}
         self.assertEqual(self.telegram.upload_one(self.archive), "uploaded")
         args, kwargs = self.request.call_args
         self.assertEqual(args[0], "sendDocument")
@@ -179,7 +182,7 @@ class TelegramTests(unittest.TestCase):
         key = self.ingest()
         self.confirm(key)
         _, root = self.telegram.menu(self.archive, "root")
-        self.assertEqual(root, [[{"text": "Front_Camera", "callback_data": "c:"+self.telegram.camera_token("Front_Camera")+":asc"}]])
+        self.assertEqual(root[0], [{"text": "Front_Camera", "callback_data": "c:"+self.telegram.camera_token("Front_Camera")+":asc"}])
         _, months = self.telegram.menu(self.archive, "y:2026")
         self.assertEqual(len(months), 12)
         self.assertEqual(months[9][0]["callback_data"], "m:2026-10")
@@ -213,7 +216,7 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual([row[0]["text"] for row in years if row[0].get("callback_data", "").startswith("y:")], ["2026"])
         self.assertEqual(self.archive.list_day("2027-01-01"), [])
 
-    def test_camera_and_clip_menu_produce_stable_private_channel_link(self):
+    def test_camera_and_clip_menu_produce_stable_private_replay_callback(self):
         key = self.ingest()
         self.confirm(key)
         _, cameras = self.telegram.menu(self.archive, "d:2026-10-03")
@@ -222,7 +225,7 @@ class TelegramTests(unittest.TestCase):
         self.assertRegex(callback, r"^p:2026-10-03:[0-9a-f]{12}:0$")
         title, clips = self.telegram.menu(self.archive, callback)
         self.assertIn("Front_Camera", title)
-        self.assertEqual(clips, [[{"text": "10:00:00 ▶", "url": "https://t.me/c/1234567890/17"}]])
+        self.assertEqual(clips, [[{"text": "10:00:00 ▶", "callback_data": "v:"+key[:32]}]])
         self.assertEqual(self.telegram.menu(self.archive, callback), (title, clips))
 
     def test_old_camera_callback_stays_bound_after_alphabetically_earlier_camera_is_added(self):
@@ -235,14 +238,16 @@ class TelegramTests(unittest.TestCase):
         title, buttons = self.telegram.menu(self.archive, original_callback)
         self.assertIn("Zulu_Camera", title)
         self.assertNotIn("Alpha_Camera", title)
-        self.assertEqual(buttons[0][0]["url"], "https://t.me/c/1234567890/71")
+        self.assertEqual(buttons[0][0]["callback_data"], "v:"+original[:32])
         _, refreshed = self.telegram.menu(self.archive, "d:2026-10-03")
         callback_for_original = next(row[0]["callback_data"] for row in refreshed if row[0]["text"] == "Zulu_Camera")
         self.assertEqual(callback_for_original, original_callback)
 
     def test_clip_pages_have_ten_rows_and_valid_navigation(self):
+        keys=[]
         for minute in range(12):
             key = self.ingest(record_id=f"page-record-{minute}", minute=minute)
+            keys.append(key)
             self.confirm(key, message_id=100 + minute)
         _, cameras = self.telegram.menu(self.archive, "d:2026-10-03")
         callback = cameras[0][0]["callback_data"]
@@ -252,7 +257,7 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(first[-1], [{"text": "→", "callback_data": next_callback}])
         _, second = self.telegram.menu(self.archive, next_callback)
         self.assertEqual(len(second), 3)
-        self.assertEqual(second[0][0]["url"], "https://t.me/c/1234567890/110")
+        self.assertEqual(second[0][0]["callback_data"], "v:"+keys[10][:32])
         self.assertEqual(second[-1], [{"text": "←", "callback_data": callback}])
         for row in first + second:
             for button in row:

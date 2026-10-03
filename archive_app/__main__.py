@@ -38,10 +38,12 @@ def main():
     doctor=subs.add_parser('doctor');doctor.add_argument('--network',action='store_true')
     dashboard=subs.add_parser('dashboard');dashboard.add_argument('--host',default=os.environ.get('DASHBOARD_HOST','0.0.0.0'));dashboard.add_argument('--port',type=int,default=int(os.environ.get('DASHBOARD_PORT','8080')))
     ingest=subs.add_parser('ingest');ingest.add_argument('--manifest',required=True);ingest.add_argument('--dry-run',action='store_true')
-    subs.add_parser('run');subs.add_parser('health')
+    subs.add_parser('run');subs.add_parser('health');subs.add_parser('backup')
     listing=subs.add_parser('list');listing.add_argument('--date',required=True);listing.add_argument('--camera');listing.add_argument('--order',choices=('asc','desc'),default='asc')
     reconcile=subs.add_parser('reconcile');reconcile.add_argument('--key',required=True);reconcile.add_argument('--chat-id',required=True)
     reconcile.add_argument('--message-id',type=int,required=True);reconcile.add_argument('--file-id',required=True)
+    reconcile.add_argument('--file-unique-id');reconcile.add_argument('--media-type',choices=('video','document'))
+    retry=subs.add_parser('retry-oversize');retry.add_argument('--key',required=True)
     args=parser.parse_args()
     settings=Settings.from_env()
     if args.command=='dashboard':
@@ -50,7 +52,9 @@ def main():
         serve(settings,args.host,args.port);return 0
     if args.command=='doctor':
         data={'machine':platform.machine(),'sd_adapter':'exported-file-ingest','automatic_sd_download':'not_implemented',
-              'input_dir':str(settings.input_dir),'upload_enabled':settings.enable_upload,'api_mode':settings.api_mode}
+              'input_dir':str(settings.input_dir),'upload_enabled':settings.enable_upload,'api_mode':settings.api_mode,
+              'telegram_destination':'owner_private_chat','owner_configured':bool(settings.effective_owner),
+              'allowed_users_count':len(settings.allowed_users)}
         if args.network:
             host=os.environ.get('CAMERA_HOST','192.168.1.10');data['tcp']={}
             for port in (int(os.environ.get('CAMERA_DEVICE_PORT','8000')),int(os.environ.get('CAMERA_RTSP_PORT','554')),80):
@@ -72,10 +76,25 @@ def main():
             emit('ingest',dry_run=args.dry_run,recordings=[{'key':r['key'],'status':r['status']} for r in rows]);return 0
         if args.command=='list':
             emit('archive',date=args.date,recordings=archive.list_day(args.date,args.camera,args.order));return 0
+        if args.command=='backup':
+            path=archive.backup_daily()
+            emit('backup',result='created' if path else 'already_exists_today',retention_days=7);return 0
+        if args.command=='retry-oversize':
+            row=archive.conn.execute('SELECT * FROM recordings WHERE key=?',(args.key,)).fetchone()
+            if row is None or row['status']!='needs_review' or row['last_error']!='missing_or_oversize_file' or row['file_id']:
+                raise ValueError('Only an unposted missing/oversize recording may be requeued explicitly')
+            path=Path(row['local_path']).resolve(strict=True)
+            if not path.is_relative_to(settings.cache_dir.resolve()) or not path.is_file() or not 0<path.stat().st_size<=settings.max_bytes:
+                raise ValueError('Cached recording must exist and fit the current API limit')
+            with archive.conn:
+                archive.conn.execute("UPDATE recordings SET status='downloaded',last_error=NULL,retry_at=0 WHERE key=?",(args.key,))
+            emit('requeued',key=args.key,reason='file_available_within_current_limit');return 0
         if args.command=='reconcile':
             row=archive.conn.execute('SELECT status FROM recordings WHERE key=?',(args.key,)).fetchone()
             if row is None or row[0]!='upload_unknown':raise ValueError('Reconcile requires upload_unknown recording and confirmed Message metadata')
-            archive.mark_uploaded(args.key,args.chat_id,args.message_id,args.file_id)
+            if not settings.effective_owner or str(args.chat_id)!=str(settings.effective_owner):
+                raise ValueError('Confirmed upload must belong to the configured owner private chat')
+            archive.mark_uploaded(args.key,args.chat_id,args.message_id,args.file_id,args.file_unique_id,args.media_type)
             archive.cleanup(args.key)
             emit('reconciled',key=args.key);return 0
         running=True
@@ -106,6 +125,9 @@ def main():
         poll_thread.start()
         emit('started',**archive.status())
         while running:
+            try:
+                if archive.backup_daily():emit('backup',result='created',retention_days=7)
+            except Exception as exc:emit('backup_error',error_type=type(exc).__name__)
             for manifest in sorted(settings.input_dir.glob('*.json')):
                 try:
                     for row in archive.ingest_manifest(manifest,continue_on_error=True):
@@ -116,7 +138,7 @@ def main():
                 if result:emit('upload',status=result)
             except Exception as exc:emit('telegram_error',error_type=type(exc).__name__)
             if not settings.keep_cache:
-                for row in archive.conn.execute("SELECT key FROM recordings WHERE status='uploaded'").fetchall():
+                for row in archive.conn.execute("SELECT key FROM recordings WHERE status='uploaded' AND cleaned_at IS NULL").fetchall():
                     try:archive.cleanup(row[0])
                     except Exception as exc:emit('cleanup_error',error_type=type(exc).__name__)
             for _ in range(settings.interval):

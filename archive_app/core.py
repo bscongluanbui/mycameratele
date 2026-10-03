@@ -3,14 +3,18 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import socket
 import time
+import uuid
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -76,13 +80,46 @@ class Settings:
     cache_max_bytes: int = 100000000000
     min_free_bytes: int = 5000000000
     interval: int = 15
+    owner_user_id: int = 0
+    bot_username: str = ''
+    # Direct constructors retain the original immediate-cleanup behavior. The
+    # deployment environment defaults to a 24-hour post-upload retention.
+    cache_retention_hours: float = 0.0
+
+    @property
+    def effective_owner(self):
+        """Only a positive private-user ID can be an upload destination."""
+        value = self.owner_user_id if self.owner_user_id else self.chat_id
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, int):
+            return value if value > 0 else 0
+        if isinstance(value, str) and re.fullmatch(r'[0-9]+', value.strip()):
+            owner = int(value)
+            return owner if owner > 0 else 0
+        return 0
 
     @classmethod
     def from_env(cls):
         mode = os.environ.get('TELEGRAM_API_MODE', 'cloud')
         if mode not in ('cloud', 'local'):
             raise ValueError('TELEGRAM_API_MODE must be cloud or local')
-        allowed = tuple(int(x) for x in re.split(r'[,\s]+', os.environ.get('TELEGRAM_ALLOWED_USER_IDS', '').strip()) if x)
+        configured_owner = os.environ.get('TELEGRAM_OWNER_USER_ID', '').strip()
+        legacy_chat = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+        owner_value = configured_owner or legacy_chat
+        if owner_value and (not re.fullmatch(r'[0-9]+', owner_value) or int(owner_value) <= 0):
+            raise ValueError('TELEGRAM_OWNER_USER_ID must be a positive private-user ID; legacy TELEGRAM_CHAT_ID accepts positive IDs only')
+        owner = int(owner_value) if owner_value else 0
+        allowed_values = [x for x in re.split(r'[,\s]+', os.environ.get('TELEGRAM_ALLOWED_USER_IDS', '').strip()) if x]
+        if any(not re.fullmatch(r'[0-9]+', x) or int(x) <= 0 for x in allowed_values):
+            raise ValueError('TELEGRAM_ALLOWED_USER_IDS must contain positive numeric user IDs')
+        allowed = tuple(dict.fromkeys(([owner] if owner else []) + [int(x) for x in allowed_values]))
+        username = os.environ.get('TELEGRAM_BOT_USERNAME', '').strip().lstrip('@')
+        if username and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', username):
+            raise ValueError('Invalid TELEGRAM_BOT_USERNAME')
+        retention = float(os.environ.get('CACHE_RETENTION_HOURS', '24'))
+        if not math.isfinite(retention) or retention < 0:
+            raise ValueError('CACHE_RETENTION_HOURS must be a nonnegative finite number')
         result = cls(
             Path(os.environ.get('STATE_DIR', './data')).resolve(),
             Path(os.environ.get('CACHE_DIR', './cache')).resolve(),
@@ -90,13 +127,14 @@ class Settings:
             os.environ.get('DISPLAY_TIMEZONE', 'Asia/Ho_Chi_Minh'),
             os.environ.get('KEEP_CACHE', 'true').lower() == 'true',
             os.environ.get('ENABLE_UPLOAD', 'false').lower() == 'true',
-            secret('TELEGRAM_BOT_TOKEN'), os.environ.get('TELEGRAM_CHAT_ID', '').strip(),
+            secret('TELEGRAM_BOT_TOKEN'), str(owner) if owner else '',
             os.environ.get('TELEGRAM_API_BASE', os.environ.get('TELEGRAM_API_BASE_URL', 'https://api.telegram.org')).rstrip('/'),
             mode, allowed, os.environ.get('FFMPEG_BIN', 'ffmpeg'), os.environ.get('FFPROBE_BIN', 'ffprobe'),
             int(os.environ.get('TELEGRAM_MAX_BYTES', '2000000000' if mode == 'local' else '50000000')),
             int(float(os.environ.get('CACHE_MAX_GB', '100')) * 1e9),
             int(float(os.environ.get('CACHE_MIN_FREE_GB', '5')) * 1e9),
             max(1, int(os.environ.get('SCAN_INTERVAL_SECONDS', '15'))),
+            owner, username, retention,
         )
         get_zone(result.timezone)
         limit = 2000000000 if mode == 'local' else 50000000
@@ -104,8 +142,8 @@ class Settings:
             raise ValueError('TELEGRAM_MAX_BYTES exceeds configured API mode limit')
         if result.cache_max_bytes <= 0 or result.min_free_bytes < 0:
             raise ValueError('Invalid cache budget')
-        if result.enable_upload and (not result.token or not result.chat_id):
-            raise ValueError('ENABLE_UPLOAD needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID')
+        if result.enable_upload and (not result.token or not result.effective_owner):
+            raise ValueError('ENABLE_UPLOAD needs TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_USER_ID')
         return result
 
 
@@ -141,12 +179,38 @@ def normalize(source, dest, settings):
             partial.unlink()
 
 
+def _is_link(path):
+    return path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction())
+
+
+def _confined_path(path, root, *, allow_missing=False):
+    """Validate without converting a symlink into its deletion target."""
+    root = Path(root)
+    path = Path(os.path.abspath(path))
+    if root.resolve() != root or _is_link(root) or not path.is_relative_to(root):
+        raise ValueError('Managed path outside its original root')
+    current = root
+    for part in path.relative_to(root).parts:
+        current = current / part
+        if _is_link(current):
+            raise ValueError('Managed paths must not contain symlinks or junctions')
+    if path.exists():
+        if not path.is_file():
+            raise ValueError('Managed path must be a regular file')
+    elif not allow_missing:
+        raise FileNotFoundError(path)
+    return path
+
+
 class Archive:
     def __init__(self, settings):
         self.settings = settings
         settings.state_dir.mkdir(parents=True, exist_ok=True)
         settings.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(settings.state_dir / 'archive.db', timeout=30)
+        self._state_root = settings.state_dir.resolve()
+        self._cache_root = settings.cache_dir.resolve()
+        self._database_path = _confined_path(self._state_root / 'archive.db', self._state_root, allow_missing=True)
+        self.conn = sqlite3.connect(self._database_path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA journal_mode=WAL')
         self.conn.executescript('''
@@ -168,9 +232,25 @@ class Archive:
                 enabled INTEGER NOT NULL DEFAULT 1, probe_json TEXT, created_at REAL NOT NULL
             );
         ''')
-        self.conn.execute('''INSERT OR IGNORE INTO cameras(id,name,created_at)
-            SELECT DISTINCT camera,camera,? FROM recordings''',(time.time(),))
-        self.conn.commit()
+        # Add columns in place under a SQLite writer lock. Camera IDs, stable
+        # recording keys and all existing Telegram references stay untouched.
+        self.conn.execute('BEGIN IMMEDIATE')
+        try:
+            columns = {row[1] for row in self.conn.execute('PRAGMA table_info(recordings)')}
+            for name, kind in (('file_unique_id', 'TEXT'), ('media_type', 'TEXT'),
+                               ('bot_id', 'INTEGER'), ('uploaded_at', 'REAL'), ('cleaned_at', 'REAL')):
+                if name not in columns:
+                    self.conn.execute(f'ALTER TABLE recordings ADD COLUMN {name} {kind}')
+            # Old rows have no known upload timestamp. Start their retention
+            # clock at the first migration rather than deleting them early.
+            self.conn.execute("INSERT OR IGNORE INTO state(name,value) VALUES('cleanup_legacy_hold_since',?)", (str(time.time()),))
+            self.conn.execute('''INSERT OR IGNORE INTO cameras(id,name,created_at)
+                SELECT DISTINCT camera,camera,? FROM recordings''',(time.time(),))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            self.conn.close()
+            raise
 
     def close(self):
         self.conn.close()
@@ -268,12 +348,13 @@ class Archive:
         with self.conn:self.conn.execute('UPDATE cameras SET probe_json=? WHERE id=?',(json.dumps(result),slug))
         return result
 
-    @staticmethod
-    def telegram_url(row):
-        try:
-            chat=int(row['chat_id']);message=int(row['message_id'])
-            return f'https://t.me/c/{-chat-1000000000000}/{message}' if chat < -1000000000000 and message>0 else None
-        except (ValueError,TypeError):return None
+    def telegram_url(self, row):
+        username = self.settings.bot_username or self.state('telegram_bot_username') or ''
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', username):
+            return None
+        if row['status'] != 'uploaded' or not row['file_id'] or not re.fullmatch(r'[a-f0-9]{64}', row['key']):
+            return None
+        return f"https://t.me/{username}?start=play_{row['key'][:32]}"
 
     def calendar(self,camera):
         zone=get_zone(self.settings.timezone);tree={}
@@ -306,7 +387,8 @@ class Archive:
         rows=self.conn.execute('SELECT r.*,COALESCE(c.name,r.camera) camera_name FROM recordings r LEFT JOIN cameras c ON c.id=r.camera'+where+' ORDER BY r.start_ms '+direction+',r.key '+direction+' LIMIT ? OFFSET ?',(*params,limit,offset))
         # API intentionally excludes host paths, errors, attempt IDs and Telegram file IDs.
         public=('key','camera','camera_name','start_ms','end_ms','status','duration','file_size')
-        recordings=[{**{k:row[k] for k in public},'telegram_url':self.telegram_url(row)} for row in rows]
+        recordings=[{**{k:row[k] for k in public},'telegram_url':self.telegram_url(row),
+                     'telegram_available':row['status']=='uploaded' and bool(row['file_id'])} for row in rows]
         return {'recordings':recordings,'total':total,'offset':offset,'limit':limit}
 
     def ingest_entry(self, entry, dry_run=False):
@@ -403,12 +485,20 @@ class Archive:
             self.conn.rollback()
             raise
 
-    def mark_uploaded(self, key, chat_id, message_id, file_id):
-        if not chat_id or int(message_id) <= 0 or not file_id:
+    def mark_uploaded(self, key, chat_id, message_id, file_id, file_unique_id=None, media_type=None, bot_id=None):
+        if not chat_id or int(message_id) <= 0 or not isinstance(file_id, str) or not file_id.strip():
             raise ValueError('Confirmed Telegram metadata required')
+        if file_unique_id is not None and (not isinstance(file_unique_id, str) or not file_unique_id.strip()):
+            raise ValueError('Invalid Telegram file_unique_id')
+        if media_type not in (None, 'video', 'document'):
+            raise ValueError('Telegram media_type must be video or document')
+        if bot_id is not None and (type(bot_id) is not int or bot_id <= 0):
+            raise ValueError('Invalid Telegram bot identity')
         with self.conn:
-            changed = self.conn.execute("UPDATE recordings SET status='uploaded',chat_id=?,message_id=?,file_id=?,last_error=NULL WHERE key=?",
-                                       (str(chat_id),int(message_id),str(file_id),key)).rowcount
+            changed = self.conn.execute("""UPDATE recordings SET status='uploaded',chat_id=?,message_id=?,file_id=?,
+                file_unique_id=COALESCE(?,file_unique_id),media_type=COALESCE(?,media_type),bot_id=COALESCE(?,bot_id),
+                uploaded_at=COALESCE(uploaded_at,?),last_error=NULL WHERE key=?""",
+                (str(chat_id),int(message_id),file_id,file_unique_id,media_type,bot_id,time.time(),key)).rowcount
         if not changed:
             raise ValueError('Unknown record key')
 
@@ -418,16 +508,129 @@ class Archive:
 
     def cleanup(self, key):
         row = self.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone()
-        if self.settings.keep_cache or row is None or row['status'] != 'uploaded' or not all(row[n] for n in ('chat_id','message_id','file_id')):
+        if self.settings.keep_cache or row is None or row['cleaned_at'] is not None or row['status'] != 'uploaded' or not all(row[n] for n in ('chat_id','message_id','file_id')):
             return False
-        if not row['local_path']:
-            return True
-        path = Path(row['local_path']).resolve()
-        if not path.is_relative_to(self.settings.cache_dir.resolve()):
-            raise ValueError('Cleanup path outside cache')
-        if path.exists():
-            path.unlink()
+        retention = self.settings.cache_retention_hours
+        if not math.isfinite(retention) or retention < 0:
+            raise ValueError('Invalid cache retention')
+        now = time.time()
+        if retention:
+            start = row['uploaded_at']
+            if start is None:
+                start = self.state('cleanup_legacy_hold_since')
+            try:
+                start = float(start)
+            except (ValueError, TypeError):
+                return False
+            if not math.isfinite(start) or now - start < retention * 3600:
+                return False
+        if row['local_path']:
+            path = _confined_path(row['local_path'], self._cache_root, allow_missing=True)
+            if path.exists():
+                path.unlink()
+        # Keep the archive status and Telegram metadata available after cache
+        # removal. A crash after unlink is reconciled by the next cleanup run.
+        with self.conn:
+            self.conn.execute('UPDATE recordings SET cleaned_at=COALESCE(cleaned_at,?) WHERE key=?', (now,key))
         return True
+
+    @contextmanager
+    def _backup_lock(self, root):
+        path = _confined_path(root / '.backup.lock', root, allow_missing=True)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, 'r+b') as lock:
+            if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+                raise ValueError('Backup lock must be a regular file')
+            acquired = False
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    lock.seek(0, 2)
+                    if lock.tell() == 0:
+                        lock.write(b'0')
+                        lock.flush()
+                    lock.seek(0)
+                    try:
+                        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                    except BlockingIOError:
+                        pass
+                yield acquired
+            finally:
+                if acquired:
+                    if os.name == 'nt':
+                        lock.seek(0)
+                        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def backup_daily(self, retention_days=7):
+        """Atomically snapshot the committed SQLite catalog; never cache media."""
+        if type(retention_days) is not int or retention_days < 7:
+            raise ValueError('Keep at least seven daily database backups')
+        if self.settings.state_dir.resolve() != self._state_root:
+            raise ValueError('State directory changed')
+        root = self._state_root / 'backups'
+        if _is_link(root):
+            raise ValueError('Backup directory must not be a symlink or junction')
+        root.mkdir(exist_ok=True)
+        if root.resolve() != root:
+            raise ValueError('Backup directory outside state')
+        today = datetime.fromtimestamp(time.time(), get_zone(self.settings.timezone)).date()
+        destination = _confined_path(root / f'archive-{today.isoformat()}.db', root, allow_missing=True)
+        with self._backup_lock(root) as acquired:
+            if not acquired or destination.exists():
+                return None
+            source = _confined_path(self._database_path, self._state_root)
+            partial = _confined_path(root / f'.archive-{today.isoformat()}.{uuid.uuid4().hex}.partial', root, allow_missing=True)
+            descriptor = os.open(partial, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            os.close(descriptor)
+            try:
+                # Read through a separate connection so an in-flight writer's
+                # uncommitted changes cannot leak into the snapshot.
+                with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True, timeout=30)) as original:
+                    with closing(sqlite3.connect(partial, timeout=30)) as snapshot:
+                        original.backup(snapshot)
+                        if snapshot.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                            raise ValueError('SQLite backup verification failed')
+                with partial.open('r+b') as handle:
+                    os.fsync(handle.fileno())
+                _confined_path(destination, root, allow_missing=True)
+                os.replace(partial, destination)
+                if os.name != 'nt':
+                    directory = os.open(root, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                cutoff = today - timedelta(days=retention_days - 1)
+                managed = []
+                for candidate in root.iterdir():
+                    match = re.fullmatch(r'archive-(\d{4}-\d{2}-\d{2})\.db', candidate.name)
+                    if match and not _is_link(candidate) and candidate.is_file():
+                        try:
+                            date = datetime.strptime(match[1], '%Y-%m-%d').date()
+                        except ValueError:
+                            continue
+                        managed.append((date, candidate))
+                managed.sort(reverse=True)
+                # Also retain the seven most recent existing snapshots if
+                # outages left gaps between calendar days.
+                for date, candidate in managed[7:]:
+                    if date < cutoff:
+                        _confined_path(candidate, root).unlink()
+                return destination
+            finally:
+                if partial.exists():
+                    _confined_path(partial, root).unlink()
 
     def state(self, name, value=None):
         if value is None:
@@ -440,5 +643,9 @@ class Archive:
         return {'queue':dict(self.conn.execute('SELECT status,count(*) FROM recordings GROUP BY status').fetchall()),
                 'sd_adapter':'exported-file-ingest', 'sd_auto_download':'not_implemented',
                 'upload_enabled':self.settings.enable_upload, 'timezone':self.settings.timezone,
-                'version':'2.0','counts':{'cameras':self.conn.execute('SELECT COUNT(*) FROM cameras').fetchone()[0],
+                'telegram_destination':'owner_private_chat','owner_configured':bool(self.settings.effective_owner),
+                'owner_started':bool(self.settings.effective_owner) and self.state(f'telegram_owner_started:{self.settings.effective_owner}')=='1',
+                'allowed_users_count':len(set(self.settings.allowed_users) | ({self.settings.effective_owner} if self.settings.effective_owner else set())),
+                'cache_retention_hours':self.settings.cache_retention_hours,'api_mode':self.settings.api_mode,
+                'version':'2.1','counts':{'cameras':self.conn.execute('SELECT COUNT(*) FROM cameras').fetchone()[0],
                 'recordings':self.conn.execute('SELECT COUNT(*) FROM recordings').fetchone()[0]}}

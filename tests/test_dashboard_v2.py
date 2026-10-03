@@ -11,7 +11,7 @@ class DashboardTests(unittest.TestCase):
         parent=Path(__file__).parent if os.name=='nt' else Path(tempfile.gettempdir())
         self.root=parent/('.tmp-dashboard-'+uuid.uuid4().hex);self.parent=parent.resolve()
         self.root.mkdir();(self.root/'input').mkdir()
-        self.settings=Settings(self.root/'state',self.root/'cache',self.root/'input','UTC+07:00',min_free_bytes=0)
+        self.settings=Settings(self.root/'state',self.root/'cache',self.root/'input','UTC+07:00',min_free_bytes=0,bot_username='fixture_archive_bot')
         self.archive=Archive(self.settings)
         self.server=DashboardServer(('127.0.0.1',0),self.settings,token='synthetic-dashboard-token-123456789')
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
@@ -42,7 +42,7 @@ class DashboardTests(unittest.TestCase):
             dest.write_bytes(b'synthetic MP4');return {'duration':60,'codec_video':'h264','codec_audio':'aac','bytes':13}
         entry={'camera':camera,'record_id':record_id,'path':str(source),'start_time':start,'end_time':end}
         with patch('archive_app.core.normalize',side_effect=fake):row=self.archive.ingest_entry(entry)
-        self.archive.mark_uploaded(row['key'],'-1001234567890',101 if record_id=='one' else 102,'fake-id')
+        self.archive.mark_uploaded(row['key'],'42',101 if record_id=='one' else 102,'fake-id','fake-unique','video')
         return row['key']
 
     def test_health_and_private_api(self):
@@ -95,8 +95,15 @@ class DashboardTests(unittest.TestCase):
         desc=self.request('GET','/api/archive?camera=h6c&year=2026&month=10&day=3&order=desc')[1]
         self.assertEqual([r['key'] for r in asc['recordings']],[first,second])
         self.assertEqual([r['key'] for r in desc['recordings']],[second,first])
-        self.assertEqual(asc['total'],2);self.assertEqual(asc['recordings'][0]['telegram_url'],'https://t.me/c/1234567890/101')
+        self.assertEqual(asc['total'],2);self.assertEqual(asc['recordings'][0]['telegram_url'],f'https://t.me/fixture_archive_bot?start=play_{first[:32]}')
+        self.assertTrue(asc['recordings'][0]['telegram_available'])
         self.assertNotIn('local_path',asc['recordings'][0]);self.assertNotIn('file_id',asc['recordings'][0])
+        self.assertNotIn('file_unique_id',asc['recordings'][0]);self.assertNotIn('chat_id',asc['recordings'][0])
+
+    def test_dashboard_without_username_retains_bot_availability(self):
+        self.add();self.recording();self.settings.bot_username='';self.login()
+        row=self.request('GET','/api/archive?camera=h6c')[1]['recordings'][0]
+        self.assertIsNone(row['telegram_url']);self.assertTrue(row['telegram_available'])
 
     def test_pagination_and_bad_filters(self):
         self.add();self.recording();self.recording(record_id='two');self.login()

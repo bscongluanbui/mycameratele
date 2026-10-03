@@ -1,5 +1,6 @@
 import json
 import hashlib
+import re
 from pathlib import Path
 import time
 import urllib.error
@@ -19,6 +20,42 @@ class ApiRejected(Exception):
 class Telegram:
     def __init__(self, settings):
         self.settings = settings
+
+    @property
+    def owner(self):
+        owner = self.settings.effective_owner
+        return owner if isinstance(owner, int) and not isinstance(owner, bool) and owner > 0 else 0
+
+    @property
+    def viewers(self):
+        return {value for value in (*self.settings.allowed_users,self.owner)
+                if type(value) is int and value > 0}
+
+    @staticmethod
+    def play_callback(row):
+        return 'v:'+row['key'][:32]
+
+    def caption(self, archive, row):
+        zone = get_zone(self.settings.timezone)
+        start = datetime.fromtimestamp(row['start_ms']/1000, zone)
+        end = datetime.fromtimestamp(row['end_ms']/1000, zone)
+        return f"{archive.camera_name(row['camera'])} | {start.isoformat()} → {end.isoformat()}\nArchive: {row['key']}"
+
+    def validate_media_message(self, message, field, chat_id=None):
+        expected_chat = self.owner if chat_id is None else chat_id
+        if not isinstance(message, dict):
+            raise ValueError('Invalid Telegram media response')
+        chat = message.get('chat', {})
+        message_id = message.get('message_id')
+        media = message.get(field, {})
+        if (not isinstance(chat, dict) or chat.get('type') != 'private' or
+            type(chat.get('id')) is not int or chat['id'] != expected_chat or expected_chat <= 0 or
+            type(message_id) is not int or message_id <= 0 or not isinstance(media, dict) or
+            not isinstance(media.get('file_id'), str) or not media['file_id'].strip() or
+            not isinstance(media.get('file_unique_id'), str) or not media['file_unique_id'].strip() or
+            ('document' if field == 'video' else 'video') in message):
+            raise ValueError('Unconfirmed owner/private/media identity')
+        return media
 
     def request(self, method, fields, *, file_path=None, file_field=None):
         if not self.settings.token:
@@ -60,7 +97,8 @@ class Telegram:
         return result['result']
 
     def upload_one(self, archive):
-        if not self.settings.enable_upload:
+        if (not self.settings.enable_upload or not self.settings.token or not self.owner or
+            archive.state(f'telegram_owner_started:{self.owner}') != '1'):
             return None
         row = archive.claim_upload()
         if row is None:
@@ -70,17 +108,19 @@ class Telegram:
             with archive.conn:
                 archive.conn.execute("UPDATE recordings SET status='needs_review',last_error='missing_or_oversize_file' WHERE key=?", (row['key'],))
             return 'needs_review'
-        start = datetime.fromtimestamp(row['start_ms']/1000,get_zone(self.settings.timezone))
-        end = datetime.fromtimestamp(row['end_ms']/1000,get_zone(self.settings.timezone))
-        caption = f"{archive.camera_name(row['camera'])} | {start.isoformat()} → {end.isoformat()}\nArchive: {row['key']}"
+        caption = self.caption(archive, row)
         video = row['codec_video']=='h264' and row['codec_audio'] in (None,'aac')
         method, field = ('sendVideo','video') if video else ('sendDocument','document')
-        fields = {'chat_id':self.settings.chat_id,'caption':caption,'disable_notification':True}
+        fields = {'chat_id':self.owner,'caption':caption,'disable_notification':True}
         if video:
             fields['supports_streaming']=True
         try:
             message = self.request(method,fields,file_path=path,file_field=field)
-            archive.mark_uploaded(row['key'],message['chat']['id'],message['message_id'],message[field]['file_id'])
+            media = self.validate_media_message(message, field)
+            bot_value = archive.state('telegram_bot_id')
+            bot_id = int(bot_value) if bot_value and bot_value.isdecimal() and int(bot_value)>0 else None
+            archive.mark_uploaded(row['key'],self.owner,message['message_id'],media['file_id'],
+                                  file_unique_id=media['file_unique_id'],media_type=field,bot_id=bot_id)
         except ApiRejected as exc:
             with archive.conn:
                 if exc.code == 429:
@@ -98,9 +138,133 @@ class Telegram:
         archive.cleanup(row['key'])
         return 'uploaded'
 
+    @staticmethod
+    def _replay_attempt(archive):
+        value=archive.state('telegram_replay_attempt')
+        if not value:
+            return {}
+        try:
+            attempt=json.loads(value) if len(value)<=512 else {}
+            return attempt if isinstance(attempt,dict) else {}
+        except (ValueError,TypeError):
+            return {}
+
+    @staticmethod
+    def _save_replay_attempt(archive, update_id, phase, *, advance=False, retry_at=0):
+        # Two fixed-size state rows, not one ever-growing row per button click.
+        attempt=json.dumps({'update_id':update_id,'phase':phase}) if phase else '{}'
+        with archive.conn:
+            for name,value in (('telegram_replay_attempt',attempt),('telegram_replay_retry_at',str(retry_at))):
+                archive.conn.execute('INSERT INTO state(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',
+                                     (name,value))
+            if advance:
+                archive.conn.execute("INSERT INTO state(name,value) VALUES('telegram_offset',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                                     (str(update_id+1),))
+
+    def replay(self, archive, prefix, chat_id=None, *, update_id=None):
+        """Resend Telegram's stored file ID; never read/delete/reupload local bytes."""
+        recipient = self.owner if chat_id is None else chat_id
+        if type(recipient) is not int or recipient not in self.viewers or not re.fullmatch(r'[a-f0-9]{32}', prefix):
+            raise ValueError('Invalid archive play selection')
+        rows = archive.conn.execute("SELECT * FROM recordings WHERE status='uploaded' AND substr(key,1,32)=?",
+                                    (prefix,)).fetchall()
+        if len(rows) != 1:
+            raise ValueError('Unknown or ambiguous archive selection')
+        row = dict(rows[0])
+        file_id = row.get('file_id')
+        if not isinstance(file_id, str) or not file_id.strip():
+            raise ValueError('Archive media identity is missing')
+        active_bot = archive.state('telegram_bot_id')
+        if row.get('bot_id') is not None and active_bot and active_bot.isdecimal() and row['bot_id']!=int(active_bot):
+            raise ValueError('Archived file belongs to a different bot')
+        field = row.get('media_type')
+        if field is None:
+            # Pre-private rows have no media_type column value. The upload path
+            # originally selected its method from these exact codec fields.
+            field = 'video' if row['codec_video']=='h264' and row['codec_audio'] in (None,'aac') else 'document'
+        if field not in ('video','document'):
+            raise ValueError('Unknown archived media type')
+        fields = {'chat_id':recipient,field:file_id,'caption':self.caption(archive,row),'disable_notification':True}
+        if field == 'video':
+            fields['supports_streaming'] = True
+        if update_id is not None:
+            previous=self._replay_attempt(archive)
+            if previous.get('update_id')==update_id and previous.get('phase') in ('pending','unknown','done','rejected'):
+                self._save_replay_attempt(archive,update_id,'unknown' if previous['phase']=='pending' else previous['phase'],advance=True)
+                return 'consumed_without_retry'
+            self._save_replay_attempt(archive,update_id,'pending')
+        try:
+            message = self.request('sendVideo' if field == 'video' else 'sendDocument', fields)
+            self.validate_media_message(message,field,recipient)
+        except ApiRejected as exc:
+            if update_id is None:
+                raise
+            if exc.code==429:
+                # A known rejection did not send a message. Clear the pending
+                # guard and hold the same cursor until retry_after has elapsed.
+                self._save_replay_attempt(archive,update_id,None,retry_at=time.time()+max(1,exc.retry_after))
+                raise
+            phase='rejected' if 400<=exc.code<500 else 'unknown'
+            self._save_replay_attempt(archive,update_id,phase,advance=True)
+            return phase
+        except Exception:
+            if update_id is None:
+                raise
+            # A timeout, 5xx or invalid response can follow a successful POST.
+            # Consume this event; a new manual click gets a new update ID.
+            self._save_replay_attempt(archive,update_id,'unknown',advance=True)
+            return 'unknown'
+        if update_id is not None:
+            self._save_replay_attempt(archive,update_id,'done',advance=True)
+        return 'replayed'
+
+    def start_viewer(self, archive, actor):
+        if actor == self.owner:
+            archive.state(f'telegram_owner_started:{self.owner}', '1')
+        # getMe is informative only: a transient failure must not undo /start.
+        try:
+            me = self.request('getMe', {})
+            username = me.get('username') if isinstance(me,dict) else None
+            if isinstance(username,str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}',username):
+                archive.state('telegram_bot_username', username)
+            if isinstance(me,dict) and type(me.get('id')) is int and me['id']>0:
+                archive.state('telegram_bot_id',me['id'])
+        except Exception:
+            pass
+
+    def recent_menu(self, archive, page=0):
+        if page < 0 or page > 100000:
+            raise ValueError('Invalid recent page')
+        result = archive.browse(order='desc',status='uploaded',offset=page*10,limit=10)
+        if page and not result['recordings']:
+            raise ValueError('Invalid recent page')
+        zone = get_zone(self.settings.timezone)
+        buttons = []
+        for row in result['recordings']:
+            stamp = datetime.fromtimestamp(row['start_ms']/1000,zone).strftime('%d/%m %H:%M:%S')
+            buttons.append([{'text':archive.camera_name(row['camera'])+' | '+stamp+' ▶',
+                             'callback_data':self.play_callback(row)}])
+        nav = []
+        if page:
+            nav.append({'text':'←','callback_data':f'recent:{page-1}'})
+        if (page+1)*10 < result['total']:
+            nav.append({'text':'→','callback_data':f'recent:{page+1}'})
+        if nav:
+            buttons.append(nav)
+        buttons.append([{'text':'↩ Camera','callback_data':'root'}])
+        return f'Video gần đây | trang {page+1}',buttons
+
     def menu(self, archive, data='root'):
         # Camera IDs stay immutable; friendly names never enter callback_data.
         # Keep callback payloads compact even for a 64-character camera ID.
+        if data == 'status':
+            return json.dumps(archive.status(),ensure_ascii=False),[[{'text':'↩ Camera','callback_data':'root'}]]
+        if data in ('today','yesterday'):
+            from datetime import timedelta
+            day=datetime.now(get_zone(self.settings.timezone))-(timedelta(days=1) if data=='yesterday' else timedelta())
+            return self._legacy_menu(archive,'d:'+day.strftime('%Y-%m-%d'))
+        if data.startswith('recent:'):
+            return self.recent_menu(archive,int(data.split(':')[1]))
         if data == 'root' or data.startswith('r:'):
             page = 0 if data == 'root' else int(data.split(':')[1])
             cameras = sorted(archive.cameras(), key=lambda c: (c['name'].casefold(), c['id']))
@@ -115,6 +279,9 @@ class Telegram:
                 nav.append({'text':'→', 'callback_data':f'r:{page+1}'})
             if nav:
                 buttons.append(nav)
+            buttons.append([{'text':'🕐 Video gần đây','callback_data':'recent:0'},
+                            {'text':'📅 Hôm nay','callback_data':'today'},
+                            {'text':'⚙ Trạng thái','callback_data':'status'}])
             return 'Archive — chọn Camera' + ('' if cameras else ' (chưa có camera)'), buttons
         pieces = data.split(':')
         kind = pieces[0]
@@ -161,11 +328,8 @@ class Telegram:
         zone = get_zone(self.settings.timezone)
         buttons = []
         for row in rows[page*10:page*10+10]:
-            chat_id = int(row['chat_id'])
-            if chat_id > -1000000000000:
-                continue
             stamp = datetime.fromtimestamp(row['start_ms']/1000, zone).strftime('%H:%M:%S')
-            buttons.append([{'text':stamp+' ▶', 'url':f"https://t.me/c/{-chat_id-1000000000000}/{row['message_id']}"}])
+            buttons.append([{'text':stamp+' ▶', 'callback_data':self.play_callback(row)}])
         nav = []
         if page:
             nav.append({'text':'←', 'callback_data':f'p:{token}:{day}:{order}:{page-1}'})
@@ -222,12 +386,8 @@ class Telegram:
             rows = [r for r in rows if r['camera']==camera]
             buttons=[]
             for row in rows[page*10:page*10+10]:
-                chat_id=int(row['chat_id'])
-                if chat_id > -1000000000000:
-                    continue
-                cid=-chat_id-1000000000000
                 stamp=datetime.fromtimestamp(row['start_ms']/1000,zone).strftime('%H:%M:%S')
-                buttons.append([{'text':stamp+' ▶','url':f"https://t.me/c/{cid}/{row['message_id']}"}])
+                buttons.append([{'text':stamp+' ▶','callback_data':self.play_callback(row)}])
             nav=[]
             if page:
                 nav.append({'text':'←','callback_data':f'p:{day}:{camera_token}:{page-1}'})
@@ -239,26 +399,56 @@ class Telegram:
         raise ValueError('Unknown menu selection')
 
     def poll(self,archive):
-        if not self.settings.token or not self.settings.allowed_users:
+        if not self.settings.token or not self.viewers:
+            return
+        if float(archive.state('telegram_replay_retry_at') or 0)>time.time():
             return
         offset=int(archive.state('telegram_offset') or 0)
         updates=self.request('getUpdates',{'offset':offset,'timeout':0,'allowed_updates':['message','callback_query']})
         for update in updates:
+            if update['update_id'] < int(archive.state('telegram_offset') or 0):
+                continue
             callback=update.get('callback_query')
-            message=update.get('message') or (callback or {}).get('message',{})
+            message=(callback or {}).get('message',{}) if callback else update.get('message',{})
             actor=(callback or message).get('from',{}).get('id')
-            if actor not in self.settings.allowed_users or message.get('chat',{}).get('type') != 'private':
+            chat=message.get('chat',{})
+            if (type(actor) is not int or actor not in self.viewers or chat.get('type') != 'private' or
+                type(chat.get('id')) is not int or chat.get('id') != actor):
                 archive.state('telegram_offset',update['update_id']+1)
                 continue
             chat_id=message['chat']['id']
+            previous=self._replay_attempt(archive)
+            if previous.get('update_id')==update['update_id'] and previous.get('phase') in ('pending','unknown','done','rejected'):
+                # Crash after the POST but before its durable cursor commit.
+                # Do not invoke getMe, answerCallbackQuery or the media POST.
+                self._save_replay_attempt(archive,update['update_id'],
+                                          'unknown' if previous['phase']=='pending' else previous['phase'],advance=True)
+                continue
             try:
                 try:
                     if callback:
                         self.request('answerCallbackQuery',{'callback_query_id':callback['id']})
+                        if callback['data'].startswith('v:'):
+                            self.replay(archive,callback['data'][2:],chat_id,update_id=update['update_id'])
+                            archive.state('telegram_offset',update['update_id']+1)
+                            continue
                         text,buttons=self.menu(archive,callback['data'])
                     else:
-                        command=message.get('text','').split()[0].split('@')[0] if message.get('text','').strip() else ''
-                        if command in ('/status','/start'):
+                        words=message.get('text','').split()
+                        command=words[0].split('@')[0] if words else ''
+                        if command == '/start':
+                            self.start_viewer(archive,actor)
+                            if len(words)>1:
+                                if not words[1].startswith('play_'):
+                                    raise ValueError('Unknown start payload')
+                                self.replay(archive,words[1][5:],chat_id,update_id=update['update_id'])
+                                archive.state('telegram_offset',update['update_id']+1)
+                                continue
+                            text=('Đã kết nối owner. Video mới được gửi trực tiếp trong chat riêng này.' if actor==self.owner else
+                                  'Đã kết nối viewer. Video đã lưu được phát lại trong chat riêng này.')+'\nDùng /archive hoặc /recent để xem lại.'
+                            buttons=[[{'text':'📷 Camera','callback_data':'root'},
+                                      {'text':'🕐 Video gần đây','callback_data':'recent:0'}]]
+                        elif command == '/status':
                             text=json.dumps(archive.status(),ensure_ascii=False)
                             buttons=[[{'text':'Archive','callback_data':'root'}]]
                         else:
@@ -267,6 +457,8 @@ class Telegram:
                             elif command=='/yesterday':
                                 from datetime import timedelta
                                 data='d:'+(datetime.now(get_zone(self.settings.timezone))-timedelta(days=1)).strftime('%Y-%m-%d')
+                            elif command=='/recent':
+                                data='recent:0'
                             else:
                                 data='root'
                             text,buttons=self.menu(archive,data)

@@ -74,6 +74,7 @@ class ArchiveTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {
             "STATE_DIR": str(self.state), "CACHE_DIR": str(self.cache), "INPUT_DIR": str(self.input),
             "DISPLAY_TIMEZONE": "UTC+07:00", "KEEP_CACHE": "false",
+            "CACHE_RETENTION_HOURS": "0",
             "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "",
         }, clear=True)
         self.environment.start()

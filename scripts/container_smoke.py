@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import subprocess
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -48,8 +49,50 @@ try:
         assert reopened.browse(camera="smoke_camera", status="all")["total"] == 1
     finally:
         reopened.close()
+    # Private-bot behavior uses a fake API transport; no credential or network.
+    settings.owner_user_id = 42
+    settings.allowed_users = (42, 77, 88)
+    settings.bot_username = 'fixture_archive_bot'
+    settings.token = 'synthetic-ci-not-a-token'
+    settings.enable_upload = True
+    settings.keep_cache = False
+    settings.cache_retention_hours = 24
+    telegram = Telegram(settings)
+    assert telegram.upload_one(archive) is None  # Owner has not started the bot.
+    calls = []
+    def fake_request(method, fields, **kwargs):
+        calls.append((method, fields, kwargs))
+        field = 'video' if method == 'sendVideo' else 'document'
+        return {'message_id': len(calls), 'chat': {'id': fields['chat_id'], 'type': 'private'},
+                field: {'file_id': 'fixture-file-id', 'file_unique_id': 'fixture-unique-id'}}
+    telegram.request = fake_request
+    archive.state('telegram_owner_started:42', '1')
+    assert telegram.upload_one(archive) == 'uploaded'
+    assert calls[0][1]['chat_id'] == 42
+    assert Path(row['local_path']).is_file()  # Cache holds for a full 24 hours.
+    saved = dict(archive.conn.execute('SELECT * FROM recordings WHERE key=?', (row['key'],)).fetchone())
+    assert saved['file_unique_id'] == 'fixture-unique-id' and saved['media_type'] == 'video'
+    archive.conn.execute('UPDATE recordings SET uploaded_at=? WHERE key=?', (time.time()-86401, row['key']))
+    archive.conn.commit()
+    assert archive.cleanup(row['key']) and not Path(row['local_path']).exists()
+    before = dict(archive.conn.execute('SELECT * FROM recordings WHERE key=?', (row['key'],)).fetchone())
+    for viewer in (77, 88):
+        assert telegram.replay(archive, row['key'][:32], viewer) == 'replayed'
+        assert calls[-1][1]['chat_id'] == viewer and calls[-1][1]['video'] == 'fixture-file-id'
+        assert not calls[-1][2]  # No binary reads/re-upload kwargs after cleanup.
+    try: telegram.replay(archive, row['key'][:32], 999)
+    except ValueError: pass
+    else: raise AssertionError('Non-allowlisted viewer accepted')
+    after = dict(archive.conn.execute('SELECT * FROM recordings WHERE key=?', (row['key'],)).fetchone())
+    assert before == after  # Replay does not replace owner archive metadata.
+    assert archive.telegram_url(after).endswith('start=play_'+row['key'][:32])
+    assert archive.backup_daily().is_file()
+    assert archive.backup_daily() is None
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == original
 finally:
     archive.close()
 print(json.dumps({"result": "OK", "machine": platform.machine(), "uid": os.getuid(),
                   "ffmpeg": "h264+aac-remux-decode", "sqlite": "durable-idempotent",
-                  "source": "unchanged", "timezone": "+07:00", "telegram_posts": 0}, sort_keys=True))
+                  "source": "unchanged", "timezone": "+07:00", "telegram_posts": 0,
+                  "private_bot": "owner+2-viewers-file-id-replay", "cache": "24h-cleanup",
+                  "daily_backup": "atomic-sqlite"}, sort_keys=True))

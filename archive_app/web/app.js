@@ -27,7 +27,7 @@
       if (typeof value !== "string") return null;
       try {
         const url = new URL(value);
-        return url.protocol === "https:" && url.hostname === "t.me" && !url.username && !url.password && !url.port && /^\/[^\s]+$/.test(url.pathname) ? url.href : null;
+        return url.protocol === "https:" && url.hostname === "t.me" && !url.username && !url.password && !url.port && !url.hash && /^\/[A-Za-z][A-Za-z0-9_]{4,31}$/.test(url.pathname) && /^\?start=play_[a-f0-9]{32}$/.test(url.search) ? url.href : null;
       } catch (_) { return null; }
     },
     validHost(value) {
@@ -197,6 +197,9 @@
     const details = [
       ["Phiên bản", status.version || "—"], ["Múi giờ lưu trữ", timezone],
       ["Upload Telegram", status.upload_enabled === true ? "Đã bật" : status.upload_enabled === false ? "Đang tắt" : "Chưa rõ"],
+      ["Nơi lưu video", status.telegram_destination === "owner_private_chat" ? "Chat riêng của owner" : "—"],
+      ["Owner /start", status.owner_started === true ? "Đã kết nối" : "Chờ owner mở bot và /start"],
+      ["ID được phép xem", status.allowed_users_count ?? "—"],
       ["Bot API", status.api_mode || status.telegram_api_mode || "—"],
       ["Kiến trúc", status.architecture || status.machine || "—"],
       ["Hàng đợi upload", status.queue?.downloaded ?? status.queue?.pending ?? status.queue_count ?? "—"],
@@ -338,8 +341,8 @@
       row.append(node("td", "", helpers.formatDuration(record.start_ms, record.end_ms)), node("td", "", helpers.formatBytes(record.file_size ?? record.size_bytes)));
       const statusCell = node("td"); statusCell.append(chip(...helpers.status(record.status))); row.append(statusCell);
       const telegramCell = node("td", "align-right"), url = helpers.telegramUrl(record.telegram_url);
-      if (url) { const link = node("a", "telegram-link", "Mở video"); link.href = url; link.target = "_blank"; link.rel = "noopener noreferrer"; link.setAttribute("aria-label", `Mở video ${record.camera_name || cameraName(record.camera)} lúc ${time} ngày ${date} trên Telegram`); link.append(icon("external")); telegramCell.append(link); }
-      else telegramCell.append(node("span", "small muted", "Chưa có liên kết")); row.append(telegramCell); $("archive-rows").append(row);
+      if (url) { const link = node("a", "telegram-link", "Xem trong bot"); link.href = url; link.target = "_blank"; link.rel = "noopener noreferrer"; link.setAttribute("aria-label", `Xem video ${record.camera_name || cameraName(record.camera)} lúc ${time} ngày ${date} trong bot Telegram`); link.append(icon("external")); telegramCell.append(link); }
+      else telegramCell.append(node("span", "small muted", record.telegram_available ? "Xem bằng /archive trong bot" : "Chưa lưu Telegram")); row.append(telegramCell); $("archive-rows").append(row);
     }
     $("archive-table-wrap").hidden = !records.length; $("archive-empty").hidden = !!records.length;
     $("archive-result-count").textContent = `${displayCount(state.total)} video phù hợp`;

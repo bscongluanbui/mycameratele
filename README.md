@@ -1,27 +1,40 @@
-# MyCameraTele
+# MyCameraTele — Telegram Private Archive
 
-Dashboard Docker quản lý camera EZVIZ và lưu video đã xuất lên Telegram.
+Một bot lưu recording vào **private chat của owner**; owner và các viewer được
+cho phép duyệt lại lịch sử ngay trong private chat riêng của mỗi người.
+Không cần channel/group. SQLite là mục lục, Telegram chứa media, bot là browser.
 
 ```text
-Video xuất từ EZVIZ Studio + thời gian ghi hình
-  → thư mục input / manifest
-  → chuẩn hóa MP4, kiểm tra media và SHA-256
-  → SQLite + hàng đợi upload
-  → Telegram + dashboard: Camera → Năm → Tháng → Ngày
+MP4 xuất từ EZVIZ Studio + thời gian ghi hình
+  → input / manifest → kiểm tra media, remux không transcode
+  → cache + SQLite → upload một lần vào private chat owner
+  → Camera → Năm → Tháng → Ngày → Video
+  → phát lại bằng file_id trong private chat của người được cho phép
 ```
 
-**Tải lịch sử SD trực tiếp từ camera chưa được triển khai.** Thêm camera hoặc
-thấy cổng TCP mở không đồng nghĩa đã tải được video SD. RTSP live không thay
-thế lịch sử recording trên thẻ nhớ. Luồng hiện tại nhận video xuất bằng Studio.
+**Downloader lịch sử SD trực tiếp từ camera vẫn chưa được triển khai.** Luồng
+hiện có nhận file xuất bằng Studio; thêm camera/probe TCP/RTSP live không chứng
+minh đã tải được recording trên SD. Tài liệu này mô tả phiên bản có private-chat
+flow; sửa source tại máy local không tự cập nhật image `latest` trên GHCR.
 
-## 1. Cài lần đầu trên Ubuntu / Armbian
+## 1. Cài đặt trên Ubuntu / Armbian
 
-Chuẩn bị Docker Engine, Compose plugin và Git. Tham khảo tài liệu Docker cho
+Dùng Docker Engine và Compose plugin theo hướng dẫn chính thức cho
 [Ubuntu](https://docs.docker.com/engine/install/ubuntu/) hoặc
-[Debian](https://docs.docker.com/engine/install/debian/).
-Image hướng tới Linux `amd64`, `arm64`, `arm/v7`; Docker tự chọn biến thể theo
-kiến trúc host. `aarch64` thường tương ứng userland `arm64`; đối chiếu bằng
-`uname -m` và `dpkg --print-architecture`. Không ép platform x86 trên board ARM.
+[Debian](https://docs.docker.com/engine/install/debian/). Kiểm tra userland:
+
+```bash
+uname -m
+dpkg --print-architecture
+docker version
+docker compose version
+```
+
+Ứng dụng hướng tới `linux/amd64`, `linux/arm64`, `linux/arm/v7`; `aarch64` thường
+đi với `arm64`, nhưng kernel 64-bit có thể chạy userland `armhf`. Image Local Bot
+API có workflow native `amd64`/`arm64`, không công bố ARMv7 cho image tùy chọn này.
+Docker tự chọn platform host; không ép image x86 trên ARM. Manifest/runtime của
+**tag hoặc digest được triển khai** phải được đối chiếu với báo cáo CI tương ứng.
 
 ```bash
 git clone https://github.com/bscongluanbui/mycameratele.git
@@ -35,56 +48,45 @@ docker compose up -d archive dashboard
 docker compose ps
 ```
 
-Compose mặc định **chỉ tải image GHCR, không build trên board**:
+Compose mặc định **pull-only**, không build trên board:
 
-- `ghcr.io/bscongluanbui/mycameratele:latest` cho worker và dashboard.
-- `ghcr.io/bscongluanbui/mycameratele-bot-api:latest` cho profile local API tùy chọn.
-- `ARCHIVE_IMAGE` / `BOT_API_IMAGE` trong `.env` có thể chọn tag hoặc digest khác.
+- `ARCHIVE_IMAGE=ghcr.io/bscongluanbui/mycameratele:latest` cho worker/dashboard.
+- `BOT_API_IMAGE=ghcr.io/bscongluanbui/mycameratele-bot-api:latest` cho local API.
+- Có thể pin tag/digest của phiên bản đã kiểm chứng trong `.env`.
 
-`ENABLE_UPLOAD=false` mặc định. Worker lập chỉ mục nhưng chưa gửi video.
-SQLite, token dashboard và cache nằm trong named volumes; thư mục `input` được
-mount chỉ đọc. Image dùng UID/GID `10001:10001`; file nguồn cần đọc được bởi UID
-này. Không đổi tên project Compose hoặc volume khi cập nhật một cài đặt đang có.
+Mặc định cloud test, `ENABLE_UPLOAD=false`, `KEEP_CACHE=true`; một cài đặt chưa
+có credential vẫn khởi động dashboard/worker mà chưa gửi Telegram. Image dùng
+UID/GID `10001:10001`; `input` chỉ đọc. SQLite/cache/token dashboard nằm trong
+named volumes. Giữ project **`ezviz-telegram-archive`** và volume keys
+`archive-state`, `archive-cache`, `bot-api-state` khi cập nhật để dùng lại dữ liệu.
 
-### Mở dashboard
+### Dashboard
 
 ```bash
 docker compose exec dashboard cat /data/dashboard_token
 ```
 
-Mở `http://127.0.0.1:8080` trên máy Docker và nhập token. Token tự tạo, lưu trong
-volume `/data`; token này khác token bot Telegram. Nếu đặt `DASHBOARD_TOKEN` trong
-`.env`, dùng chuỗi ngẫu nhiên ít nhất 24 ký tự và đăng nhập bằng giá trị đó.
-Token override không ghi đè file token cũ.
-
-Từ PC khác, dùng tunnel (thay `USER` và `DOCKER_HOST`):
+Mở `http://127.0.0.1:8080` và đăng nhập bằng token. Token dashboard khác token bot,
+tự tạo và lưu `/data`; `DASHBOARD_TOKEN` có thể override với chuỗi ngẫu nhiên ít
+nhất 24 ký tự. Để mở dashboard từ PC qua SSH, thay hai slot bằng máy thật:
 
 ```bash
 ssh -L 8080:127.0.0.1:8080 USER@DOCKER_HOST
 ```
 
-Rồi mở `http://127.0.0.1:8080` trên PC. Để truy cập trực tiếp trong LAN, đặt
-`DASHBOARD_BIND_IP` bằng địa chỉ LAN thực của máy Docker, chọn `DASHBOARD_PORT`
-trong `.env`, rồi chạy:
+Rồi mở `http://127.0.0.1:8080` trên PC. Truy cập LAN trực tiếp chỉ khi bạn đặt
+`DASHBOARD_BIND_IP` bằng địa chỉ LAN của máy Docker và recreate dashboard.
+Mặc định bind loopback. Cookie đăng nhập có HttpOnly/SameSite/CSRF; Đăng xuất hủy
+phiên. Không đưa token/mật khẩu/Wi-Fi vào source, manifest, image hay build args.
 
-```bash
-docker compose up -d --force-recreate dashboard
-```
+## 2. Thêm camera và nhập recording
 
-Truy cập `http://DOCKER_HOST:8080` với `DOCKER_HOST` là địa chỉ thực. Mặc định
-dashboard bind loopback, không mở trên mọi interface. Phiên đăng nhập có cookie
-HttpOnly, SameSite và CSRF; nút Đăng xuất hủy phiên trên server.
+Trên dashboard, tạo mã camera ổn định, tên hiển thị, model, địa chỉ LAN và các
+cổng. Đổi tên không đổi mã/lịch sử; manifest dùng mã, không dùng tên hiển thị.
+Camera từ manifest cũ có thể tự đăng ký. Kiểm tra LAN chỉ kiểm tra TCP.
 
-## 2. Thêm camera và nhập video
-
-Trên dashboard, thêm camera với mã ổn định, tên hiển thị, model, địa chỉ LAN và
-cổng device/HTTP/RTSP. Có thể đổi tên hoặc tạm dừng camera. **Mã camera không
-đổi** để lịch sử không bị tách; trường `camera` trong manifest dùng mã, không
-dùng tên hiển thị. Camera từ manifest cũ tự đăng ký với tên ban đầu bằng mã.
-Nút Kiểm tra LAN chỉ kiểm tra TCP; khả năng tải SD cần kiểm chứng từng model.
-
-Xuất một recording bằng EZVIZ Studio, lấy đúng Start Time / End Time của dòng
-recording đó. Copy file vào `input`, rồi tạo `input/manifest.json`:
+Xuất recording bằng Studio, copy MP4 vào `input`, lấy đúng Start Time/End Time
+của dòng đã xuất rồi tạo `input/manifest.json`:
 
 ```json
 {
@@ -93,147 +95,175 @@ recording đó. Copy file vào `input`, rồi tạo `input/manifest.json`:
       "record_id": "studio-recording-001",
       "camera": "living_room",
       "path": "/input/recording-001.mp4",
-      "start_time": "2026-01-01T08:00:00+07:00",
-      "end_time": "2026-01-01T08:01:00+07:00"
+      "start_time": "REPLACE_WITH_STUDIO_START_ISO8601_OFFSET",
+      "end_time": "REPLACE_WITH_STUDIO_END_ISO8601_OFFSET"
     }
   ]
 }
 ```
 
-Thay mã, file và **hai thời điểm ví dụ** bằng dữ liệu recording thực. Thời gian
-phải có UTC offset; tên file và PTS không phải bằng chứng giờ ghi hình.
-`DISPLAY_TIMEZONE` quyết định ngày/tháng khi tra cứu. Copy xong video trước,
-đưa manifest hoàn chỉnh vào sau. Worker quét các manifest `*.json` mỗi
-`SCAN_INTERVAL_SECONDS`; không cần dừng dịch vụ để thêm file.
-
-Kiểm tra manifest mà chưa nhập dữ liệu:
+Thay placeholders bằng thời gian thực, dạng `YYYY-MM-DDTHH:MM:SS+07:00`; parser
+sẽ từ chối khi chưa thay. Tên file/PTS không chứng minh giờ ghi hình. SQLite lưu
+UTC, `DISPLAY_TIMEZONE` chuyển đổi ngày/tháng tra cứu, `CAMERA_TIMEZONE` phải
+khớp timezone của camera. Copy xong MP4 trước, đưa manifest hoàn chỉnh vào sau.
+Worker quét `*.json` mỗi `SCAN_INTERVAL_SECONDS`.
 
 ```bash
+# Dừng worker trước CLI ingest để dùng chung khóa ghi.
 docker compose stop archive
 docker compose run --rm archive ingest --manifest /input/manifest.json --dry-run
+docker compose run --rm archive ingest --manifest /input/manifest.json
 docker compose up -d archive
 docker compose logs --tail=100 archive
 ```
 
-Nếu muốn gọi CLI ingest thật thay cho worker, dừng worker trước để dùng chung
-khóa ghi:
+Dry-run kiểm tra input/metadata, chưa gửi Telegram. File nguồn không bị xóa.
+SQLite đối chiếu khóa camera/source/record ID; upload mơ hồ vào `upload_unknown`
+để đối soát, không gửi lại mù. Cache giữ nguyên file chưa upload hoặc chưa commit
+metadata thành công. Chỉnh `CACHE_MAX_GB`/`CACHE_MIN_FREE_GB` theo dung lượng ổ.
 
-```bash
-docker compose stop archive
-docker compose run --rm archive ingest --manifest /input/manifest.json
-docker compose up -d archive
-```
+## 3. Owner, viewers và cloud test
 
-File nguồn không bị xóa. SQLite chống nhập trùng theo camera/source/record ID;
-`upload_unknown` giữ lại trường hợp kết quả upload chưa rõ để đối chiếu, không
-tự gửi lại mù. `KEEP_CACHE=true` giữ bản cache sau upload; điều chỉnh
-`CACHE_MAX_GB` và `CACHE_MIN_FREE_GB` theo dung lượng ổ đĩa.
+Tạo bot qua [BotFather](https://core.telegram.org/bots/features#botfather).
+**Owner ID là số nguyên dương của tài khoản người dùng**, không phải bot token,
+username, số điện thoại hoặc ID channel/group âm. Cấu hình owner rõ ràng;
+ứng dụng không nhận người nhắn đầu tiên làm owner.
 
-## 3. Telegram và cây tra cứu
-
-Tạo bot qua [BotFather](https://core.telegram.org/bots/features#botfather), thêm
-bot vào channel lưu trữ với quyền đăng bài. Sửa `.env` trên máy triển khai:
+Sửa `.env` trên máy triển khai; thay các slot bằng giá trị thật:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
-TELEGRAM_CHAT_ID=YOUR_CHANNEL_CHAT_ID
-TELEGRAM_ALLOWED_USER_IDS=YOUR_TELEGRAM_USER_ID
-ENABLE_UPLOAD=true
+TELEGRAM_OWNER_USER_ID=YOUR_POSITIVE_TELEGRAM_USER_ID
+TELEGRAM_BOT_USERNAME=YOUR_BOT_USERNAME_WITHOUT_AT
+TELEGRAM_ALLOWED_USER_IDS=OWNER_ID,VIEWER_ID_2,VIEWER_ID_3
+TELEGRAM_CHAT_ID=
+TELEGRAM_API_BASE=https://api.telegram.org
+TELEGRAM_API_MODE=cloud
+TELEGRAM_MAX_BYTES=50000000
+ENABLE_UPLOAD=false
+KEEP_CACHE=true
 ```
 
-Allowlist nhận nhiều ID ngăn bởi dấu phẩy. Worker là consumer polling duy nhất
-của bot; không chạy thêm một cài đặt khác với cùng token. Áp dụng cấu hình:
+Các ID trong allowlist phải là **số nguyên dương thật**, ngăn bằng dấu phẩy.
+Owner được tự thêm vào quyền truy cập nếu không xuất hiện trong danh sách.
+Để trống allowlist thì chỉ owner được truy cập; thêm ID để cho người khác xem.
+`TELEGRAM_CHAT_ID` chỉ là alias cũ cho **cùng ID owner dương**; cấu hình mới để trống.
+Username bot không có `@`; có thể để trống để `/start` lấy qua `getMe` và lưu lại.
+
+```bash
+docker compose up -d --force-recreate archive dashboard
+```
+
+Owner mở bot trên Telegram và bấm **Start / gửi `/start` trong private chat**.
+Ứng dụng lưu trạng thái owner đã bắt đầu; chỉ `/start` đúng owner mới mở gate
+cho automatic upload. [Telegram yêu cầu người dùng bắt đầu cuộc trò chuyện](https://core.telegram.org/bots#how-are-bots-different-from-users).
+Viewer được cho phép cũng mở bot và `/start`, sau đó duyệt `/archive` trong chat
+riêng của mình. Viewer không được thay owner và không mở gate upload của owner.
+
+Khi owner `/start` thành công, sửa `.env` thành `ENABLE_UPLOAD=true` rồi recreate:
 
 ```bash
 docker compose up -d --force-recreate archive dashboard
 docker compose logs --tail=100 archive
 ```
 
-Nhắn `/archive` cho bot bằng tài khoản trong allowlist. Dashboard và bot duyệt
-**Tên camera → Năm → Tháng → Ngày**, có phân trang và **Cũ → Mới / Mới → Cũ**
-theo giờ ghi hình, không theo ngày upload hay tên file. Đổi tên camera cập nhật
-cây tra cứu và caption upload mới; không sửa message Telegram đã gửi.
-Video qua nửa đêm có thể hiện ở cả hai ngày; end đúng 00:00 không tính sang
-ngày mới.
+Automatic upload **chỉ đến private chat owner**. Viewer chỉ nhận video khi chủ
+động chọn xem, không nhận mọi recording mới. Một worker là consumer polling duy
+nhất của bot; không chạy hai cài đặt cùng token. Lệnh/callback và replay đều
+kiểm tra người dùng được phép và private chat của chính người đó.
 
-Telegram lưu các message, không tạo thư mục vật lý hoặc sắp xếp lại lịch sử chat.
-SQLite và bot quản lý cây tra cứu, liên kết tới message gốc. Tài khoản mở link
-channel riêng cần là thành viên channel. Dashboard mặc định hiện video đã
-upload; chọn Tất cả trạng thái để xem hàng đợi.
+### Tra cứu/phát lại
 
-Cloud Bot API dùng ngưỡng upload mặc định 50 MB. File vượt giới hạn được giữ
-để xử lý; bộ chia clip lớn tự động chưa được triển khai. Xem
-[Telegram Bot API](https://core.telegram.org/bots/api#sendvideo).
+Dashboard và `/archive` duyệt **Camera → Năm → Tháng → Ngày → Video**, phân trang
+và Cũ → Mới / Mới → Cũ theo thời gian ghi hình. Video qua nửa đêm có thể xuất hiện
+ở cả hai ngày; end đúng 00:00 không tính sang ngày mới. `/today`, `/yesterday`,
+`/recent`, `/status` là các shortcut.
 
-### Local Bot API tùy chọn
+Bot lưu message ID, `file_id` và `file_unique_id` sau upload được xác nhận/commit.
+Chọn video gửi lại bằng `sendVideo`/`sendDocument` với **file_id**, không tải về
+rồi upload binary lần nữa. Theo [Telegram Sending files](https://core.telegram.org/bots/api#sending-files),
+file_id có thể tái sử dụng bởi **cùng bot**, không chuyển sang bot khác.
+Dashboard mở link bot dạng `https://t.me/BOT_USERNAME?start=play_RECORD_KEY`;
+người mở vẫn phải được phép. Khi username chưa được cấu hình/lấy từ getMe,
+dashboard không đoán link channel. Cây thư mục là virtual filesystem trong
+SQLite, không phải thư mục vật lý trên Telegram.
 
-Image local Bot API được build riêng cho `amd64` và `arm64`; image ứng dụng
-chính có thêm `arm/v7`. Profile này không cần bật khi dùng cloud Bot API.
-
-Lấy application credentials tại [my.telegram.org](https://core.telegram.org/api/obtaining_api_id)
-và cấu hình `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` trong `.env`:
+Cloud mode chỉ dành cho kiểm tra clip nhỏ, giới hạn binary upload 50 MB;
+file vượt ngưỡng được giữ để xử lý, không tự chia/transcode. Dùng `sendVideo`
+cho codec phù hợp, còn lại gửi `sendDocument`; không encode lại chỉ để ép video.
+Sau khi chuyển sang Local API, bản ghi `needs_review` vì file thiếu/vượt ngưỡng
+cũ cần lệnh rõ ràng; worker không tự retry các upload mơ hồ:
 
 ```bash
-docker compose --profile local-api pull telegram-bot-api
-docker compose --profile local-api up -d telegram-bot-api
+docker compose -f compose.yaml -f compose.local.yaml --profile local-api stop archive
+docker compose -f compose.yaml -f compose.local.yaml --profile local-api run --rm archive retry-oversize --key RECORD_KEY
+docker compose -f compose.yaml -f compose.local.yaml --profile local-api up -d archive
 ```
 
-Khi chuyển bot đang dùng cloud sang local, thực hiện `logOut` trên cloud theo
-[hướng dẫn chính thức](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server),
-rồi đổi:
+Lệnh chỉ đưa bản ghi chưa có file_id và lỗi `missing_or_oversize_file` vào hàng
+đợi khi cache còn tồn tại và vừa ngưỡng API hiện tại; `upload_unknown` cần đối soát.
+
+## 4. Production: official Local Bot API
+
+Local API dùng nguồn chính thức `tdlib/telegram-bot-api`, pin commit trong
+`Dockerfile.bot-api`; `compose.local.yaml` chọn endpoint local, tối đa
+`2000000000` bytes, `KEEP_CACHE=false`, retention 24 giờ cho cả worker/dashboard.
+Không âm thầm đổi sang cloud nếu local API ngừng hoạt động.
+
+Lấy application `api_id`/`api_hash` theo
+[hướng dẫn Telegram](https://core.telegram.org/api/obtaining_api_id), thêm `.env`:
 
 ```dotenv
-TELEGRAM_API_BASE=http://telegram-bot-api:8081
-TELEGRAM_API_MODE=local
-TELEGRAM_MAX_BYTES=2000000000
+TELEGRAM_API_ID=YOUR_APPLICATION_API_ID
+TELEGRAM_API_HASH=YOUR_APPLICATION_API_HASH
+ENABLE_UPLOAD=false
 ```
+
+Owner/token/application credentials là trường bắt buộc trong production
+Compose override. `ENABLE_UPLOAD` vẫn do bạn chọn trong `.env`; override không
+tự bật upload. Nếu bot đang dùng cloud, gọi `logOut` trên cloud trước chuyển
+endpoint theo [hướng dẫn migration chính thức](https://github.com/tdlib/telegram-bot-api#moving-a-bot-to-a-local-server).
 
 ```bash
-docker compose --profile local-api up -d --force-recreate archive dashboard
+docker compose -f compose.yaml -f compose.local.yaml --profile local-api config --quiet
+docker compose -f compose.yaml -f compose.local.yaml --profile local-api pull
+docker compose -f compose.yaml -f compose.local.yaml --profile local-api up -d
+docker compose -f compose.yaml -f compose.local.yaml --profile local-api ps
 ```
 
-Local API ở mạng Compose, không publish cổng 8081 ra host; đọc cùng `/cache`
-để gửi file URI. Telegram công bố giới hạn local mode tới 2000 MB tại
-[Using a local Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server).
-Đổi API không bổ sung chức năng tải SD từ camera.
+Owner `/start` với endpoint mới; xác nhận trạng thái, rồi đặt `ENABLE_UPLOAD=true`
+và chạy lại lệnh `up -d --force-recreate archive dashboard` với **cùng hai file
+Compose và profile**. Khi đã chọn local, luôn giữ các cờ này trong lệnh cập nhật;
+lệnh chỉ dùng `compose.yaml` sẽ chọn lại cấu hình cloud mặc định.
 
-## 4. Cập nhật: pull image, giữ nguyên dữ liệu
+Local API chỉ trong mạng Compose, **không publish 8081**; đọc `/cache:ro` cùng
+đường dẫn worker, trạng thái API ở volume writable riêng. Theo
+[Telegram Local Bot API](https://core.telegram.org/bots/api#using-a-local-bot-api-server),
+local mode hỗ trợ upload tới 2000 MB. Không cần VPS hoặc middleware.
 
-Không cần build lại. Ghi lại digest và backup trước khi nâng phiên bản; `git
-pull` cập nhật Compose, tài liệu và file mẫu, không thay thế `.env` đang dùng.
+RAM runtime tùy workload/TDLib; không có một mức cố định suy ra từ dung lượng
+file. Theo dõi **min/max/peak** trước và trong upload thực bằng `docker stats`
+và log/OOM của host. File URI không có nghĩa toàn bộ server không dùng RAM.
+Build TDLib là bài toán khác: compiler/job/architecture thay đổi bộ nhớ, có
+[hướng dẫn chính thức cho low-memory build](https://github.com/tdlib/td#building).
+Pull image có sẵn tránh compile trên board nhỏ. Test 100 MB, 500 MB, 1 GB là các
+mốc nghiệm thu bằng **clip thật**, không phải kết quả đã đạt chỉ vì sparse-file,
+mock API, kiểm tra config hoặc unit test thành công.
 
-Nếu Compose đã cập nhật và `ARCHIVE_IMAGE` vẫn dùng tag mặc định `latest`, hai
-lệnh ngắn gọn là:
+## 5. Retention và daily SQLite backup
 
-```bash
-docker pull ghcr.io/bscongluanbui/mycameratele:latest
-docker compose up -d
-```
+Cloud/debug mặc định `KEEP_CACHE=true`. Production override đặt
+`KEEP_CACHE=false`, `CACHE_RETENTION_HOURS=24`: chỉ xóa cache đã upload xác nhận,
+có metadata Telegram, SQLite commit thành công và đủ thời gian retention.
+File thất bại/mơ hồ/chưa upload được giữ; nguồn `input` không bị cleanup.
 
-```bash
-docker image inspect "$(docker compose images -q archive | head -n 1)" \
-  --format '{{join .RepoDigests "\n"}}'
-git pull --ff-only
-docker compose config --quiet
-docker compose pull archive dashboard
-docker compose up -d archive dashboard
-docker compose ps
-docker compose logs --tail=100 archive dashboard
-```
-
-Nếu dùng local API, thêm `--profile local-api` và pull cả `telegram-bot-api`.
-Các volume vẫn dùng project `ezviz-telegram-archive` và khóa
-`archive-state`, `archive-cache`, `bot-api-state` như trước.
-
-### Backup và rollback bằng digest
-
-Dừng cả worker và dashboard để backup SQLite nhất quán. Lệnh sau lưu `/data`,
-bao gồm database và token, vào thư mục backup trên host; thư mục backup này cần
-được bảo quản cùng cấu hình `.env`:
+Worker tạo SQLite snapshot nhất quán hằng ngày trong `/data/backups`, giữ **7
+snapshot ngày gần nhất**. Snapshot nằm cùng volume với DB nên cần copy ra ổ
+độc lập nếu muốn chống hỏng ổ. SQLite mất thì media Telegram có thể còn nhưng
+mất catalog. Khi thực hiện backup toàn bộ `/data`, dừng worker/dashboard trước:
 
 ```bash
 mkdir -p backups
-# Chỉ đổi quyền thư mục backup riêng để UID ứng dụng ghi được:
 sudo chown 10001:10001 backups
 sudo chmod 700 backups
 docker compose stop archive dashboard
@@ -243,46 +273,64 @@ docker compose run --rm --no-deps --entrypoint python \
 docker compose up -d archive dashboard
 ```
 
-Backup cache `/cache` và video nguồn `input` riêng nếu cần bản sao media độc lập.
-Để quay lại image đã ghi nhận, đặt trong `.env`:
+Nếu production local, thêm `-f compose.yaml -f compose.local.yaml --profile
+local-api` ở mọi lệnh trên. Backup `.env`, cache/media nguồn riêng nếu cần bản
+sao video độc lập. Telegram là nơi gửi/lưu media, không thay thế chính sách
+backup của bạn.
 
-```dotenv
-ARCHIVE_IMAGE=ghcr.io/bscongluanbui/mycameratele@sha256:PREVIOUS_DIGEST
-```
+## 6. Migration từ cấu hình channel cũ
 
-Sau đó `docker compose pull archive dashboard` và `docker compose up -d archive
-dashboard`. Cách này đổi mã chạy nhưng giữ nguyên volumes. Một phiên bản cũ
-phải tương thích schema database hiện tại; nếu cần phục hồi database, dừng
-cả hai dịch vụ và dùng backup nhất quán tương ứng. Không xóa volume khi rollback.
+1. Giữ **cùng bot/token, project và volumes**, backup trước cập nhật.
+2. Đặt `TELEGRAM_OWNER_USER_ID` rõ ràng; xóa giá trị channel âm khỏi alias
+   `TELEGRAM_CHAT_ID`, đặt alias trống hoặc bằng owner. Owner được tự cấp quyền;
+   các viewer cũ vẫn phải có ID dương trong allowlist mới.
+3. Owner `/start`; chọn cloud test hoặc production override; chỉ bật upload
+   sau khi gate của owner đã được xác nhận.
+
+Bản ghi cũ cùng message/file ID vẫn ở SQLite; **không reset DB, xóa lịch sử,
+reupload toàn bộ hay đổi chủ recording**. `file_id` cũ hợp lệ với cùng bot có
+thể gửi lại vào private chat người được phép. Message đã gửi trước đây không
+bị xóa/chỉnh sửa; UI mới không tạo link private-channel từ chat ID cũ.
+Nếu đổi sang bot khác, file_id của bot cũ không dùng chung; đó là migration
+khác, không được coi là replay cùng bot.
+
+### Update/rollback giữ dữ liệu
 
 ```bash
-# Dừng toàn bộ dịch vụ, giữ nguyên dữ liệu:
-docker compose --profile local-api down
+git pull --ff-only
+docker compose config --quiet
+docker compose pull archive dashboard
+docker compose up -d archive dashboard
+docker compose ps
 ```
 
-`down -v` xóa volume; không dùng cho cập nhật/rollback giữ dữ liệu. Đổi image hay
-phục hồi SQLite không xóa/rollback message đã gửi lên Telegram. Với
-`upload_unknown`, đối chiếu message thật rồi dùng `archive reconcile --help`.
+Production local dùng hai Compose files/profile ở trên và pull thêm Bot API.
+Trước upgrade, lưu image digest và SQLite snapshot. Rollback image bằng
+`ARCHIVE_IMAGE=ghcr.io/bscongluanbui/mycameratele@sha256:PREVIOUS_DIGEST`, pull và
+recreate; phiên bản cũ phải tương thích schema hoặc dùng DB backup nhất quán
+phù hợp. Giữ volumes, không dùng `down -v`. Đổi image/phục hồi DB không rollback
+message đã gửi. Đối chiếu `upload_unknown` với message thật trước dùng CLI
+`archive reconcile --help`; không retry binary mù.
 
-## 5. Phát triển tại máy local
+## 7. Phát triển/test local, tách khỏi release GHCR
 
-Build chỉ được bật khi thêm override, không ảnh hưởng lệnh cài đặt pull-only:
+Default Compose luôn pull-only. Build source cần override rõ ràng:
 
 ```bash
 docker compose -f compose.yaml -f compose.build.yaml build archive dashboard
-docker compose -f compose.yaml -f compose.build.yaml up -d archive dashboard
 docker compose -f compose.yaml -f compose.build.yaml run --rm --entrypoint python \
   archive -m unittest discover -s tests -v
+docker compose -f compose.yaml -f compose.build.yaml up -d archive dashboard
 ```
 
-Override dùng `mycameratele:dev` và `mycameratele-bot-api:dev`; local Bot API
-biên dịch từ nguồn chính thức cần RAM/thời gian, `BOT_API_BUILD_JOBS` điều chỉnh
-số job. `docker-bake.hcl` phục vụ kiểm tra/build đa kiến trúc. Kết quả build,
-unit test và probe TCP không thay thế kiểm chứng tải một recording SD thực trên
-từng model/firmware/kiến trúc.
+Để test local-mode source, thêm `-f compose.local.yaml --profile local-api`
+trước command; production override vẫn yêu cầu owner/token/application
+credentials. Sửa file/build/test tại máy local không tự push Git, publish
+registry hoặc cập nhật image GHCR. Báo cáo kiểm chứng phải phân biệt config,
+unit test, runtime kiến trúc, upload Telegram thật và downloader SD thật.
 
-## Tài liệu liên quan
+## Nguồn chính thức
 
-- [EZVIZ: tải recording bằng Studio](https://support.ezviz.com/faq/article/How-to-download-the-recorded-video-clips)
-- [Docker multi-platform builds](https://docs.docker.com/build/building/multi-platform/)
+- [EZVIZ Studio export recording](https://support.ezviz.com/faq/article/How-to-download-the-recorded-video-clips)
 - [Telegram Bot API](https://core.telegram.org/bots/api)
+- [Docker multi-platform builds](https://docs.docker.com/build/building/multi-platform/)

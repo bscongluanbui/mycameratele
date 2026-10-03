@@ -31,6 +31,7 @@ jobs:
       - run: node archive_app/web/test_web.js
       - run: python scripts/ci_validate_manifest.py --self-test
       - run: docker compose config --quiet
+      - run: python scripts/ci_validate_private_compose.py
 
   publish:
     needs: validate

@@ -34,6 +34,7 @@ jobs:
         run: |
           python -m compileall -q archive_app tests scripts
           python scripts/ci_validate_manifest.py --self-test
+          python scripts/ci_validate_private_compose.py
       - name: Compose and multiarch configuration
         run: |
           docker compose config --quiet

@@ -1,0 +1,35 @@
+# Production override. Keep the base project's existing volumes and pull-only images.
+# Usage: docker compose -f compose.yaml -f compose.local.yaml --profile local-api up -d
+# Owner, bot token and application credentials must be supplied in the local .env.
+services:
+  archive:
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_OWNER_USER_ID: ${TELEGRAM_OWNER_USER_ID:?Set positive TELEGRAM_OWNER_USER_ID in .env}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_OWNER_USER_ID:?Set positive TELEGRAM_OWNER_USER_ID in .env}
+      TELEGRAM_API_BASE: http://telegram-bot-api:8081
+      TELEGRAM_API_MODE: local
+      TELEGRAM_MAX_BYTES: "2000000000"
+      KEEP_CACHE: "false"
+      CACHE_RETENTION_HOURS: "24"
+      ENABLE_UPLOAD: ${ENABLE_UPLOAD:-false}
+    depends_on:
+      telegram-bot-api:
+        condition: service_healthy
+
+  dashboard:
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_OWNER_USER_ID: ${TELEGRAM_OWNER_USER_ID:?Set positive TELEGRAM_OWNER_USER_ID in .env}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_OWNER_USER_ID:?Set positive TELEGRAM_OWNER_USER_ID in .env}
+      TELEGRAM_API_BASE: http://telegram-bot-api:8081
+      TELEGRAM_API_MODE: local
+      TELEGRAM_MAX_BYTES: "2000000000"
+      KEEP_CACHE: "false"
+      CACHE_RETENTION_HOURS: "24"
+      ENABLE_UPLOAD: ${ENABLE_UPLOAD:-false}
+
+  telegram-bot-api:
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?Set TELEGRAM_API_ID in .env}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH in .env}
