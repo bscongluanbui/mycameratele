@@ -23,7 +23,10 @@ def _statistics():
             'needs_review': 0, 'upload_unknown': 0, 'deleted': 0,
             'failed_records': 0, 'probe_tcp_open': 0, 'probe_error_type': None,
             'sd_backend': None, 'sd_searched': 0, 'sd_downloaded': 0, 'sd_deferred': 0,
-            'sd_backlog': 0, 'sd_error_code': None}
+            'sd_backlog': 0, 'sd_error_code': None,
+            'sd_connect_seconds': 0.0, 'sd_search_seconds': 0.0,
+            'sd_download_seconds': 0.0, 'sd_ingest_seconds': 0.0,
+            'sd_download_bytes': 0, 'upload_seconds': 0.0}
 
 
 class SyncQueue:
@@ -178,16 +181,19 @@ class SyncQueue:
         return self.conn.execute('SELECT id,enabled,upload_enabled FROM cameras WHERE id=?', (slug,)).fetchone()
 
     def _counts(self, slug, statistics):
-        rows = self.conn.execute('SELECT status,deleted_at,retry_at FROM recordings WHERE camera=?', (slug,)).fetchall()
         now = time.time()
-        visible = [row for row in rows if row['deleted_at'] is None]
-        statistics['ready'] = sum(row['status'] == 'downloaded' and (row['retry_at'] or 0) <= now for row in visible)
-        statistics['pending'] = sum(row['status'] != 'uploaded' for row in visible)
-        statistics['needs_review'] = sum(row['status'] == 'needs_review' for row in visible)
-        statistics['upload_unknown'] = sum(row['status'] in ('upload_unknown', 'uploading') for row in visible)
-        statistics['deleted'] = len(rows) - len(visible)
-        statistics['failed_records'] = sum(row['status'] in ('failed', 'ingesting') for row in visible)
-        return len(rows), sum(row['status'] == 'downloaded' and (row['retry_at'] or 0) > now for row in visible)
+        row = self.conn.execute('''SELECT count(*) AS total,
+            count(CASE WHEN deleted_at IS NULL AND status='downloaded' AND coalesce(retry_at,0)<=? THEN 1 END) AS ready,
+            count(CASE WHEN deleted_at IS NULL AND status!='uploaded' THEN 1 END) AS pending,
+            count(CASE WHEN deleted_at IS NULL AND status='needs_review' THEN 1 END) AS needs_review,
+            count(CASE WHEN deleted_at IS NULL AND status IN ('upload_unknown','uploading') THEN 1 END) AS upload_unknown,
+            count(CASE WHEN deleted_at IS NOT NULL THEN 1 END) AS deleted,
+            count(CASE WHEN deleted_at IS NULL AND status IN ('failed','ingesting') THEN 1 END) AS failed_records,
+            count(CASE WHEN deleted_at IS NULL AND status='downloaded' AND coalesce(retry_at,0)>? THEN 1 END) AS delayed
+            FROM recordings WHERE camera=?''', (now,now,slug)).fetchone()
+        for field in ('ready','pending','needs_review','upload_unknown','deleted','failed_records'):
+            statistics[field] = row[field]
+        return row['total'], row['delayed']
 
     def _progress(self, job, statistics, phase, message):
         self._counts(job['camera_id'], statistics)
@@ -268,11 +274,14 @@ class SyncQueue:
             if upload_paused or statistics['uploaded']>=MAX_UPLOADS_PER_JOB or self._gate(slug):
                 return None
             try:
+                started=time.monotonic()
                 result=telegram.upload_one(self.archive,camera=slug)
             except Exception as error:
                 upload_paused=True
                 upload_error_type=self._error_type(error)
                 return None
+            finally:
+                statistics['upload_seconds']+=round(time.monotonic()-started,6)
             if result=='uploaded':statistics['uploaded']+=1
             elif result is not None:upload_paused=True
             return result
@@ -308,6 +317,8 @@ class SyncQueue:
                 # Snapshots are cumulative, so do not add the same file twice.
                 statistics['imported']=snapshot.get('imported',0)
                 statistics['already_known']=snapshot.get('already_known',0)
+                for field in ('connect_seconds','search_seconds','download_seconds','ingest_seconds','download_bytes'):
+                    statistics['sd_'+field]=snapshot.get(field,0)
                 phase=snapshot.get('phase','sd_download')
                 if phase not in ('sd_search','sd_download','sd_complete'):phase='sd_download'
                 self._progress(job,statistics,phase,'Đang xử lý recording SD; số liệu cập nhật sau từng file')

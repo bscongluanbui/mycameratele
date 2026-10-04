@@ -469,6 +469,8 @@ class Archive:
                 created_at REAL NOT NULL)''')
             self.conn.execute('''CREATE INDEX IF NOT EXISTS by_active_window
                 ON recordings(status,deleted_at,start_ms,end_ms,camera)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS by_camera_pipeline
+                ON recordings(camera,status,deleted_at,retry_at)''')
             # Old rows have no known upload timestamp. Start their retention
             # clock at the first migration rather than deleting them early.
             self.conn.execute("INSERT OR IGNORE INTO state(name,value) VALUES('cleanup_legacy_hold_since',?)", (str(time.time()),))

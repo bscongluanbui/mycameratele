@@ -139,7 +139,9 @@ services:
       - --local
       - --http-port=8081
       - --dir=/var/lib/telegram-bot-api
-      - --temp-dir=/tmp
+      # Multipart uploads may approach 2 GB: spool to the existing disk volume,
+      # not the small /tmp RAM filesystem. Bot API owns temporary-file cleanup.
+      - --temp-dir=/var/lib/telegram-bot-api
     volumes:
       - bot-api-state:/var/lib/telegram-bot-api
     expose:

@@ -36,6 +36,10 @@ assert result.returncode == 0, 'Production fixture render failed'
 assert local['name'] == 'ezviz-telegram-archive'
 assert set(local['volumes']) == {'archive-state', 'archive-cache', 'bot-api-state'}
 assert 'ports' not in local['services']['telegram-bot-api']
+assert '--temp-dir=/var/lib/telegram-bot-api' in local['services']['telegram-bot-api']['command']
+assert '--temp-dir=/tmp' not in local['services']['telegram-bot-api']['command']
+spool_mount=next(v for v in local['services']['telegram-bot-api']['volumes'] if v['target']=='/var/lib/telegram-bot-api')
+assert spool_mount['type']=='volume' and not spool_mount.get('read_only',False)
 for service in ('archive', 'dashboard'):
     settings = local['services'][service]['environment']
     assert settings['TELEGRAM_OWNER_USER_ID'] == '42' and settings['TELEGRAM_ALLOWED_USER_IDS'] == '77,88'

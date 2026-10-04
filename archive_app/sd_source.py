@@ -3,7 +3,7 @@
 The native protocol uses a separately supplied, architecture-matching official
 HCNetSDK. ISAPI is used only when the device returns a genuine CMSearchResult.
 Neither an open TCP port nor the camera's model name establishes compatibility.
-Only finished downloads enter Archive's existing remux/decode/upload pipeline.
+Only finished downloads enter Archive's stream-copy/remux/upload pipeline.
 """
 from __future__ import annotations
 
@@ -533,7 +533,9 @@ class HCNetSDKSource:
         try:
             self.process.stdin.write((json.dumps(payload) + '\n').encode())
             self.process.stdin.flush()
-            remaining = min(timeout, self.deadline - time.monotonic())
+            # Bound each SDK operation, not the wall-clock lifetime of a
+            # healthy batch (which also includes remux and Telegram waits).
+            remaining = min(timeout, self.timeout)
             if remaining <= 0:
                 raise queue.Empty
             raw = self.inbox.get(timeout=remaining)
@@ -595,7 +597,6 @@ class HCNetSDKSource:
                                             bufsize=0, cwd=str(Path(__file__).resolve().parents[1]), env=environment)
         except OSError:
             raise SDSourceError('sd_native_worker_failed', 'Native SD helper did not start.') from None
-        self.deadline = time.monotonic() + self.timeout
         self.reader = threading.Thread(target=self._reader, daemon=True)
         self.reader.start()
         try:
@@ -720,7 +721,8 @@ class SDSource:
         if type(channel) is not int or not 1 <= channel <= 9999 or backend not in ('auto', 'isapi', 'hcnetsdk'):
             raise SDSourceError('sd_config_invalid', 'Invalid camera SD backend/channel.')
         zone = get_zone(config.get('sd_timezone', config.get('timezone', self.archive.settings.timezone)))
-        max_bytes = min(MAX_NATIVE_FILE, self.archive.settings.cache_max_bytes // 2)
+        reserve_factor = 3 if self.archive.settings.media_mode == 'remux_copy' else 2
+        max_bytes = min(MAX_NATIVE_FILE, self.archive.settings.cache_max_bytes // reserve_factor)
         if max_bytes <= 0:
             raise SDSourceError('sd_cache_budget', 'Cache budget is too small for SD staging.')
         common = (address, username, password, channel, zone, max_bytes)
@@ -773,14 +775,24 @@ class SDSource:
         start, end = now - timedelta(hours=hours), now - timedelta(seconds=SETTLE_SECONDS)
         provider = self._provider()
         statistics = {'backend': provider.backend, 'searched': 0, 'downloaded': 0,
-                      'imported': 0, 'already_known': 0, 'deferred': 0, 'backlog': 0}
-        def notify(phase):
-            if progress is not None:
+                      'imported': 0, 'already_known': 0, 'deferred': 0, 'backlog': 0,
+                      'connect_seconds': 0.0, 'search_seconds': 0.0,
+                      'download_seconds': 0.0, 'ingest_seconds': 0.0, 'download_bytes': 0}
+        last_notification = None
+        def notify(phase, *, force=True):
+            nonlocal last_notification
+            clock = time.monotonic()
+            if progress is not None and (force or last_notification is None or clock-last_notification >= 1):
                 progress(dict(statistics, phase=phase))
+                last_notification = time.monotonic()
+        started = time.monotonic()
         with provider:
+            statistics['connect_seconds'] = round(time.monotonic()-started, 6)
             notify('sd_search')
             try:
+                started = time.monotonic()
                 recordings = sorted(provider.search(start, end), key=lambda row: (parse_time(row['start_time']), row['record_id']))
+                statistics['search_seconds'] = round(time.monotonic()-started, 6)
             except SDSourceError as error:
                 if getattr(provider, 'native_sdk_missing', False) and error.code in ('sd_isapi_unsupported', 'sd_network_error'):
                     raise SDSourceError('sd_sdk_missing', 'ISAPI SD history did not respond; mount the architecture-matching official Linux HCNetSDK to use camera port 8000.') from None
@@ -795,7 +807,7 @@ class SDSource:
                 first, last = parse_time(recording['start_time']), parse_time(recording['end_time'])
                 if last > end or last <= first or first >= end or last <= start:
                     statistics['deferred'] += 1
-                    notify('sd_download')
+                    notify('sd_download', force=False)
                     continue
                 channel = self.config.get('sd_channel', self.config.get('channel', 1))
                 entry = {'camera': self.camera_id, 'source': 'camera-sd',
@@ -809,37 +821,49 @@ class SDSource:
                     if known['end_ms'] != int(last.timestamp() * 1000):
                         raise SDSourceError('sd_record_changed', 'Camera changed a closed recording interval; archived footage needs operator review.')
                     statistics['already_known'] += 1
-                    notify('sd_download')
+                    notify('sd_download', force=False)
                     continue
                 if statistics['downloaded'] >= max_files:
                     statistics['backlog'] += 1
-                    notify('sd_download')
+                    notify('sd_download', force=False)
                     continue
                 used = sum(path.stat().st_size for path in self.archive.settings.cache_dir.rglob('*') if path.is_file())
                 free = shutil.disk_usage(root).free
-                provider.max_bytes = min(MAX_NATIVE_FILE, (self.archive.settings.cache_max_bytes - used) // 2,
-                                         (free - self.archive.settings.min_free_bytes) // 2)
+                # One staged source plus the same worst-case MP4 reservation
+                # used by ingest. Reject before downloading, not after it.
+                reserve_factor = 3 if self.archive.settings.media_mode == 'remux_copy' else 2
+                provider.max_bytes = min(MAX_NATIVE_FILE, (self.archive.settings.cache_max_bytes - used) // reserve_factor,
+                                         (free - self.archive.settings.min_free_bytes) // reserve_factor)
                 estimate = max(1, recording.get('size', 0))
                 if provider.max_bytes <= 0:
                     raise SDSourceError('sd_cache_budget', 'SD staging cache budget reached; confirmed recordings remain intact.')
                 if estimate > provider.max_bytes:
                     raise SDSourceError('sd_size_limit', 'SD file exceeds the bounded native staging size; shorten camera recording segments.')
-                needed = estimate * 2  # Staged source and identical-byte cached copy.
+                needed = estimate * reserve_factor
                 if used + needed > self.archive.settings.cache_max_bytes or free - needed < self.archive.settings.min_free_bytes:
                     raise SDSourceError('sd_cache_budget', 'SD staging cache budget reached; confirmed recordings remain intact.')
                 partial = root / f'{key}.{uuid.uuid4().hex}.part'
                 complete = root / f'{key}.{uuid.uuid4().hex}.source'
                 try:
                     notify('sd_download')
+                    started = time.monotonic()
                     provider.download(recording, partial)
+                    statistics['download_seconds'] += round(time.monotonic()-started, 6)
+                    statistics['download_bytes'] += partial.stat().st_size
                     partial.replace(complete)
                     statistics['downloaded'] += 1
                     entry['path'] = str(complete)
+                    started = time.monotonic()
                     result = self.archive.ingest_download(entry, complete)
+                    statistics['ingest_seconds'] += round(time.monotonic()-started, 6)
                     if result.get('status') == 'camera_disabled':
                         statistics['deferred'] += 1
                         raise SDSourceError('camera_disabled', 'Camera was paused during SD sync; the download was not imported.')
                     statistics['imported'] += 1
+                    # Ingest has committed the independent managed artifact.
+                    # Release the SD staging copy before progress can block
+                    # in a Telegram upload; unconfirmed managed MP4 stays.
+                    complete.unlink()
                     notify('sd_download')
                 except SDSourceError:
                     raise
