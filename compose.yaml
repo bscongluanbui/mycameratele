@@ -32,15 +32,20 @@ services:
       TELEGRAM_PLAYER_PUBLIC_URL: ${TELEGRAM_PLAYER_PUBLIC_URL:-}
       TELEGRAM_API_BASE: ${TELEGRAM_API_BASE:-https://api.telegram.org}
       TELEGRAM_API_MODE: ${TELEGRAM_API_MODE:-cloud}
+      BOT_API_SPOOL_DIR: ${BOT_API_SPOOL_DIR:-}
+      BOT_API_SPOOL_MAX_GB: ${BOT_API_SPOOL_MAX_GB:-5}
       TELEGRAM_MAX_BYTES: ${TELEGRAM_MAX_BYTES:-50000000}
       ENABLE_UPLOAD: ${ENABLE_UPLOAD:-false}
       KEEP_CACHE: ${KEEP_CACHE:-false}
-      CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-1}
+      CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-0}
+      ERROR_RETENTION_HOURS: ${ERROR_RETENTION_HOURS:-72}
       SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-900}
       HCNETSDK_DIR: /opt/hcnetsdk
     volumes:
       - archive-state:/data
       - archive-cache:/cache
+      # Read only: worker checks admission; Bot API alone owns multipart files.
+      - bot-api-spool:/var/lib/telegram-bot-api-spool:ro
       - type: bind
         source: ${INPUT_HOST_DIR:-./input}
         target: /input
@@ -91,7 +96,8 @@ services:
       TELEGRAM_MAX_BYTES: ${TELEGRAM_MAX_BYTES:-50000000}
       ENABLE_UPLOAD: ${ENABLE_UPLOAD:-false}
       KEEP_CACHE: ${KEEP_CACHE:-false}
-      CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-1}
+      CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-0}
+      ERROR_RETENTION_HOURS: ${ERROR_RETENTION_HOURS:-72}
       SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-900}
       HCNETSDK_DIR: /opt/hcnetsdk
       DASHBOARD_COOKIE_SECURE: ${DASHBOARD_COOKIE_SECURE:-false}
@@ -124,8 +130,27 @@ services:
         max-size: 10m
         max-file: "3"
 
-  # Optional local Bot API; upload arrives as streamed multipart, not file://.
-  # Only the Bot API working-state volume is shared with its own restarts.
+  # Initialize only the new spool's root ownership, never persistent Bot API
+  # state. Published multiarch app image provides Python; no source build.
+  spool-init:
+    profiles: [local-api]
+    image: ${ARCHIVE_IMAGE:-ghcr.io/bscongluanbui/mycameratele:latest}
+    pull_policy: missing
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    restart: "no"
+    entrypoint: [python, -c]
+    command:
+      - "import os, stat; p='/spool'; s=os.lstat(p); assert stat.S_ISDIR(s.st_mode); os.chown(p,10001,10001,follow_symlinks=False); os.chmod(p,0o700)"
+    volumes:
+      - bot-api-spool:/spool
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt: [no-new-privileges:true]
+
+  # Local Bot API receives streamed multipart into a separate disk volume.
+  # The 5 GB worker admission budget is cooperative, not a filesystem quota.
   telegram-bot-api:
     profiles: [local-api]
     image: ${BOT_API_IMAGE:-ghcr.io/bscongluanbui/mycameratele-bot-api:latest}
@@ -139,11 +164,14 @@ services:
       - --local
       - --http-port=8081
       - --dir=/var/lib/telegram-bot-api
-      # Multipart uploads may approach 2 GB: spool to the existing disk volume,
-      # not the small /tmp RAM filesystem. Bot API owns temporary-file cleanup.
-      - --temp-dir=/var/lib/telegram-bot-api
+      # Bot API owns live-file cleanup. Never put large uploads in RAM /tmp.
+      - --temp-dir=/var/lib/telegram-bot-api-spool
     volumes:
       - bot-api-state:/var/lib/telegram-bot-api
+      - bot-api-spool:/var/lib/telegram-bot-api-spool
+    depends_on:
+      spool-init:
+        condition: service_completed_successfully
     expose:
       - "8081"
     read_only: true
@@ -170,3 +198,4 @@ volumes:
   archive-state:
   archive-cache:
   bot-api-state:
+  bot-api-spool:

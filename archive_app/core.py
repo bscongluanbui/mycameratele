@@ -88,8 +88,7 @@ class Settings:
     interval: int = 15
     owner_user_id: int = 0
     bot_username: str = ''
-    # Direct constructors retain the original immediate-cleanup behavior. The
-    # deployment environment defaults to a one-hour post-upload retention.
+    # Confirmed uploads default to immediate cleanup in all deployments.
     cache_retention_hours: float = 0.0
     # Raw-mode metadata probing is optional and disabled by default. MP4
     # stream-copy mode never invokes a probe or decode-validation process.
@@ -102,6 +101,9 @@ class Settings:
     media_mode: str = 'raw'
     player_public_url: str = ''
     bot_api_file_root: Path = Path('/var/lib/telegram-bot-api')
+    bot_api_spool_root: Path | None = None
+    bot_api_spool_max_bytes: int = 5000000000
+    error_retention_hours: float = 72.0
 
     @property
     def effective_owner(self):
@@ -145,9 +147,16 @@ class Settings:
             raise ValueError('TELEGRAM_STORAGE_CHANNEL_ID must be a negative numeric channel ID')
         channel = int(channel_value) if channel_value else 0
         if channel:destination='channel'
-        retention = float(os.environ.get('CACHE_RETENTION_HOURS', '1'))
+        retention = float(os.environ.get('CACHE_RETENTION_HOURS', '0'))
         if not math.isfinite(retention) or retention < 0:
             raise ValueError('CACHE_RETENTION_HOURS must be a nonnegative finite number')
+        error_retention = float(os.environ.get('ERROR_RETENTION_HOURS', '72'))
+        if not math.isfinite(error_retention) or error_retention <= 0:
+            raise ValueError('ERROR_RETENTION_HOURS must be a positive finite number')
+        spool_gb = float(os.environ.get('BOT_API_SPOOL_MAX_GB', '5'))
+        if not math.isfinite(spool_gb) or spool_gb <= 0:
+            raise ValueError('BOT_API_SPOOL_MAX_GB must be a positive finite number')
+        spool_path = os.environ.get('BOT_API_SPOOL_DIR', '').strip()
         media_mode = os.environ.get('MEDIA_MODE', 'raw').strip().lower()
         if media_mode not in ('raw', 'remux_copy'):
             raise ValueError('MEDIA_MODE must be raw or remux_copy')
@@ -166,11 +175,14 @@ class Settings:
             int(float(os.environ.get('CACHE_MIN_FREE_GB', '5')) * 1e9),
             max(1, int(os.environ.get('SCAN_INTERVAL_SECONDS', '15'))),
             owner, username, retention,
-            os.environ.get('PASSTHROUGH_PROBE_METADATA', 'false').lower() == 'true',
+            error_retention_hours=error_retention,
+            passthrough_probe=os.environ.get('PASSTHROUGH_PROBE_METADATA', 'false').lower() == 'true',
             tenant_id=tenant, telegram_destination=destination, storage_channel_id=channel,
             media_mode=media_mode,
             player_public_url=os.environ.get('TELEGRAM_PLAYER_PUBLIC_URL', '').strip().rstrip('/'),
             bot_api_file_root=Path(os.environ.get('TELEGRAM_BOT_API_FILE_ROOT', '/var/lib/telegram-bot-api')),
+            bot_api_spool_root=Path(spool_path) if spool_path else None,
+            bot_api_spool_max_bytes=int(spool_gb * 1e9),
         )
         get_zone(result.timezone)
         limit = 2000000000 if mode == 'local' else 50000000
@@ -446,6 +458,8 @@ class Archive:
             columns = {row[1] for row in self.conn.execute('PRAGMA table_info(recordings)')}
             for name, kind in (('file_unique_id', 'TEXT'), ('media_type', 'TEXT'),
                                ('bot_id', 'INTEGER'), ('uploaded_at', 'REAL'), ('cleaned_at', 'REAL'),
+                               ('error_started_at', 'REAL'), ('media_expired_at', 'REAL'),
+                               ('cleanup_revision', 'INTEGER NOT NULL DEFAULT 0'),
                                ('deleted_at', 'REAL'), ('deleted_by', 'INTEGER'),
                                ('processing_method', "TEXT NOT NULL DEFAULT 'legacy'"),
                                ('media_container', 'TEXT'), ('media_probe_status', 'TEXT'),
@@ -471,6 +485,23 @@ class Archive:
                 ON recordings(status,deleted_at,start_ms,end_ms,camera)''')
             self.conn.execute('''CREATE INDEX IF NOT EXISTS by_camera_pipeline
                 ON recordings(camera,status,deleted_at,retry_at)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS by_camera_pipeline_v2
+                ON recordings(camera,status,deleted_at,retry_at,media_expired_at)''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS by_error_expiry
+                ON recordings(status,media_expired_at,error_started_at)''')
+            # Historical errors have no reliable first-failure timestamp.
+            # Give them the full retention window from this upgrade, once.
+            self.conn.execute("""UPDATE recordings SET error_started_at=?
+                WHERE status IN ('failed','needs_review','upload_unknown')
+                AND error_started_at IS NULL""", (time.time(),))
+            self.conn.execute('''CREATE TRIGGER IF NOT EXISTS record_first_error_insert
+                AFTER INSERT ON recordings
+                WHEN NEW.status IN ('failed','needs_review','upload_unknown') AND NEW.error_started_at IS NULL
+                BEGIN UPDATE recordings SET error_started_at=CAST(strftime('%s','now') AS REAL) WHERE key=NEW.key; END''')
+            self.conn.execute('''CREATE TRIGGER IF NOT EXISTS record_first_error_update
+                AFTER UPDATE OF status ON recordings
+                WHEN NEW.status IN ('failed','needs_review','upload_unknown') AND NEW.error_started_at IS NULL
+                BEGIN UPDATE recordings SET error_started_at=CAST(strftime('%s','now') AS REAL) WHERE key=NEW.key; END''')
             # Old rows have no known upload timestamp. Start their retention
             # clock at the first migration rather than deleting them early.
             self.conn.execute("INSERT OR IGNORE INTO state(name,value) VALUES('cleanup_legacy_hold_since',?)", (str(time.time()),))
@@ -833,8 +864,14 @@ class Archive:
         if end <= start:
             raise ValueError('end_time must be greater than start_time')
         if end-start>timedelta(days=7):raise ValueError('Recording interval exceeds seven days')
-        source = resolve_input(entry['path'], self.settings.input_dir) if downloaded_source is None else downloaded_source
         start_ms, end_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
+        expired = self.conn.execute('SELECT * FROM recordings WHERE key=? AND media_expired_at IS NOT NULL', (key,)).fetchone()
+        if expired is not None and not dry_run:
+            if (expired['start_ms'] != start_ms or expired['end_ms'] != end_ms
+                    or expired['camera'] != entry['camera']):
+                raise ValueError('Expired recording identity changed; operator review required')
+            return dict(expired, record_key=key)
+        source = resolve_input(entry['path'], self.settings.input_dir) if downloaded_source is None else downloaded_source
         if dry_run:
             return {'key': key, 'record_key': key, 'camera': entry['camera'], 'status': 'validated', 'source_bytes': source.stat().st_size}
         with self.conn:
@@ -845,7 +882,7 @@ class Archive:
         if old:
             if old['start_ms'] != start_ms or old['camera'] != entry['camera']:
                 raise ValueError('Stable record_id collision; do not merge different recording')
-            if old['status'] in ('downloaded', 'uploading', 'upload_unknown', 'uploaded', 'needs_review'):
+            if old['media_expired_at'] is not None or old['status'] in ('downloaded', 'uploading', 'upload_unknown', 'uploaded', 'needs_review'):
                 # Closed clips are immutable after ingest; avoid changing archived time retroactively.
                 if old['end_ms'] != end_ms:
                     raise ValueError('Closed recording end_time changed; operator review required')
@@ -951,7 +988,7 @@ class Archive:
             raise ValueError('Invalid camera filter')
         self.conn.execute('BEGIN IMMEDIATE')
         try:
-            sql="SELECT r.* FROM recordings r JOIN cameras c ON c.id=r.camera WHERE r.status='downloaded' AND r.deleted_at IS NULL AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"
+            sql="SELECT r.* FROM recordings r JOIN cameras c ON c.id=r.camera WHERE r.status='downloaded' AND r.media_expired_at IS NULL AND r.deleted_at IS NULL AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"
             params=[time.time()]
             if camera is not None:sql+=' AND r.camera=?';params.append(camera)
             row = self.conn.execute(sql+' ORDER BY r.start_ms,r.key LIMIT 1',params).fetchone()
@@ -1030,7 +1067,7 @@ class Archive:
         current_modes = ('remux_copy',) if self.settings.media_mode == 'remux_copy' else ('passthrough', 'remux_copy')
         placeholders = ','.join('?' for _ in current_modes)
         sql = f"""UPDATE recordings SET status='failed',last_error='raw_reingest_required'
-            WHERE processing_method NOT IN ({placeholders}) AND status IN ('downloaded','failed')
+            WHERE processing_method NOT IN ({placeholders}) AND status IN ('downloaded','failed') AND media_expired_at IS NULL
             AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL
             AND COALESCE(last_error,'')!='raw_reingest_required'"""
         values = list(current_modes)
@@ -1054,7 +1091,7 @@ class Archive:
             raise ValueError('Invalid pending remux batch size')
         if self.settings.media_mode != 'remux_copy':
             return result
-        where = """processing_method='passthrough' AND status IN ('downloaded','failed')
+        where = """processing_method='passthrough' AND status IN ('downloaded','failed') AND media_expired_at IS NULL
             AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL
             AND local_path IS NOT NULL AND local_path!=''"""
         values = []
@@ -1107,33 +1144,103 @@ class Archive:
                 result['failed'] += 1
         return result
 
-    def cleanup(self, key):
-        row = self.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone()
-        if self.settings.keep_cache or row is None or row['cleaned_at'] is not None or row['status'] != 'uploaded' or not all(row[n] for n in ('chat_id','message_id','file_id')):
-            return False
-        retention = self.settings.cache_retention_hours
-        if not math.isfinite(retention) or retention < 0:
-            raise ValueError('Invalid cache retention')
-        now = time.time()
-        if retention:
-            start = row['uploaded_at']
-            if start is None:
-                start = self.state('cleanup_legacy_hold_since')
-            try:
-                start = float(start)
-            except (ValueError, TypeError):
-                return False
-            if not math.isfinite(start) or now - start < retention * 3600:
-                return False
+    def _managed_media_paths(self, row):
+        """One recording's generated files only; never input originals or SD."""
+        key = row['key']
+        if not re.fullmatch(r'[a-f0-9]{64}', key):
+            raise ValueError('Invalid managed recording key')
+        if self.settings.cache_dir.resolve() != self._cache_root:
+            raise ValueError('Cache directory changed')
+        paths = []
         if row['local_path']:
-            path = _confined_path(row['local_path'], self._cache_root, allow_missing=True)
-            if path.exists():
-                path.unlink()
-        # Keep the archive status and Telegram metadata available after cache
-        # removal. A crash after unlink is reconciled by the next cleanup run.
-        with self.conn:
-            self.conn.execute('UPDATE recordings SET cleaned_at=COALESCE(cleaned_at,?) WHERE key=?', (now,key))
-        return True
+            paths.append(_confined_path(row['local_path'], self._cache_root, allow_missing=True))
+        generated = re.compile(re.escape(key) + r'\.(?:part\.)?[a-z0-9]{1,10}')
+        for path in self._cache_root.glob(key + '.*'):
+            if generated.fullmatch(path.name):
+                paths.append(_confined_path(path, self._cache_root, allow_missing=True))
+        camera = row['camera']
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', camera):
+            raise ValueError('Invalid managed camera ID')
+        stage = self._cache_root / 'sd-stage' / camera
+        for directory in (stage.parent, stage):
+            if _is_link(directory) or (directory.exists() and not directory.is_dir()):
+                raise ValueError('Invalid managed staging directory')
+        if stage.exists():
+            staged = re.compile(re.escape(key) + r'\.[a-f0-9]{32}\.(?:part|source)')
+            for path in stage.glob(key + '.*'):
+                if staged.fullmatch(path.name):
+                    paths.append(_confined_path(path, self._cache_root, allow_missing=True))
+        # Validate every candidate before the first unlink. Repeated paths are
+        # harmless, but a stale cleaned_at must not hide PS/TS/staging siblings.
+        return list(dict.fromkeys(paths))
+
+    def cleanup(self, key):
+        self.conn.execute('BEGIN IMMEDIATE')
+        try:
+            row = self.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone()
+            if (self.settings.keep_cache or row is None or row['status'] != 'uploaded'
+                    or not all(row[n] for n in ('chat_id','message_id','file_id'))):
+                self.conn.commit()
+                return False
+            retention = self.settings.cache_retention_hours
+            if not math.isfinite(retention) or retention < 0:
+                raise ValueError('Invalid cache retention')
+            now = time.time()
+            if retention:
+                start = row['uploaded_at'] or self.state('cleanup_legacy_hold_since')
+                try:
+                    start = float(start)
+                except (ValueError, TypeError):
+                    self.conn.commit()
+                    return False
+                if not math.isfinite(start) or now-start < retention*3600:
+                    self.conn.commit()
+                    return False
+            paths = self._managed_media_paths(row)
+            existing = [path for path in paths if path.exists()]
+            for path in existing:
+                path.unlink(missing_ok=True)
+            changed = bool(existing) or row['cleaned_at'] is None
+            self.conn.execute('UPDATE recordings SET cleaned_at=COALESCE(cleaned_at,?),cleanup_revision=1 WHERE key=?', (now,key))
+            self.conn.commit()
+            return changed
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def expire_error_media(self, now=None, limit=100):
+        """Expire terminal-error media, retaining identity/status/Telegram IDs."""
+        now = time.time() if now is None else now
+        hours = self.settings.error_retention_hours
+        if (not math.isfinite(now) or not math.isfinite(hours) or hours <= 0
+                or type(limit) is not int or not 1 <= limit <= 1000):
+            raise ValueError('Invalid error media retention')
+        cutoff = now-hours*3600
+        self.conn.execute('BEGIN IMMEDIATE')
+        try:
+            rows = self.conn.execute("""SELECT * FROM recordings
+                WHERE status IN ('failed','needs_review','upload_unknown')
+                AND ((media_expired_at IS NULL AND error_started_at<=?)
+                    OR (media_expired_at IS NOT NULL AND cleanup_revision<1))
+                ORDER BY error_started_at,key LIMIT ?""", (cutoff,limit)).fetchall()
+            # No active upload/ingest enters this transaction; retaining the
+            # tombstone prevents SD/manifest scans from recreating expired data.
+            plans = [(row,self._managed_media_paths(row)) for row in rows]
+            for row,_ in plans:
+                # Commit expiry BEFORE filesystem mutation. A crash or unlink
+                # error can never roll back the tombstone and cause re-download.
+                self.conn.execute('UPDATE recordings SET media_expired_at=COALESCE(media_expired_at,?) WHERE key=?', (now,row['key']))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        for row,paths in plans:
+            for path in paths:
+                path.unlink(missing_ok=True)
+            with self.conn:
+                self.conn.execute('''UPDATE recordings SET cleaned_at=COALESCE(cleaned_at,?),
+                    cleanup_revision=1 WHERE key=? AND media_expired_at IS NOT NULL''', (now,row['key']))
+        return len(rows)
 
     @contextmanager
     def _backup_lock(self, root):
@@ -1255,7 +1362,9 @@ class Archive:
                 'owner_configured':bool(self.settings.effective_owner),
                 'owner_started':bool(self.settings.effective_owner) and self.state(f'telegram_owner_started:{self.settings.effective_owner}')=='1',
                 'allowed_users_count':len(set(self.settings.allowed_users) | ({self.settings.effective_owner} if self.settings.effective_owner else set())),
-                'cache_retention_hours':self.settings.cache_retention_hours,'api_mode':self.settings.api_mode,
+                  'cache_retention_hours':self.settings.cache_retention_hours,
+                  'error_retention_hours':self.settings.error_retention_hours,
+                  'bot_api_spool_max_bytes':self.settings.bot_api_spool_max_bytes,'api_mode':self.settings.api_mode,
                 'version':'2.4','counts':{'cameras':self.conn.execute('SELECT COUNT(*) FROM cameras').fetchone()[0],
                 'recordings':self.conn.execute('SELECT COUNT(*) FROM recordings WHERE deleted_at IS NULL').fetchone()[0],
                 'uploaded':self.conn.execute("SELECT COUNT(*) FROM recordings WHERE status='uploaded' AND deleted_at IS NULL").fetchone()[0],

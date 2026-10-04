@@ -84,7 +84,7 @@ def main():
             emit('backup',result='created' if path else 'already_exists_today',retention_days=7);return 0
         if args.command=='retry-oversize':
             row=archive.conn.execute('SELECT * FROM recordings WHERE key=?',(args.key,)).fetchone()
-            if row is None or row['status']!='needs_review' or row['last_error']!='missing_or_oversize_file' or row['file_id']:
+            if row is None or row['media_expired_at'] is not None or row['status']!='needs_review' or row['last_error']!='missing_or_oversize_file' or row['file_id']:
                 raise ValueError('Only an unposted missing/oversize recording may be requeued explicitly')
             path=Path(row['local_path']).resolve(strict=True)
             if not path.is_relative_to(settings.cache_dir.resolve()) or not path.is_file() or not 0<path.stat().st_size<=settings.max_bytes:
@@ -114,6 +114,10 @@ def main():
         from .sd_source import recover_staging
         recovered=recover_staging(archive)
         if recovered:emit('sd_staging_recovered',files=recovered)
+        try:
+            expired=archive.expire_error_media()
+            if expired:emit('error_media_expired',files=expired,retention_hours=settings.error_retention_hours)
+        except Exception as exc:emit('error_media_cleanup_error',error_type=type(exc).__name__)
         sync=SyncQueue(archive)
         sync.recover()  # The exclusive worker lock above prevents two runners.
         sync_interval=int(os.environ.get('SD_SYNC_INTERVAL_SECONDS','900'))
@@ -183,9 +187,13 @@ def main():
                 if result:emit('upload',status=result)
             except Exception as exc:emit('telegram_error',error_type=type(exc).__name__)
             if not settings.keep_cache:
-                for row in archive.conn.execute("SELECT key FROM recordings WHERE status='uploaded' AND cleaned_at IS NULL").fetchall():
+                for row in archive.conn.execute("SELECT key FROM recordings WHERE status='uploaded' AND (cleaned_at IS NULL OR cleanup_revision<1)").fetchall():
                     try:archive.cleanup(row[0])
                     except Exception as exc:emit('cleanup_error',error_type=type(exc).__name__)
+            try:
+                expired=archive.expire_error_media()
+                if expired:emit('error_media_expired',files=expired,retention_hours=settings.error_retention_hours)
+            except Exception as exc:emit('error_media_cleanup_error',error_type=type(exc).__name__)
             for _ in range(settings.interval):
                 if not running:break
                 if archive.conn.execute("SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1").fetchone():break

@@ -814,10 +814,10 @@ class SDSource:
                          'record_id': f'ch{channel}:{_utc(first)}', 'start_time': first.isoformat(),
                          'end_time': last.isoformat()}
                 key = record_key(entry)
-                known = self.archive.conn.execute('SELECT status,deleted_at,start_ms,end_ms FROM recordings WHERE key=?', (key,)).fetchone()
+                known = self.archive.conn.execute('SELECT status,deleted_at,start_ms,end_ms,media_expired_at FROM recordings WHERE key=?', (key,)).fetchone()
                 # Never re-fetch uploaded/uncertain/trashed recordings. Failed
                 # media validation is retried on a later explicitly queued scan.
-                if known is not None and (known['deleted_at'] is not None or known['status'] not in ('failed', 'ingesting')):
+                if known is not None and (known['media_expired_at'] is not None or known['deleted_at'] is not None or known['status'] not in ('failed', 'ingesting')):
                     if known['end_ms'] != int(last.timestamp() * 1000):
                         raise SDSourceError('sd_record_changed', 'Camera changed a closed recording interval; archived footage needs operator review.')
                     statistics['already_known'] += 1

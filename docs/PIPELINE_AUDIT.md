@@ -18,8 +18,10 @@
 immediately; `1` retains them for one hour. Unconfirmed and review files are
 retained. Bot API's internal files are separately owned by Telegram's server;
 archive cleanup does not delete its session/database or claim to clear all of
-its caches. Its multipart spool uses the disk-backed `bot-api-state` volume,
-not the 256 MiB `/tmp` RAM filesystem. Budget disk for both volumes.
+its caches. Its multipart spool now uses a separate disk-backed `bot-api-spool`
+volume with a 5 GB cooperative admission budget, not the 256 MiB `/tmp` RAM
+filesystem. Terminal-error media now expires after 72 hours; the catalog stays.
+See [cache retention](CACHE_RETENTION.md) for the current policy.
 
 ## Changes from the audit
 

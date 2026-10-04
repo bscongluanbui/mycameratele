@@ -12,6 +12,7 @@ from datetime import datetime
 
 from .core import get_zone,from_epoch_ms
 from .telegram_menu import TimeMenus
+from .upload_spool import check_upload_spool, SpoolBudgetError
 
 
 class ApiRejected(Exception):
@@ -370,6 +371,15 @@ class Telegram:
             with archive.conn:
                 archive.conn.execute("UPDATE recordings SET status='needs_review',last_error='mp4_remux_required' WHERE key=?", (row['key'],))
             return 'needs_review'
+        try:
+            check_upload_spool(self.settings, path.stat().st_size)
+        except (SpoolBudgetError, OSError):
+            # Capacity was rejected before POST: this is a known unsent upload,
+            # not an ambiguous Telegram delivery. Retain source and retry later.
+            with archive.conn:
+                archive.conn.execute("UPDATE recordings SET status='downloaded',retry_at=?,last_error='upload_spool_budget' WHERE key=? AND status='uploading'",
+                                     (time.time()+60, row['key']))
+            return 'upload_spool_budget'
         caption = self.caption(archive, row)
         # Preserve raw bytes: do not request Telegram's video processing path.
         video = row.get('processing_method') == 'remux_copy' and path.suffix.lower() == '.mp4'

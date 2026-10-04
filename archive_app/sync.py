@@ -21,7 +21,7 @@ def _statistics():
             'uploaded': 0, 'failed': 0, 'ready': 0, 'pending': 0, 'remuxed': 0, 'remux_failed': 0,
             'remux_budget_blocked': 0,
             'needs_review': 0, 'upload_unknown': 0, 'deleted': 0,
-            'failed_records': 0, 'probe_tcp_open': 0, 'probe_error_type': None,
+            'failed_records': 0, 'expired': 0, 'spool_blocked': 0, 'probe_tcp_open': 0, 'probe_error_type': None,
             'sd_backend': None, 'sd_searched': 0, 'sd_downloaded': 0, 'sd_deferred': 0,
             'sd_backlog': 0, 'sd_error_code': None,
             'sd_connect_seconds': 0.0, 'sd_search_seconds': 0.0,
@@ -183,15 +183,16 @@ class SyncQueue:
     def _counts(self, slug, statistics):
         now = time.time()
         row = self.conn.execute('''SELECT count(*) AS total,
-            count(CASE WHEN deleted_at IS NULL AND status='downloaded' AND coalesce(retry_at,0)<=? THEN 1 END) AS ready,
-            count(CASE WHEN deleted_at IS NULL AND status!='uploaded' THEN 1 END) AS pending,
-            count(CASE WHEN deleted_at IS NULL AND status='needs_review' THEN 1 END) AS needs_review,
-            count(CASE WHEN deleted_at IS NULL AND status IN ('upload_unknown','uploading') THEN 1 END) AS upload_unknown,
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status='downloaded' AND coalesce(retry_at,0)<=? THEN 1 END) AS ready,
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status!='uploaded' THEN 1 END) AS pending,
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status='needs_review' THEN 1 END) AS needs_review,
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status IN ('upload_unknown','uploading') THEN 1 END) AS upload_unknown,
             count(CASE WHEN deleted_at IS NOT NULL THEN 1 END) AS deleted,
-            count(CASE WHEN deleted_at IS NULL AND status IN ('failed','ingesting') THEN 1 END) AS failed_records,
-            count(CASE WHEN deleted_at IS NULL AND status='downloaded' AND coalesce(retry_at,0)>? THEN 1 END) AS delayed
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status IN ('failed','ingesting') THEN 1 END) AS failed_records,
+            count(CASE WHEN media_expired_at IS NOT NULL AND status!='uploaded' THEN 1 END) AS expired,
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status='downloaded' AND coalesce(retry_at,0)>? THEN 1 END) AS delayed
             FROM recordings WHERE camera=?''', (now,now,slug)).fetchone()
-        for field in ('ready','pending','needs_review','upload_unknown','deleted','failed_records'):
+        for field in ('ready','pending','needs_review','upload_unknown','deleted','failed_records','expired'):
             statistics[field] = row[field]
         return row['total'], row['delayed']
 
@@ -283,6 +284,9 @@ class SyncQueue:
             finally:
                 statistics['upload_seconds']+=round(time.monotonic()-started,6)
             if result=='uploaded':statistics['uploaded']+=1
+            elif result=='upload_spool_budget':
+                statistics['spool_blocked']=1
+                upload_paused=True
             elif result is not None:upload_paused=True
             return result
         if self.archive.settings.media_mode=='remux_copy':
@@ -365,7 +369,9 @@ class SyncQueue:
                 continue
             statistics['matched'] += len(results)
             for result in results:
-                if result['status'] == 'failed':
+                if result.get('media_expired_at') is not None:
+                    statistics['already_known'] += 1
+                elif result['status'] == 'failed':
                     statistics['failed'] += 1
                     scan_errors.append(result.get('error_type', 'Error'))
                 elif result.get('key') in existing:
@@ -422,6 +428,8 @@ class SyncQueue:
             self._finish(job, statistics, 'blocked', 'remux_cache_budget', 'Cache cần thêm dung lượng để chuyển container MP4; file nguồn vẫn được giữ')
         elif statistics['failed_records']:
             self._finish(job, statistics, 'blocked', 'needs_review', 'Có video cần kiểm tra nguồn hoặc trạng thái Telegram trước khi xử lý tiếp')
+        elif statistics['spool_blocked'] or self.conn.execute("SELECT 1 FROM recordings WHERE camera=? AND status='downloaded' AND deleted_at IS NULL AND media_expired_at IS NULL AND last_error='upload_spool_budget' AND retry_at>? LIMIT 1",(slug,time.time())).fetchone():
+            self._finish(job, statistics, 'blocked', 'upload_spool_budget', 'Vùng tạm upload cần dung lượng; giữ video và thử lại sau')
         elif delayed:
             self._finish(job, statistics, 'blocked', 'rate_limited', 'Telegram đang giới hạn tốc độ; video được giữ để thử sau thời gian retry')
         elif statistics['ready'] and statistics['uploaded'] >= MAX_UPLOADS_PER_JOB:

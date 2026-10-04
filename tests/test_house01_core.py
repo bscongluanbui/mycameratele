@@ -18,7 +18,7 @@ class House01SettingsTests(unittest.TestCase):
                     TELEGRAM_BOT_TOKEN='synthetic-token',ENABLE_UPLOAD='true')
         self.assertEqual(s.telegram_destination,'channel')
         self.assertEqual(s.storage_channel_id,0)
-        self.assertEqual(s.cache_retention_hours,1)
+        self.assertEqual(s.cache_retention_hours,0)
 
     def test_negative_channel_forces_channel_mode_without_replacing_owner(self):
         s=self.load(TELEGRAM_STORAGE_CHANNEL_ID='-100123456',TELEGRAM_OWNER_USER_ID='42')
