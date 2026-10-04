@@ -132,6 +132,7 @@ class DashboardAuthHTTPTests(AuthFixture):
         self.settings.input_dir.mkdir()
         with patch.dict(os.environ, {'DASHBOARD_COOKIE_SECURE': 'false'}):
             self.server = DashboardServer(('127.0.0.1', 0), self.settings, token='obsolete-token-never-authorizes')
+        self.server.daemon_threads = False
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': 0.02}, daemon=True)
         self.thread.start()
         self.cookie = ''
@@ -145,18 +146,18 @@ class DashboardAuthHTTPTests(AuthFixture):
 
     def request(self, method, path, body=None, headers=None, server=None):
         server = server or self.server
-        conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=15)
-        supplied = {'Cookie': self.cookie, 'X-CSRF-Token': self.csrf, **(headers or {})}
-        if body is not None:
-            supplied['Content-Type'] = 'application/json'
-            body = json.dumps(body, ensure_ascii=True).encode()
-        conn.request(method, path, body=body, headers=supplied)
-        response = conn.getresponse()
-        raw = response.read()
-        content = json.loads(raw) if response.getheader('Content-Type', '').startswith('application/json') else raw
-        result = response.status, content, dict(response.getheaders())
-        conn.close()
-        return result
+        # Real password hashes are deliberately retained; QEMU builders can
+        # take longer than native CPUs when several platforms run together.
+        with closing(http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=120)) as conn:
+            supplied = {'Cookie': self.cookie, 'X-CSRF-Token': self.csrf, **(headers or {})}
+            if body is not None:
+                supplied['Content-Type'] = 'application/json'
+                body = json.dumps(body, ensure_ascii=True).encode()
+            conn.request(method, path, body=body, headers=supplied)
+            response = conn.getresponse()
+            raw = response.read()
+            content = json.loads(raw) if response.getheader('Content-Type', '').startswith('application/json') else raw
+            return response.status, content, dict(response.getheaders())
 
     def login(self, username='admin', password='admin'):
         result = self.request('POST', '/api/login', {'username': username, 'password': password})
@@ -221,6 +222,7 @@ class DashboardAuthHTTPTests(AuthFixture):
 
     def test_change_credentials_revokes_sessions_in_other_dashboard_instance(self):
         other = DashboardServer(('127.0.0.1', 0), self.settings)
+        other.daemon_threads = False
         thread = threading.Thread(target=other.serve_forever, kwargs={'poll_interval': 0.02}, daemon=True)
         thread.start()
         try:
