@@ -35,12 +35,12 @@ class TimeMenus:
     def shortcuts():
         """Fresh inline-keyboard rows, suitable for /start and archive menus."""
         return [
-            [{'text': '📅 Hôm nay', 'callback_data': 'today'}],
-            [{'text': '📆 Hôm qua', 'callback_data': 'yesterday'}],
-            [{'text': '🕕 6 giờ trước', 'callback_data': 'last6h'}],
-            [{'text': '🗓 Tuần này', 'callback_data': 'thisweek'}],
-            [{'text': '📆 Tuần trước', 'callback_data': 'lastweek'}],
-            [{'text': '🗓 Tùy chọn thời gian', 'callback_data': 'custom-time'}],
+            [TimeMenus._button('📅 Hôm nay', 'today', green=True)],
+            [TimeMenus._button('📆 Hôm qua', 'yesterday', green=True)],
+            [TimeMenus._button('🕕 6 giờ trước', 'last6h', green=True)],
+            [TimeMenus._button('🗓 Tuần này', 'thisweek', green=True)],
+            [TimeMenus._button('📆 Tuần trước', 'lastweek', green=True)],
+            [TimeMenus._button('🗓 Tùy chọn thời gian', 'custom-time', green=True)],
         ]
 
     @staticmethod
@@ -62,11 +62,15 @@ class TimeMenus:
         ]
 
     @staticmethod
-    def _button(text, callback):
+    def _button(text, callback, *, green=False):
         # Telegram accepts 1–64 UTF-8 bytes, not 64 Unicode characters.
         if not 1 <= len(callback.encode('utf-8')) <= 64:
             raise ValueError('Time-menu callback is too long')
-        return {'text': text, 'callback_data': callback}
+        button = {'text': text, 'callback_data': callback}
+        # Native Bot API style: Telegram renders the green background itself.
+        if green:
+            button['style'] = 'success'
+        return button
 
     @staticmethod
     def _camera_callback(kind, anchor, order, page):
@@ -311,7 +315,7 @@ class TimeMenus:
             token = self.telegram.camera_token(camera['id'])
             buttons.append([self._button(
                 f"{camera['name']} ({camera['count']} video)",
-                self._clip_callback(kind, anchor, token, order, 0, page))])
+                self._clip_callback(kind, anchor, token, order, 0, page), green=True)])
         nav = []
         if page:
             nav.append(self._button('← Camera', self._camera_callback(kind, anchor, order, page - 1)))

@@ -638,6 +638,9 @@ class Telegram:
                             [{'text':'🕐 Video gần đây','callback_data':'recent:0'}],
                             [{'text':'🗑 Thùng rác','callback_data':'trash:0'}],
                             [{'text':'⚙ Trạng thái','callback_data':'status'}]])
+            for line in buttons:
+                for button in line:
+                    button['style'] = 'success'
             return '📹 Camera · Menu',buttons
         if data in ('today','yesterday','last6h','thisweek','lastweek','custom-time') or data.startswith(('w:','wc:','wq:','wqc:')):
             return TimeMenus(self).menu(archive,data,actor=actor)
@@ -654,7 +657,7 @@ class Telegram:
             cameras = sorted(archive.cameras(), key=lambda c: (c['name'].casefold(), c['id']))
             if page < 0 or page > max(0, (len(cameras)-1)//10):
                 raise ValueError('Invalid camera page')
-            buttons = [[{'text':c['name'], 'callback_data':f"c:{self.camera_token(c['id'])}:asc"}]
+            buttons = [[{'text':c['name'], 'callback_data':f"c:{self.camera_token(c['id'])}:asc", 'style':'success'}]
                        for c in cameras[page*10:page*10+10]]
             nav = []
             if page:
@@ -835,7 +838,7 @@ class Telegram:
             rows = archive.list_day(pieces[1])
             cameras = sorted({r['camera'] for r in rows})
             # Stable compact slug digest avoids callbacks changing after a new camera arrives.
-            return pieces[1]+' — chọn camera', [[{'text':archive.camera_name(camera),'callback_data':f'p:{pieces[1]}:{hashlib.sha256(camera.encode()).hexdigest()[:12]}:0'}] for camera in cameras[:100]]
+            return pieces[1]+' — chọn camera', [[{'text':archive.camera_name(camera),'callback_data':f'p:{pieces[1]}:{hashlib.sha256(camera.encode()).hexdigest()[:12]}:0','style':'success'}] for camera in cameras[:100]]
         if pieces[0]=='p' and len(pieces)==4:
             day, camera_token, page = pieces[1],pieces[2],int(pieces[3])
             rows = archive.list_day(day)

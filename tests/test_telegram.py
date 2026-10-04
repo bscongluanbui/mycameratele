@@ -183,7 +183,7 @@ class TelegramTests(unittest.TestCase):
         key = self.ingest()
         self.confirm(key)
         _, root = self.telegram.menu(self.archive, "root")
-        self.assertEqual(root[0], [{"text": "Front_Camera", "callback_data": "c:"+self.telegram.camera_token("Front_Camera")+":asc"}])
+        self.assertEqual(root[0], [{"text": "Front_Camera", "callback_data": "c:"+self.telegram.camera_token("Front_Camera")+":asc", "style": "success"}])
         _, months = self.telegram.menu(self.archive, "y:2026")
         self.assertEqual(len(months), 12)
         self.assertEqual(months[9][0]["callback_data"], "m:2026-10")
