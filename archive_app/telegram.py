@@ -21,6 +21,11 @@ class ApiRejected(Exception):
         self.source_missing = code == 400 and isinstance(description, str) and description.lower() in (
             'bad request: message to copy not found', 'bad request: message not found',
             'bad request: message_id_invalid')
+        normalized=description.lower() if isinstance(description,str) else ''
+        self.not_modified=code==400 and normalized.startswith('bad request: message is not modified')
+        self.menu_uneditable=code==400 and normalized in (
+            'bad request: message to edit not found', "bad request: message can't be edited",
+            'bad request: message_id_invalid')
         super().__init__('Telegram API rejected request')
 
 
@@ -55,14 +60,83 @@ class Telegram:
                             [{'text':'📷 Camera'},{'text':'🕐 Video gần đây'},{'text':'🗑 Thùng rác'}],
                             [{'text':'⚙ Trạng thái'}]],'resize_keyboard':True,'is_persistent':True}
 
+    def _keyboard_state_key(self,actor):
+        return f'telegram_keyboard_removed_v1:{actor}:'+hashlib.sha256(self.settings.token.encode()).hexdigest()[:12]
+
     def ensure_keyboard(self, archive, actor, *, force=False):
-        """Install refreshed persistent actions once, including existing viewers."""
-        schema=json.dumps(self.reply_keyboard(),ensure_ascii=False,sort_keys=True,separators=(',',':'))
-        name=f'telegram_keyboard:{actor}:'+hashlib.sha256((self.settings.token+'\0'+schema).encode()).hexdigest()[:12]
-        if force or archive.state(name) != '1':
-            self.request('sendMessage',{'chat_id':actor,'text':'🏠 Menu',
-                                       'reply_markup':self.reply_keyboard(),'disable_notification':True})
+        """Retire the old persistent mother keyboard once per viewer/token."""
+        archive._archive_actor(actor)
+        name=self._keyboard_state_key(actor)
+        if archive.state(name) != '1':
+            sent=self.request('sendMessage',{'chat_id':actor,'text':'🏠 Menu',
+                                            'reply_markup':{'remove_keyboard':True},'disable_notification':True})
+            if not (isinstance(sent,dict) and type(sent.get('message_id')) is int and sent['message_id']>0):
+                raise RuntimeError('Keyboard removal was not confirmed')
             archive.state(name,'1')
+
+    def _menu_state_key(self,actor):
+        return f'telegram_active_menu_v1:{actor}:'+hashlib.sha256(self.settings.token.encode()).hexdigest()[:12]
+
+    def _active_menu(self,archive,actor):
+        raw=archive.state(self._menu_state_key(actor))
+        return int(raw) if isinstance(raw,str) and len(raw)<=10 and raw.isdecimal() and 0<int(raw)<=2147483647 else None
+
+    def _route_state_key(self,actor):
+        return self._menu_state_key(actor)+':route'
+
+    def _menu_route(self,archive,actor):
+        route=archive.state(self._route_state_key(actor))
+        return route if isinstance(route,str) and 1<=len(route.encode())<=64 else 'home'
+
+    def navigation_buttons(self,archive,actor,route,buttons):
+        """Return from action panels to their list, not the camera root."""
+        actions=('x:','xc:','u:','bw:','bwq:','bd:','bulk-','sync:','up:','ss:')
+        if isinstance(route,str) and route.startswith(actions):
+            buttons=[[dict(button) for button in line] for line in buttons]
+            for line in buttons:
+                for button in line:
+                    if (button.get('callback_data') in ('home','root') or
+                            'Quay lại' in button.get('text','') or button.get('text')=='↩ Camera'):
+                        button.update(text='↩ Quay lại',callback_data='nav-return')
+            if not any(b.get('callback_data')=='nav-return' for line in buttons for b in line):
+                buttons.append([{'text':'↩ Quay lại','callback_data':'nav-return'}])
+        return buttons
+
+    def remember_menu_route(self,archive,actor,route):
+        actions=('x:','xc:','u:','bw:','bwq:','bd:','bulk-','sync:','up:','ss:')
+        if (isinstance(route,str) and 1<=len(route.encode())<=64 and
+                not route.startswith(actions)):
+            archive.state(self._route_state_key(actor),route)
+
+    def present_menu(self,archive,chat_id,actor,text,buttons,*,message_id=None):
+        """Replace a screen in-place; retire only the confirmed prior keyboard."""
+        try:archive._archive_actor(actor)
+        except (PermissionError,ValueError,TypeError):raise ValueError('Viewer is not authorized') from None
+        if type(chat_id) is not int or chat_id!=actor:raise ValueError('Invalid private menu destination')
+        prior=self._active_menu(archive,actor)
+        target=message_id if type(message_id) is int and 0<message_id<=2147483647 else None
+        fields={'chat_id':chat_id,'text':text,'reply_markup':{'inline_keyboard':buttons}}
+        if target is not None:
+            try:
+                edited=self.request('editMessageText',{**fields,'message_id':target})
+                if not (edited is True or isinstance(edited,dict) and
+                        type(edited.get('message_id')) is int and edited['message_id']==target):
+                    raise RuntimeError('Menu edit was not confirmed')
+            except ApiRejected as exc:
+                if exc.not_modified:pass
+                elif exc.menu_uneditable:target=None
+                else:raise
+        if target is None:
+            sent=self.request('sendMessage',fields)
+            target=sent.get('message_id') if isinstance(sent,dict) else None
+            if type(target) is not int or not 0<target<=2147483647:
+                raise RuntimeError('Menu delivery was not confirmed')
+        archive.state(self._menu_state_key(actor),str(target))
+        if prior and prior!=target:
+            try:self.request('editMessageReplyMarkup',{'chat_id':chat_id,'message_id':prior,
+                                                     'reply_markup':{'inline_keyboard':[]}})
+            except Exception:pass # Retiring an old keyboard must not resend the current screen.
+        return target
 
     @staticmethod
     def recording_buttons(row, label):
@@ -538,14 +612,14 @@ class Telegram:
             nav.append({'text':'→','callback_data':f'recent:{page+1}'})
         if nav:
             buttons.append(nav)
-        buttons.append([{'text':'↩ Camera','callback_data':'root'}])
+        buttons.append([{'text':'↩ Quay lại','callback_data':'home'}])
         return f'Video gần đây | trang {page+1}',buttons
 
     def menu(self, archive, data='root', actor=None):
         # Camera IDs stay immutable; friendly names never enter callback_data.
         # Keep callback payloads compact even for a 64-character camera ID.
         if data == 'status':
-            return self.status_text(archive),[[{'text':'↩ Camera','callback_data':'root'}]]
+            return self.status_text(archive),[[{'text':'↩ Quay lại','callback_data':'home'}]]
         if data == 'home':
             buttons=TimeMenus.shortcuts()
             buttons.extend([[{'text':'📷 Camera / Kho video','callback_data':'root'}],
@@ -581,11 +655,7 @@ class Telegram:
                 buttons.append(nav)
             buttons.append([{'text':'▶ Start sync tất cả','callback_data':'sync:all'}])
             buttons.append([{'text':'📊 Tiến trình sync','callback_data':'ss:all'}])
-            buttons.extend(TimeMenus.shortcuts())
-            buttons.append([{'text':'🕐 Video gần đây','callback_data':'recent:0'}])
-            buttons.append([{'text':'🗑 Thùng rác','callback_data':'trash:0'}])
-            buttons.append([{'text':'⚙ Trạng thái','callback_data':'status'}])
-            buttons.append([{'text':'🏠 Menu','callback_data':'home'}])
+            buttons.append([{'text':'↩ Quay lại','callback_data':'home'}])
             return 'Chọn Camera' + ('' if cameras else ' (chưa có camera)'), buttons
         pieces = data.split(':')
         kind = pieces[0]
@@ -792,7 +862,7 @@ class Telegram:
         if page:nav.append({'text':'←','callback_data':f'trash:{page-1}'})
         if (page+1)*10<result['total']:nav.append({'text':'→','callback_data':f'trash:{page+1}'})
         if nav:buttons.append(nav)
-        buttons.append([{'text':'↩ Camera','callback_data':'root'}])
+        buttons.append([{'text':'↩ Quay lại','callback_data':'home'}])
         return f"Thùng rác kho chung | {result['total']} video | trang {page+1}",buttons
 
     def deletion_menu(self, archive, prefix, actor):
@@ -944,6 +1014,8 @@ class Telegram:
                 continue
             chat_id=message['chat']['id']
             refresh_keyboard=False
+            menu_message_id=message.get('message_id') if callback else None
+            menu_route=None
             previous=self._guarded_attempt(archive,update['update_id'])
             if previous.get('update_id')==update['update_id'] and previous.get('phase') in ('pending','unknown','done','rejected'):
                 # Crash after the POST but before its durable cursor commit.
@@ -960,6 +1032,7 @@ class Telegram:
             try:
                 try:
                     if callback:
+                        menu_route=callback['data']
                         try:self.request('answerCallbackQuery',{'callback_query_id':callback['id']})
                         except Exception:pass # ACK expiry/rate limiting does not cancel the action.
                         if callback['data'] != 'custom-time':
@@ -993,12 +1066,14 @@ class Telegram:
                             archive.restore_recording(row['key'],actor)
                             text,buttons=self.trash_menu(archive)
                             text='Đã khôi phục video.\n'+text
-                        elif callback['data']=='cancel-delete':
+                        elif callback['data'] in ('cancel-delete','nav-return'):
                             archive.state(f'telegram_delete_confirm:{actor}','{}')
-                            text,buttons=self.menu(archive,'root')
+                            menu_route=self._menu_route(archive,actor)
+                            text,buttons=self.menu(archive,menu_route,actor=actor)
                         elif callback['data']=='cancel-time':
                             TimeMenus(self).cancel(archive,actor)
                             text,buttons=self.menu(archive,'home')
+                            menu_route='home'
                         elif callback['data'].startswith(('sync:','up:')):
                             text,buttons=self.sync_action(archive,callback['data'],actor)
                         else:text,buttons=self.menu(archive,callback['data'],actor=actor)
@@ -1035,28 +1110,41 @@ class Telegram:
                                 self._advance_poll(archive,update['update_id'],backend)
                                 continue
                             text,buttons=self.menu(archive,'home')
+                            menu_route='home'
                             refresh_keyboard=True
                         elif command in ('/cancel','/huy') or raw_text == 'Hủy':
                             TimeMenus(self).cancel(archive,actor)
                             text,buttons=self.menu(archive,'home')
+                            menu_route='home'
                         elif date_input is not None:
                             text,buttons=date_input
+                            menu_message_id=self._active_menu(archive,actor)
+                            session=TimeMenus(self)._session(archive,actor)
+                            menu_route=('wq:'+session['token']+':a:0') if session.get('token') else 'custom-time'
                         elif command == '/status':
                             text=self.status_text(archive)
-                            buttons=[[{'text':'Archive','callback_data':'root'}]]
+                            buttons=[[{'text':'↩ Quay lại','callback_data':'home'}]]
+                            menu_route='status'
                         elif command == '/sync' or message.get('text','').strip() in ('▶ Start sync','Start sync'):
                             text,buttons=self.sync_action(archive,'sync:all',actor)
+                            menu_route='sync:all'
                         else:
                             data=mapping.get(message.get('text','').strip(),mapping.get(command,'root'))
                             text,buttons=self.menu(archive,data,actor=actor)
+                            menu_route=data
+                    buttons=self.navigation_buttons(archive,actor,menu_route,buttons)
                     buttons=self.player_buttons(archive,buttons,actor)
-                    self.request('sendMessage',{'chat_id':chat_id,'text':text,
-                                               'reply_markup':{'inline_keyboard':buttons}})
-                    if not callback:
-                        try:self.ensure_keyboard(archive,actor,force=refresh_keyboard)
-                        except Exception:pass # The requested action was already delivered.
+                    # Inline-only navigation prevents mother actions remaining
+                    # visible on every child screen. The old reply keyboard is
+                    # removed with one migration message, never reinstalled.
+                    self.present_menu(archive,chat_id,actor,text,buttons,message_id=menu_message_id)
+                    self.remember_menu_route(archive,actor,menu_route)
+                    try:self.ensure_keyboard(archive,actor,force=refresh_keyboard)
+                    except Exception:pass
                 except (ValueError,KeyError,IndexError):
-                    self.request('sendMessage',{'chat_id':chat_id,'text':'Mục này đã thay đổi. Chọn lại Camera.'})
+                    self.present_menu(archive,chat_id,actor,'Mục này đã thay đổi.',
+                                      [[{'text':'↩ Quay lại','callback_data':'home'}]],message_id=menu_message_id)
+                    self.remember_menu_route(archive,actor,'home')
             except ApiRejected as exc:
                 if not (400 <= exc.code < 500) or exc.code==429:
                     raise

@@ -417,7 +417,9 @@ class PrivateTelegramTests(unittest.TestCase):
                 def fake(method,fields,**kwargs):
                     if method=='getUpdates':return [self.callback(43,'root',code)]
                     if method=='answerCallbackQuery':raise ApiRejected(code,10)
-                    if method=='sendMessage':replies.append(fields);return {'message_id':92}
+                    if method=='sendMessage':
+                        if 'inline_keyboard' in fields.get('reply_markup',{}):replies.append(fields)
+                        return {'message_id':92}
                     raise AssertionError(method)
                 self.request.side_effect=fake
                 self.telegram.poll(self.archive)

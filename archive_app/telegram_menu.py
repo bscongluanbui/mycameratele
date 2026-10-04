@@ -132,7 +132,7 @@ class TimeMenus:
 
     @staticmethod
     def _cancel_buttons():
-        return [[{'text': '✖ Hủy', 'callback_data': 'cancel-time'}]]
+        return [[{'text': '↩ Quay lại', 'callback_data': 'cancel-time'}]]
 
     def begin(self, archive, actor):
         self._save_session(archive, actor, {'step': 'start', 'expires': time.time() + self.INPUT_TTL})
@@ -323,8 +323,7 @@ class TimeMenus:
             total = archive.list_window(start_ms, end_ms, limit=1)['total']
             buttons.append([self._button(f'⬇ Tải toàn bộ ({total})',
                                          self._download_callback(kind, anchor, 'all', order))])
-        buttons.extend(self.shortcuts())
-        buttons.append([self._button('↩ Tất cả Camera', 'root')])
+        buttons.append([self._button('↩ Quay lại', 'home')])
         title = f'{summary} · Camera · trang {page + 1}'
         if not result['cameras']:
             title += '\nChưa có video.'
@@ -366,7 +365,7 @@ class TimeMenus:
         buttons.append([
             self._button('Mới → cũ' if order == 'a' else 'Cũ → mới',
                          self._clip_callback(kind, anchor, token, 'd' if order == 'a' else 'a', 0, camera_page)),
-            self._button('↩ Camera', self._camera_callback(kind, anchor, order, camera_page)),
+            self._button('↩ Quay lại', self._camera_callback(kind, anchor, order, camera_page)),
         ])
         if not lines:
             lines.append('Chưa có video.')

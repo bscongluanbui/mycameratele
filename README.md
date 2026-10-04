@@ -364,12 +364,17 @@ Dashboard và `/archive` duyệt **Camera → Năm → Tháng → Ngày → Vide
 và Cũ → Mới / Mới → Cũ theo thời gian ghi hình. Video qua nửa đêm có thể xuất hiện
 ở cả hai ngày; end đúng 00:00 không tính sang ngày mới. `/today`, `/yesterday`,
 `/last6h`, `/recent`, `/trash`, `/status` là các shortcut. Worker đăng ký Menu
-commands của Telegram; gửi `/start` để nhận bàn phím nhanh phía dưới chat:
+commands của Telegram; gửi `/start` để mở menu nút ngay trong tin nhắn:
 
 ```text
 Hôm nay / Hôm qua / 6 giờ trước → chọn Camera → danh sách video
                               → Xem / Tải / Xóa
 ```
+
+Mỗi lần bấm bot thay nội dung **cùng tin nhắn**: cấp con chỉ hiện các mục của
+cấp đó, ẩn các lựa chọn cấp mẹ. **↩ Quay lại** trở về cấp ngay trước, giữ khoảng
+thời gian, thứ tự và trang Camera. Bàn phím nhanh cũ phía dưới chat được gỡ;
+gửi `/start` để mở Menu mới. Xem video vẫn mở video gốc trong Telegram channel.
 
 **Start / Menu** luôn có trong danh sách lệnh Telegram (`/start`). Chọn
 **Tùy chọn thời gian** hoặc `/time`, nhập lần lượt ngày bắt đầu và kết thúc

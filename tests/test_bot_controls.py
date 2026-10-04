@@ -39,6 +39,8 @@ class BotControlTests(unittest.TestCase):
                     field:{'file_id':'fixture-file','file_unique_id':'fixture-unique'}}
         if method in ('setMyCommands','setChatMenuButton','answerCallbackQuery'):return True
         if method=='sendMessage':return {'message_id':100}
+        if method=='editMessageText':return {'message_id':fields['message_id']}
+        if method=='editMessageReplyMarkup':return True
         raise AssertionError(method)
 
     def row(self):return dict(self.archive.conn.execute('SELECT * FROM recordings WHERE key=?',(self.key,)).fetchone())
@@ -118,26 +120,25 @@ class BotControlTests(unittest.TestCase):
         callbacks=[b['callback_data'] for row in buttons for b in row]
         self.assertIn('u:'+self.prefix,callbacks);self.assertNotIn('f:'+self.prefix,callbacks)
 
-    def test_start_shows_persistent_time_keyboard(self):
+    def test_start_removes_persistent_keyboard_and_shows_inline_home(self):
         self.message('/start')
-        fields=next(c[1] for c in self.calls if c[0]=='sendMessage' and 'keyboard' in c[1].get('reply_markup',{}))
-        keyboard=fields['reply_markup'];self.assertTrue(keyboard['is_persistent'])
-        texts=[b['text'] for row in keyboard['keyboard'] for b in row]
-        self.assertTrue({'🏠 Start','▶ Start sync','📅 Hôm nay','📆 Hôm qua','🕕 6 giờ trước','🗓 Tùy chọn thời gian'}.issubset(texts))
+        fields=next(c[1] for c in self.calls if c[0]=='sendMessage' and c[1].get('reply_markup',{}).get('remove_keyboard'))
+        self.assertEqual(fields['reply_markup'],{'remove_keyboard':True})
+        self.assertFalse(any('keyboard' in c[1].get('reply_markup',{}) for c in self.calls))
         inline=next(c[1]['reply_markup']['inline_keyboard'] for c in self.calls if c[0]=='sendMessage' and 'inline_keyboard' in c[1].get('reply_markup',{}))
         self.assertTrue(all(len(row)==1 for row in inline))
         self.assertIn('custom-time',[row[0]['callback_data'] for row in inline])
 
-    def test_existing_viewer_gets_new_start_keyboard_from_normal_command_once(self):
+    def test_existing_viewer_removes_old_keyboard_once_and_start_never_reinstalls_it(self):
         self.message('/status')
-        keyboards=[c[1] for c in self.calls if c[0]=='sendMessage' and 'keyboard' in c[1].get('reply_markup',{})]
+        keyboards=[c[1] for c in self.calls if c[0]=='sendMessage' and c[1].get('reply_markup',{}).get('remove_keyboard')]
         self.assertEqual(len(keyboards),1)
         self.calls.clear();self.message('/today',update_id=2)
-        self.assertFalse(any(c[0]=='sendMessage' and 'keyboard' in c[1].get('reply_markup',{}) for c in self.calls))
+        self.assertFalse(any(c[0]=='sendMessage' and c[1].get('reply_markup',{}).get('remove_keyboard') for c in self.calls))
         self.calls.clear();self.message('🏠 Start',update_id=3)
         home=next(c[1] for c in self.calls if c[0]=='sendMessage' and 'inline_keyboard' in c[1].get('reply_markup',{}))
         self.assertTrue(all(len(row)==1 for row in home['reply_markup']['inline_keyboard']))
-        self.assertTrue(any(c[0]=='sendMessage' and 'keyboard' in c[1].get('reply_markup',{}) for c in self.calls))
+        self.assertFalse(any('keyboard' in c[1].get('reply_markup',{}) or c[1].get('reply_markup',{}).get('remove_keyboard') for c in self.calls))
 
     def test_custom_time_text_flow_selects_camera_then_video_and_cancel_returns_home(self):
         self.message('/time')
@@ -145,7 +146,7 @@ class BotControlTests(unittest.TestCase):
         self.message('03/10/2026 09:59',update_id=2)
         self.assertTrue(any('Đến ngày nào' in c[1].get('text','') for c in self.calls))
         self.calls.clear();self.message('03/10/2026 10:02',update_id=3)
-        fields=next(c[1] for c in self.calls if c[0]=='sendMessage')
+        fields=next(c[1] for c in self.calls if c[0]=='editMessageText')
         selection=next(b['callback_data'] for row in fields['reply_markup']['inline_keyboard'] for b in row if b['callback_data'].startswith('wqc:'))
         self.calls.clear();self.callback(selection,update_id=4)
         fields=next(c[1] for c in self.calls if c[0]=='sendMessage')
@@ -166,7 +167,7 @@ class BotControlTests(unittest.TestCase):
     def test_keyboard_post_failure_does_not_repeat_completed_action_or_pin_cursor(self):
         original=self.fake
         def request(method,fields,**kwargs):
-            if method=='sendMessage' and 'keyboard' in fields.get('reply_markup',{}):
+            if method=='sendMessage' and fields.get('reply_markup',{}).get('remove_keyboard'):
                 raise TimeoutError('synthetic keyboard timeout')
             return original(method,fields,**kwargs)
         self.request.side_effect=request
