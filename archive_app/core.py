@@ -104,6 +104,8 @@ class Settings:
     bot_api_spool_root: Path | None = None
     bot_api_spool_max_bytes: int = 5000000000
     error_retention_hours: float = 72.0
+    upload_transport: str = 'multipart'
+    local_upload_root: str = ''
 
     @property
     def effective_owner(self):
@@ -157,6 +159,15 @@ class Settings:
         if not math.isfinite(spool_gb) or spool_gb <= 0:
             raise ValueError('BOT_API_SPOOL_MAX_GB must be a positive finite number')
         spool_path = os.environ.get('BOT_API_SPOOL_DIR', '').strip()
+        upload_transport = os.environ.get('TELEGRAM_UPLOAD_TRANSPORT', '').strip() or 'multipart'
+        local_upload_root = os.environ.get('TELEGRAM_LOCAL_UPLOAD_ROOT', '').strip()
+        if upload_transport not in ('multipart', 'local_file'):
+            raise ValueError('TELEGRAM_UPLOAD_TRANSPORT must be multipart or local_file')
+        if upload_transport == 'local_file':
+            from .local_upload import validate_upload_root
+            if mode != 'local':
+                raise ValueError('Local file uploads require Local Bot API')
+            validate_upload_root(local_upload_root)
         media_mode = os.environ.get('MEDIA_MODE', 'raw').strip().lower()
         if media_mode not in ('raw', 'remux_copy'):
             raise ValueError('MEDIA_MODE must be raw or remux_copy')
@@ -183,6 +194,8 @@ class Settings:
             bot_api_file_root=Path(os.environ.get('TELEGRAM_BOT_API_FILE_ROOT', '/var/lib/telegram-bot-api')),
             bot_api_spool_root=Path(spool_path) if spool_path else None,
             bot_api_spool_max_bytes=int(spool_gb * 1e9),
+            upload_transport=upload_transport,
+            local_upload_root=local_upload_root,
         )
         get_zone(result.timezone)
         limit = 2000000000 if mode == 'local' else 50000000

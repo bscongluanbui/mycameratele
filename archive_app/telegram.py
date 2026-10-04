@@ -13,6 +13,7 @@ from datetime import datetime
 from .core import get_zone,from_epoch_ms
 from .telegram_menu import TimeMenus
 from .upload_spool import check_upload_spool, SpoolBudgetError
+from .local_upload import local_mp4_uri, LocalUploadError
 
 
 class ApiRejected(Exception):
@@ -301,12 +302,18 @@ class Telegram:
             raise ValueError('Unconfirmed owner/private/media identity')
         return media
 
-    def request(self, method, fields, *, file_path=None, file_field=None):
+    def request(self, method, fields, *, file_path=None, file_field=None, local_file=False):
         if not self.settings.token:
             raise ValueError('Bot token is not configured')
         url = self.settings.api_base + '/bot' + self.settings.token + '/' + method
         headers = {'Content-Type':'application/json'}
-        if file_path is None:
+        if local_file:
+            if method != 'sendVideo' or file_field != 'video' or file_path is None:
+                raise LocalUploadError('Local upload requires a managed MP4 video')
+            # Keep file_path for the original 1800s upload timeout, but do not
+            # open/read its bytes or construct a multipart request body.
+            body = json.dumps({**fields, 'video': local_mp4_uri(self.settings, file_path)}).encode()
+        elif file_path is None:
             body = json.dumps(fields).encode()
         else:
             boundary = 'ezviz-archive-'+secrets.token_hex(16)
@@ -371,8 +378,17 @@ class Telegram:
             with archive.conn:
                 archive.conn.execute("UPDATE recordings SET status='needs_review',last_error='mp4_remux_required' WHERE key=?", (row['key'],))
             return 'needs_review'
+        video = row.get('processing_method') == 'remux_copy' and path.suffix.lower() == '.mp4'
+        direct = self.settings.api_mode == 'local' and self.settings.upload_transport == 'local_file' and video
+        if direct:
+            try:
+                local_mp4_uri(self.settings, path, expected_key=row['key'], cache_root=archive._cache_root)
+            except LocalUploadError:
+                with archive.conn:
+                    archive.conn.execute("UPDATE recordings SET status='needs_review',last_error='local_upload_path' WHERE key=?", (row['key'],))
+                return 'needs_review'
         try:
-            check_upload_spool(self.settings, path.stat().st_size)
+            check_upload_spool(self.settings, path.stat().st_size, local_file=direct)
         except (SpoolBudgetError, OSError):
             # Capacity was rejected before POST: this is a known unsent upload,
             # not an ambiguous Telegram delivery. Retain source and retry later.
@@ -382,13 +398,14 @@ class Telegram:
             return 'upload_spool_budget'
         caption = self.caption(archive, row)
         # Preserve raw bytes: do not request Telegram's video processing path.
-        video = row.get('processing_method') == 'remux_copy' and path.suffix.lower() == '.mp4'
         method,field=('sendVideo','video') if video else ('sendDocument','document')
         fields={'chat_id':destination,'caption':caption,'disable_notification':True}
         if video:fields['supports_streaming']=True
         else:fields['disable_content_type_detection']=True
         try:
-            message = self.request(method,fields,file_path=path,file_field=field)
+            kwargs = {'file_path': path, 'file_field': field}
+            if direct:kwargs['local_file'] = True
+            message = self.request(method,fields,**kwargs)
             media = self.validate_media_message(message, field, destination,
                                                 chat_type='channel' if self.channel_mode else 'private')
             bot_value = archive.state('telegram_bot_id')
@@ -397,6 +414,12 @@ class Telegram:
                           'storage_message_id':message['message_id']} if self.channel_mode else {})
             archive.mark_uploaded(row['key'],destination,message['message_id'],media['file_id'],
                                   file_unique_id=media['file_unique_id'],media_type=field,bot_id=bot_id,**placement)
+        except LocalUploadError:
+            # request() rechecks the path before constructing/sending JSON.
+            # A changed path at this point is still a definitive unsent error.
+            with archive.conn:
+                archive.conn.execute("UPDATE recordings SET status='needs_review',last_error='local_upload_path' WHERE key=?", (row['key'],))
+            return 'needs_review'
         except ApiRejected as exc:
             if exc.code == 429:
                 self._pause_uploads(archive,exc.retry_after,row['key'])

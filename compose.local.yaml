@@ -1,5 +1,6 @@
 # Optional Local Bot API override. Keep the base project's existing volumes.
-# Worker streams multipart bytes; the API does not read the archive cache.
+# The API reads managed MP4s from shared /cache; raw uploads stay multipart.
+# Set TELEGRAM_UPLOAD_TRANSPORT=multipart to opt out of direct MP4 reads.
 # Usage: docker compose -f compose.yaml -f compose.local.yaml --profile local-api up -d
 # Owner, bot token and application credentials must be supplied in the local .env.
 services:
@@ -10,6 +11,8 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TELEGRAM_API_BASE: http://telegram-bot-api:8081
       TELEGRAM_API_MODE: local
+      TELEGRAM_UPLOAD_TRANSPORT: ${TELEGRAM_UPLOAD_TRANSPORT:-local_file}
+      TELEGRAM_LOCAL_UPLOAD_ROOT: /cache
       BOT_API_SPOOL_DIR: /var/lib/telegram-bot-api-spool
       BOT_API_SPOOL_MAX_GB: ${BOT_API_SPOOL_MAX_GB:-5}
       TELEGRAM_MAX_BYTES: "2000000000"
@@ -28,6 +31,8 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TELEGRAM_API_BASE: http://telegram-bot-api:8081
       TELEGRAM_API_MODE: local
+      TELEGRAM_UPLOAD_TRANSPORT: ${TELEGRAM_UPLOAD_TRANSPORT:-local_file}
+      TELEGRAM_LOCAL_UPLOAD_ROOT: /cache
       TELEGRAM_MAX_BYTES: "2000000000"
       KEEP_CACHE: "false"
       CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-0}
@@ -38,3 +43,6 @@ services:
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:?Set TELEGRAM_API_ID in .env}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH in .env}
+    volumes:
+      # Same named volume and path as the worker; Bot API never writes here.
+      - archive-cache:/cache:ro

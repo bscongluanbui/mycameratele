@@ -32,6 +32,8 @@ services:
       TELEGRAM_PLAYER_PUBLIC_URL: ${TELEGRAM_PLAYER_PUBLIC_URL:-}
       TELEGRAM_API_BASE: ${TELEGRAM_API_BASE:-https://api.telegram.org}
       TELEGRAM_API_MODE: ${TELEGRAM_API_MODE:-cloud}
+      TELEGRAM_UPLOAD_TRANSPORT: ${TELEGRAM_UPLOAD_TRANSPORT:-multipart}
+      TELEGRAM_LOCAL_UPLOAD_ROOT: ${TELEGRAM_LOCAL_UPLOAD_ROOT:-}
       BOT_API_SPOOL_DIR: ${BOT_API_SPOOL_DIR:-}
       BOT_API_SPOOL_MAX_GB: ${BOT_API_SPOOL_MAX_GB:-5}
       TELEGRAM_MAX_BYTES: ${TELEGRAM_MAX_BYTES:-50000000}
@@ -93,6 +95,8 @@ services:
       TELEGRAM_BOT_API_FILE_ROOT: /var/lib/telegram-bot-api
       TELEGRAM_API_BASE: ${TELEGRAM_API_BASE:-https://api.telegram.org}
       TELEGRAM_API_MODE: ${TELEGRAM_API_MODE:-cloud}
+      TELEGRAM_UPLOAD_TRANSPORT: ${TELEGRAM_UPLOAD_TRANSPORT:-multipart}
+      TELEGRAM_LOCAL_UPLOAD_ROOT: ${TELEGRAM_LOCAL_UPLOAD_ROOT:-}
       TELEGRAM_MAX_BYTES: ${TELEGRAM_MAX_BYTES:-50000000}
       ENABLE_UPLOAD: ${ENABLE_UPLOAD:-false}
       KEEP_CACHE: ${KEEP_CACHE:-false}
@@ -149,7 +153,8 @@ services:
     cap_add: [CHOWN, FOWNER]
     security_opt: [no-new-privileges:true]
 
-  # Local Bot API receives streamed multipart into a separate disk volume.
+  # Multipart temporary files use the separate disk volume. The local override
+  # additionally mounts the managed MP4 cache read-only for direct file upload.
   # The 5 GB worker admission budget is cooperative, not a filesystem quota.
   telegram-bot-api:
     profiles: [local-api]

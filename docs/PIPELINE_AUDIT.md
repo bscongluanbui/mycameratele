@@ -10,9 +10,11 @@
    encoder, decode validation or routine ffprobe is used. Unsupported input stays
    in `needs_review`; do not silently transcode, drop audio or rename raw bytes.
 4. Commit the independent managed MP4 before releasing the staged source.
-5. Stream multipart upload to Local Bot API, store its confirmed message/file
-   references, then clean the managed MP4 according to retention. Ambiguous
-   uploads stay quarantined rather than being resent automatically.
+5. Let Local Bot API read the managed MP4 through its shared read-only cache
+   using `file://` (default in the local override), store confirmed message/file
+   references, then clean the managed MP4 according to retention. Cloud/raw or
+   explicit `multipart` still stream multipart. Ambiguous uploads stay
+   quarantined rather than being resent automatically.
 
 `KEEP_CACHE=false` with `CACHE_RETENTION_HOURS=0` removes confirmed archive files
 immediately; `1` retains them for one hour. Unconfirmed and review files are
@@ -20,8 +22,12 @@ retained. Bot API's internal files are separately owned by Telegram's server;
 archive cleanup does not delete its session/database or claim to clear all of
 its caches. Its multipart spool now uses a separate disk-backed `bot-api-spool`
 volume with a 5 GB cooperative admission budget, not the 256 MiB `/tmp` RAM
-filesystem. Terminal-error media now expires after 72 hours; the catalog stays.
-See [cache retention](CACHE_RETENTION.md) for the current policy.
+filesystem. Eligible direct MP4 requests avoid their multipart media transfer
+and HTTP temp copy but can still incur internal Bot API/TDLib file caching.
+No throughput improvement has been measured for this transport change.
+Terminal-error media now expires after 72 hours; the catalog stays.
+See [cache retention](CACHE_RETENTION.md) and
+[direct local upload](LOCAL_FILE_UPLOAD.md) for the current policy.
 
 ## Changes from the audit
 

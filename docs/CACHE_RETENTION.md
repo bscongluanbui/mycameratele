@@ -41,13 +41,20 @@ discarded by the adapter; complete retained error copies follow this policy.
 
 `bot-api-spool` is a separate **disk-backed Docker named volume**. The Bot API
 writes HTTP multipart temporary files there; the worker mounts it read-only to
-check capacity. Persistent Telegram session/database files stay in the existing
+check capacity. The Local Compose override now sends eligible managed MP4s
+using a `file://` URI and mounts `archive-cache:/cache:ro` in the Bot API. This
+avoids the MP4's HTTP multipart temp copy, but does not remove any internal
+Bot API/TDLib cache. Cloud/raw uploads and explicit `multipart` still use the
+multipart route. See [direct local upload](LOCAL_FILE_UPLOAD.md).
+Persistent Telegram session/database files stay in the existing
 `bot-api-state` volume. A network-disabled one-shot initialization service owns
 only the spool mount and gives UID10001 access.
 
-The worker admits a new upload only when current spool bytes plus its file size
-fit **5,000,000,000 bytes**, and the disk retains its configured free-space
-reserve. Otherwise it sends no multipart POST, keeps the video queued, reports
+For multipart, the worker admits a new upload only when current spool bytes
+plus its file size fit **5,000,000,000 bytes**, and the disk retains its
+configured free-space reserve. Direct MP4 requests do not reserve incoming
+multipart bytes, but still check existing spool use and disk free space.
+Otherwise it submits no media request, keeps the video queued, reports
 `upload_spool_budget` and retries after 60 seconds. This is a cooperative
 application admission budget, **not** a filesystem quota or a 5 GB RAM tmpfs.
 The actual disk must have sufficient free space; the budget cannot manufacture
@@ -58,7 +65,8 @@ The Telegram server owns deletion of its live HTTP temporary files. Do not
 recursively delete `bot-api-state` or sweep live API files from the worker.
 The camera media expiry timer applies to archive-owned cache files.
 
-Upgrades preserve the original three volumes and add only the spool volume.
+The spool upgrade preserved the original three volumes and added only the
+spool volume. Direct local MP4 upload reuses them without new media volumes.
 Standard local Compose startup starts `spool-init` before the Bot API:
 
 ```sh

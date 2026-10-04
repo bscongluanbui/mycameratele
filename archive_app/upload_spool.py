@@ -77,7 +77,7 @@ def _used_bytes(root, ceiling):
     return used, free
 
 
-def check_upload_spool(settings, incoming_bytes):
+def check_upload_spool(settings, incoming_bytes, *, local_file=False):
     """Admit a bounded upload or raise before HTTP POST; no file is modified.
 
     Legacy direct constructors with no spool root retain their prior behavior.
@@ -88,19 +88,20 @@ def check_upload_spool(settings, incoming_bytes):
         return None
     budget = getattr(settings, 'bot_api_spool_max_bytes', 5000000000)
     reserve = settings.min_free_bytes
+    allocation = 0 if local_file else incoming_bytes
     if (type(incoming_bytes) is not int or incoming_bytes <= 0 or
             type(budget) is not int or budget <= 0 or
-            type(reserve) is not int or reserve < 0 or incoming_bytes > budget):
+            type(reserve) is not int or reserve < 0 or allocation > budget):
         raise SpoolBudgetError('upload_spool_budget')
     root = Path(root).absolute()
     try:
         info = root.lstat()
         if not stat.S_ISDIR(info.st_mode) or root.resolve(strict=True) != root:
             raise SpoolBudgetError('upload_spool_budget')
-        used, free = _used_bytes(root, budget - incoming_bytes)
+        used, free = _used_bytes(root, budget - allocation)
     except (OSError, RuntimeError, ValueError):
         raise SpoolBudgetError('upload_spool_budget') from None
-    if used + incoming_bytes > budget or free < incoming_bytes + reserve:
+    if used + allocation > budget or free < allocation + reserve:
         raise SpoolBudgetError('upload_spool_budget')
     return {'used_bytes': used, 'incoming_bytes': incoming_bytes,
-            'budget_bytes': budget, 'free_bytes': free}
+            'reserved_bytes': allocation, 'budget_bytes': budget, 'free_bytes': free}
