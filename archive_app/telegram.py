@@ -302,7 +302,22 @@ class Telegram:
                 archive.conn.execute("INSERT INTO state(name,value) VALUES('telegram_offset',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
                                      (str(update_id+1),))
 
-    def replay(self, archive, prefix, chat_id=None, *, update_id=None, purpose='view'):
+    @staticmethod
+    def _guarded_attempt(archive,update_id):
+        current=Telegram._replay_attempt(archive)
+        if current.get('update_id')==update_id and current.get('phase') in ('pending','unknown','done','rejected'):
+            return current
+        try:
+            epoch=json.loads(archive.state('telegram_poll_epoch') or '{}')
+            raw=epoch.get('replay_attempt')
+            old=json.loads(raw) if isinstance(raw,str) and len(raw)<=4096 else {}
+            if isinstance(old,dict) and old.get('update_id')==update_id and old.get('phase') in ('pending','unknown','done','rejected'):
+                return old
+        except (ValueError,TypeError,AttributeError):
+            pass
+        return {}
+
+    def replay(self, archive, prefix, chat_id=None, *, update_id=None, purpose='view', consume_rejection=False):
         """Resend Telegram's stored file ID; never read/delete/reupload local bytes."""
         recipient = self.owner if chat_id is None else chat_id
         if type(recipient) is not int or recipient not in self.viewers or not re.fullmatch(r'[a-f0-9]{32}', prefix) or purpose not in ('view','download'):
@@ -315,7 +330,8 @@ class Telegram:
         file_id = row.get('file_id')
         if not isinstance(file_id, str) or not file_id.strip():
             raise ValueError('Archive media identity is missing')
-        active_bot = archive.state('telegram_bot_id')
+        token_prefix,separator,_=self.settings.token.partition(':')
+        active_bot = token_prefix if separator and token_prefix.isdecimal() else archive.state('telegram_bot_id')
         if row.get('bot_id') is not None and active_bot and active_bot.isdecimal() and row['bot_id']!=int(active_bot):
             raise ValueError('Archived file belongs to a different bot')
         field = row.get('media_type')
@@ -339,9 +355,10 @@ class Telegram:
         is_channel = self.channel_mode and (row.get('storage_kind') == 'channel' or str(storage_chat).startswith('-'))
         if is_channel:
             if (not re.fullmatch(r'-[1-9][0-9]*',str(storage_chat))
-                    or type(storage_message) is not int or storage_message <= 0
-                    or int(storage_chat) != getattr(self.settings,'storage_channel_id',0)):
-                raise ValueError('Channel placement does not belong to configured storage')
+                    or type(storage_message) is not int or storage_message <= 0):
+                raise ValueError('Channel placement is invalid')
+            # A channel change affects new uploads, not immutable placements in
+            # this tenant-bound archive. The same-bot check above still applies.
         method = 'copyMessage' if is_channel else ('sendVideo' if field == 'video' else 'sendDocument')
         details=None
         if is_channel:
@@ -349,7 +366,7 @@ class Telegram:
                      'recipient':recipient,'method':method,'source_chat_id':int(storage_chat),
                      'source_message_id':storage_message}
         if update_id is not None:
-            previous=self._replay_attempt(archive)
+            previous=self._guarded_attempt(archive,update_id)
             if previous.get('update_id')==update_id and previous.get('phase') in ('pending','unknown','done','rejected'):
                 self._save_replay_attempt(archive,update_id,'unknown' if previous['phase']=='pending' else previous['phase'],advance=True)
                 return 'consumed_without_retry'
@@ -378,9 +395,14 @@ class Telegram:
             if update_id is None:
                 raise
             if exc.code==429:
-                # A known rejection did not send a message. Clear the pending
-                # guard and hold the same cursor until retry_after has elapsed.
-                self._save_replay_attempt(archive,update_id,None,retry_at=time.time()+max(1,exc.retry_after))
+                deadline=time.time()+self._retry_delay(exc.retry_after)
+                if consume_rejection:
+                    # Poll consumes a known rejection. Only a new manual click
+                    # after the deadline can retry; menus keep receiving updates.
+                    self._save_replay_attempt(archive,update_id,'rejected',advance=True,retry_at=deadline)
+                    return 'rate_limited'
+                # Preserve the direct-call contract for callers outside poll().
+                self._save_replay_attempt(archive,update_id,None,retry_at=deadline)
                 raise
             phase='rejected' if 400<=exc.code<500 else 'unknown'
             self._save_replay_attempt(archive,update_id,phase,advance=True)
@@ -465,7 +487,7 @@ class Telegram:
         # Camera IDs stay immutable; friendly names never enter callback_data.
         # Keep callback payloads compact even for a 64-character camera ID.
         if data == 'status':
-            return json.dumps(archive.status(),ensure_ascii=False),[[{'text':'↩ Camera','callback_data':'root'}]]
+            return self.status_text(archive),[[{'text':'↩ Camera','callback_data':'root'}]]
         if data in ('today','yesterday','last6h') or data.startswith(('w:','wc:')):
             return TimeMenus(self).menu(archive,data)
         if data.startswith('trash:'):
@@ -496,7 +518,7 @@ class Telegram:
             buttons.append([{'text':'🕐 Video gần đây','callback_data':'recent:0'},
                             {'text':'🗑 Thùng rác','callback_data':'trash:0'},
                             {'text':'⚙ Trạng thái','callback_data':'status'}])
-            return 'Archive — chọn Camera' + ('' if cameras else ' (chưa có camera)'), buttons
+            return 'Chọn Camera' + ('' if cameras else ' (chưa có camera)'), buttons
         pieces = data.split(':')
         kind = pieces[0]
         expected = {'c':3, 'y':4, 'm':4, 'd':4, 'p':5}
@@ -516,7 +538,7 @@ class Telegram:
             buttons.extend(self.sync_camera_buttons(camera))
             self._controls(buttons, f'c:{token}:{{order}}', 'root', order)
             upload='ON' if camera.get('upload_enabled',True) else 'OFF'
-            return f'{name} — chọn Năm\nUpload Telegram: {upload}. OFF chỉ tạm dừng upload, không dừng tải SD.', buttons
+            return f'{name} · Upload {upload}\nChọn Năm', buttons
         if kind == 'y':
             year = int(pieces[2])
             if not 1 <= year <= 9999:
@@ -586,19 +608,26 @@ class Telegram:
         lines=['Sync '+(archive.camera_name(camera) if camera else 'tất cả camera'),
                'Worker: '+('đang hoạt động' if result.get('worker_alive') else 'chưa thấy heartbeat mới')]
         jobs=result.get('jobs',[])
-        for job in jobs[:10]:
+        latest=[];seen=set()
+        for job in jobs:
+            camera_id=job.get('camera_id')
+            if camera_id in seen:continue
+            seen.add(camera_id);latest.append(job)
+            if len(latest)==5:break
+        for job in latest:
             name=job.get('camera_name') or archive.camera_name(job.get('camera_id',''))
             state=states.get(job.get('state'),str(job.get('state') or 'Chưa rõ'))
             phase=phases.get(job.get('phase'),str(job.get('phase') or '—'))
             lines.append(f'{name}: {state} | {phase}')
             if job.get('code'):lines.append('Mã: '+str(job['code'])[:100])
-            if job.get('message'):lines.append(str(job['message'])[:300])
+            if job.get('code')=='sd_sdk_missing':lines.append('SDK chưa sẵn sàng')
             statistics=job.get('statistics')
             if isinstance(statistics,dict):
-                numbers=[f'{key}={value}' for key,value in statistics.items()
-                         if isinstance(value,(int,float)) and not isinstance(value,bool)]
-                if numbers:lines.append(' | '.join(numbers)[:300])
-        if not jobs:lines.append('Chưa có công việc sync. Start gửi công việc vào hàng đợi; trạng thái sẽ phản ánh tải SD thực tế.')
+                numbers=[f'{label}: {statistics[key]}' for key,label in
+                         (('sd_searched','SD'),('sd_downloaded','Tải'),('uploaded','Upload'),('pending','Chờ'))
+                         if type(statistics.get(key)) in (int,float)]
+                if numbers:lines.append(' · '.join(numbers))
+        if not jobs:lines.append('Chưa có công việc sync.')
         token=self.camera_token(camera) if camera else 'all'
         buttons=[[{'text':'▶ Start sync','callback_data':'sync:'+token},
                   {'text':'↻ Tiến trình','callback_data':'ss:'+token}]]
@@ -623,7 +652,7 @@ class Telegram:
             result=SyncQueue(archive).enqueue(camera=camera,source='telegram',actor=actor)
             text,buttons=self.sync_menu(archive,camera)
             count=len(result.get('jobs',[]))
-            return f'Đã tiếp nhận Start cho {count} camera. Theo dõi tiến trình bên dưới.\n'+text,buttons
+            return f'Đã tiếp nhận sync: {count} camera.\n'+text,buttons
         selection=re.fullmatch(r'up:([a-f0-9]{12}):([01])',data)
         if selection:
             configured=self._camera(archive,selection[1])
@@ -701,8 +730,8 @@ class Telegram:
         if not row:raise ValueError('Recording is no longer available')
         nonce=secrets.token_hex(6)
         archive.state(f'telegram_delete_confirm:{actor}',json.dumps({'key':row['key'],'nonce':nonce,'expires':time.time()+300}))
-        text=(self.caption(archive,row)+'\n\nXóa khỏi kho chung? Tất cả người được phép sẽ không còn thấy video '
-              'trong danh sách. Có thể khôi phục từ Thùng rác. Bản tin Telegram và bản đã tải vẫn còn.')
+        text=(self.caption(archive,row)+'\n\nXóa khỏi kho chung? Tất cả người được phép sẽ không thấy video. '
+              'Khôi phục được trong Thùng rác; bản đã gửi/tải vẫn còn.')
         return text,[[{'text':'🗑 Xác nhận xóa khỏi kho','callback_data':f'xc:{prefix}:{nonce}'},
                       {'text':'Hủy','callback_data':'cancel-delete'}]]
 
@@ -718,45 +747,154 @@ class Telegram:
             raise ValueError('Delete confirmation expired or belongs to another viewer')
         archive.soft_delete(pending['key'],actor)
         archive.state(f'telegram_delete_confirm:{actor}','{}')
-        return 'Đã chuyển video vào Thùng rác của kho chung.',[[{'text':'↩ Khôi phục','callback_data':'u:'+pieces[1]},
+        return 'Đã chuyển vào Thùng rác.',[[{'text':'↩ Khôi phục','callback_data':'u:'+pieces[1]},
                                                             {'text':'🗑 Thùng rác','callback_data':'trash:0'},
                                                             {'text':'📷 Camera','callback_data':'root'}]]
+
+    def status_text(self,archive):
+        status=archive.status();counts=status.get('counts',{});queue=status.get('queue',{})
+        labels={'downloaded':'Chờ upload','uploading':'Đang upload','upload_unknown':'Cần kiểm tra',
+                'needs_review':'Cần xử lý','failed':'Lỗi','ingesting':'Đang tải'}
+        pending=[f'{labels.get(key,key)}: {value}' for key,value in sorted(queue.items())
+                 if key!='uploaded' and value]
+        return (f"Camera: {counts.get('cameras',0)} · Đã lưu: {counts.get('uploaded',0)} · Thùng rác: {counts.get('deleted',0)}\n"
+                f"Upload: {'ON' if status.get('upload_enabled') else 'OFF'} · API: {status.get('api_mode','cloud')}\n"
+                'Hàng đợi · '+(' | '.join(pending) if pending else 'Không có video chờ'))
+
+    @staticmethod
+    def _retry_delay(value):
+        try:
+            delay=float(value)
+            return max(1.0,delay) if math.isfinite(delay) else 1.0
+        except (TypeError,ValueError,OverflowError):
+            return 1.0
+
+    def _poll_backend(self,archive):
+        prefix,separator,_=self.settings.token.partition(':')
+        bot=('id:'+(prefix.lstrip('0') or '0') if separator and prefix.isdecimal()
+             else 'id:'+archive.state('telegram_bot_id') if (archive.state('telegram_bot_id') or '').isdecimal()
+             else 'token:'+hashlib.sha256(self.settings.token.encode()).hexdigest())
+        scope=[self.settings.api_mode,self.settings.api_base.rstrip('/'),bot]
+        return hashlib.sha256(json.dumps(scope,separators=(',',':')).encode()).hexdigest()
+
+    @staticmethod
+    def _valid_update(update):
+        if not isinstance(update,dict) or type(update.get('update_id')) is not int or update['update_id']<0:
+            return False
+        callback=update.get('callback_query')
+        if callback is not None:
+            return (isinstance(callback,dict) and isinstance(callback.get('id'),str)
+                    and isinstance(callback.get('data'),str) and isinstance(callback.get('from'),dict)
+                    and (callback.get('message') is None or isinstance(callback.get('message'),dict)))
+        return isinstance(update.get('message'),dict)
+
+    def _adopt_poll_cursor(self,archive,updates,backend,offset):
+        """Recover only from an actual wholly lower batch, never an empty reset.
+
+        Telegram update IDs can restart after a backend migration or a week of
+        inactivity. Preserve the exact old cursor/journal in one bounded epoch;
+        overlapping guarded IDs keep their journal because their POST is uncertain.
+        """
+        if not isinstance(updates,list) or not updates or not all(self._valid_update(u) for u in updates):
+            return
+        ids=[u['update_id'] for u in updates]
+        old_backend=archive.state('telegram_poll_backend')
+        try:last=float(archive.state('telegram_poll_last_processed_at') or 0)
+        except (TypeError,ValueError,OverflowError):last=0
+        idle=math.isfinite(last) and last>0 and time.time()-last>=7*86400
+        if max(ids)>=offset or not (old_backend!=backend or idle):return
+        journal=archive.state('telegram_replay_attempt')
+        previous=self._replay_attempt(archive)
+        overlapping=(previous.get('update_id') in ids
+                     and previous.get('phase') in ('pending','unknown','done','rejected'))
+        # Oversized/corrupt state is retained rather than truncating an exact
+        # rollback record. Normal journals are less than 512 bytes.
+        if journal is not None and len(journal)>4096:return
+        try:epoch=json.loads(archive.state('telegram_poll_epoch') or '{}').get('epoch',0)
+        except (ValueError,TypeError,AttributeError):epoch=0
+        epoch=epoch if type(epoch) is int and epoch>=0 else 0
+        diagnostic={'epoch':epoch+1,'at':time.time(),'reason':'backend' if old_backend!=backend else 'idle',
+                    'old_backend':old_backend,'new_backend':backend,
+                    'old_cursor':archive.state('telegram_offset'),'new_cursor':min(ids),
+                    'replay_attempt':journal,'replay_retry_at':archive.state('telegram_replay_retry_at')}
+        with archive.conn:
+            changes=[('telegram_poll_epoch',json.dumps(diagnostic,separators=(',',':'))),
+                     ('telegram_offset',str(min(ids))),('telegram_poll_backend',backend)]
+            if not overlapping:
+                changes.extend((('telegram_replay_attempt','{}'),('telegram_replay_retry_at','0')))
+            for name,value in changes:
+                archive.conn.execute('INSERT INTO state(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',(name,value))
+
+    @staticmethod
+    def _advance_poll(archive,update_id,backend):
+        with archive.conn:
+            for name,value in (('telegram_offset',str(update_id+1)),('telegram_poll_backend',backend),
+                               ('telegram_poll_last_processed_at',str(time.time()))):
+                archive.conn.execute('INSERT INTO state(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',(name,value))
+
+    def _poll_replay(self,archive,prefix,chat_id,update_id,*,purpose='view'):
+        try:deadline=float(archive.state('telegram_replay_retry_at') or 0)
+        except (TypeError,ValueError,OverflowError):deadline=0
+        if math.isfinite(deadline) and deadline>time.time():
+            self._save_replay_attempt(archive,update_id,'rejected',advance=True,retry_at=deadline)
+            result='rate_limited'
+        else:
+            result=self.replay(archive,prefix,chat_id,update_id=update_id,purpose=purpose,consume_rejection=True)
+        if result=='rate_limited':
+            try:
+                deadline=float(archive.state('telegram_replay_retry_at') or 0)
+                seconds=max(1,math.ceil(deadline-time.time()))
+                self.request('sendMessage',{'chat_id':chat_id,'text':f'Telegram đang giới hạn. Bấm Xem/Tải lại sau {seconds}s.'})
+            except Exception:
+                pass # A rejected notification must not block other menus.
+        return result
 
     def poll(self,archive):
         if not self.settings.token or not self.viewers:
             return
-        if float(archive.state('telegram_replay_retry_at') or 0)>time.time():
-            return
         offset=int(archive.state('telegram_offset') or 0)
+        backend=self._poll_backend(archive)
         updates=self.request('getUpdates',{'offset':offset,'timeout':0,'allowed_updates':['message','callback_query']})
+        if not isinstance(updates,list):raise ValueError('Invalid Telegram update batch')
+        self._adopt_poll_cursor(archive,updates,backend,offset)
         for update in updates:
+            if not self._valid_update(update):continue
             if update['update_id'] < int(archive.state('telegram_offset') or 0):
                 continue
             callback=update.get('callback_query')
-            message=(callback or {}).get('message',{}) if callback else update.get('message',{})
-            actor=(callback or message).get('from',{}).get('id')
-            chat=message.get('chat',{})
+            message=((callback or {}).get('message') or {}) if callback else update.get('message',{})
+            sender=(callback or message).get('from')
+            actor=sender.get('id') if isinstance(sender,dict) else None
+            chat=message.get('chat')
+            chat=chat if isinstance(chat,dict) else {}
             if (type(actor) is not int or actor not in self.viewers or chat.get('type') != 'private' or
                 type(chat.get('id')) is not int or chat.get('id') != actor):
-                archive.state('telegram_offset',update['update_id']+1)
+                self._advance_poll(archive,update['update_id'],backend)
                 continue
             chat_id=message['chat']['id']
             persistent_keyboard=False
-            previous=self._replay_attempt(archive)
+            previous=self._guarded_attempt(archive,update['update_id'])
             if previous.get('update_id')==update['update_id'] and previous.get('phase') in ('pending','unknown','done','rejected'):
                 # Crash after the POST but before its durable cursor commit.
                 # Do not invoke getMe, answerCallbackQuery or the media POST.
+                deadline=archive.state('telegram_replay_retry_at') or 0
+                if self._replay_attempt(archive).get('update_id')!=update['update_id']:
+                    try:deadline=json.loads(archive.state('telegram_poll_epoch') or '{}').get('replay_retry_at') or 0
+                    except (ValueError,TypeError,AttributeError):pass
                 self._save_replay_attempt(archive,update['update_id'],
-                                          'unknown' if previous['phase']=='pending' else previous['phase'],advance=True)
+                                          'unknown' if previous['phase']=='pending' else previous['phase'],advance=True,
+                                          retry_at=deadline,details={k:v for k,v in previous.items() if k not in ('update_id','phase')})
+                self._advance_poll(archive,update['update_id'],backend)
                 continue
             try:
                 try:
                     if callback:
-                        self.request('answerCallbackQuery',{'callback_query_id':callback['id']})
+                        try:self.request('answerCallbackQuery',{'callback_query_id':callback['id']})
+                        except Exception:pass # ACK expiry/rate limiting does not cancel the action.
                         if callback['data'].startswith(('v:','f:')):
-                            self.replay(archive,callback['data'][2:],chat_id,update_id=update['update_id'],
+                            self._poll_replay(archive,callback['data'][2:],chat_id,update['update_id'],
                                         purpose='download' if callback['data'].startswith('f:') else 'view')
-                            archive.state('telegram_offset',update['update_id']+1)
+                            self._advance_poll(archive,update['update_id'],backend)
                             continue
                         if callback['data'].startswith('x:'):
                             text,buttons=self.deletion_menu(archive,callback['data'][2:],actor)
@@ -767,7 +905,7 @@ class Telegram:
                             if not row:raise ValueError('Unknown recording to restore')
                             archive.restore_recording(row['key'],actor)
                             text,buttons=self.trash_menu(archive)
-                            text='Đã khôi phục video vào kho chung.\n'+text
+                            text='Đã khôi phục video.\n'+text
                         elif callback['data']=='cancel-delete':
                             archive.state(f'telegram_delete_confirm:{actor}','{}')
                             text,buttons=self.menu(archive,'root')
@@ -786,17 +924,15 @@ class Telegram:
                             if len(words)>1:
                                 if not words[1].startswith('play_'):
                                     raise ValueError('Unknown start payload')
-                                self.replay(archive,words[1][5:],chat_id,update_id=update['update_id'])
-                                archive.state('telegram_offset',update['update_id']+1)
+                                self._poll_replay(archive,words[1][5:],chat_id,update['update_id'])
+                                self._advance_poll(archive,update['update_id'],backend)
                                 continue
-                            text=('Đã kết nối owner. Video mới lưu vào channel riêng; chat này chỉ hiện video khi bạn chọn xem.' if actor==self.owner and self.channel_mode else
-                                  'Đã kết nối owner. Video mới được gửi trực tiếp trong chat riêng này.' if actor==self.owner else
-                                  'Đã kết nối viewer. Video đã lưu được phát lại trong chat riêng này.')+'\nDùng /archive hoặc /recent để xem lại.'
+                            text='Camera'
                             buttons=[[{'text':'📷 Camera','callback_data':'root'},
                                       {'text':'🕐 Video gần đây','callback_data':'recent:0'}]]
                             persistent_keyboard=True
                         elif command == '/status':
-                            text=json.dumps(archive.status(),ensure_ascii=False)
+                            text=self.status_text(archive)
                             buttons=[[{'text':'Archive','callback_data':'root'}]]
                         elif command == '/sync' or message.get('text','').strip() in ('▶ Start sync','Start sync'):
                             text,buttons=self.sync_action(archive,'sync:all',actor)
@@ -810,9 +946,9 @@ class Telegram:
                     self.request('sendMessage',{'chat_id':chat_id,'text':text,
                                                'reply_markup':self.reply_keyboard() if persistent_keyboard else {'inline_keyboard':buttons}})
                 except (ValueError,KeyError,IndexError):
-                    self.request('sendMessage',{'chat_id':chat_id,'text':'Mục lựa chọn đã thay đổi. Dùng /archive để chọn lại.'})
+                    self.request('sendMessage',{'chat_id':chat_id,'text':'Mục này đã thay đổi. Chọn lại Camera.'})
             except ApiRejected as exc:
                 if not (400 <= exc.code < 500) or exc.code==429:
                     raise
                 # Expired callback/blocked user must not pin the durable update cursor.
-            archive.state('telegram_offset',update['update_id']+1)
+            self._advance_poll(archive,update['update_id'],backend)

@@ -336,18 +336,28 @@ class ChannelStorageTests(unittest.TestCase):
                 self.assertEqual(self.telegram.replay(self.archive,key[:32],43,update_id=40+index),'unknown')
                 self.assertEqual([c[0] for c in self.calls],['copyMessage'])
 
-    def test_forbidden_viewer_deleted_row_and_cross_channel_never_copy(self):
+    def test_forbidden_viewer_and_deleted_row_never_copy_but_old_channel_remains_replayable(self):
         key=self.uploaded()
         with self.assertRaises(ValueError):self.telegram.replay(self.archive,key[:32],99)
         self.archive.soft_delete(key,43)
         with self.assertRaises(ValueError):self.telegram.replay(self.archive,key[:32],43)
         self.archive.restore_recording(key,43)
-        self.settings.storage_channel_id=self.channel-1
-        with self.assertRaises(ValueError):self.telegram.replay(self.archive,key[:32],43)
         self.assertEqual(self.calls,[])
+        before=self.row(key)
+        self.settings.storage_channel_id=self.channel-1
+        self.assertEqual(self.telegram.replay(self.archive,key[:32],43),'replayed')
+        self.assertEqual([call[0] for call in self.calls],['copyMessage'])
+        self.assertEqual(self.calls[0][1]['from_chat_id'],self.channel)
+        self.assertEqual(self.row(key),before)
 
     def test_different_bot_identity_blocks_channel_copy(self):
         key=self.uploaded();self.archive.state('telegram_bot_id','701')
+        with self.assertRaises(ValueError):self.telegram.replay(self.archive,key[:32],43)
+        self.assertEqual(self.calls,[])
+
+    def test_changed_bot_token_blocks_old_channel_copy_even_with_stale_saved_identity(self):
+        key=self.uploaded();self.settings.token='701:synthetic-new-bot-token'
+        self.assertEqual(self.archive.state('telegram_bot_id'),'700')
         with self.assertRaises(ValueError):self.telegram.replay(self.archive,key[:32],43)
         self.assertEqual(self.calls,[])
 

@@ -5,6 +5,18 @@ bot hiện có làm giao diện tra cứu. Recording mới chỉ upload vào pri
 owner/viewer nhận phản hồi trong private chat **khi chủ động yêu cầu**, không nhận
 mỗi recording mới. Mục lục: **Camera → Năm → Tháng → Ngày → Video**, có Cũ → Mới.
 
+Menu dùng nhãn ngắn: **Hôm nay → Camera → Video**, **Hôm qua**, **6 giờ trước**.
+Đổi `TELEGRAM_STORAGE_CHANNEL_ID` chỉ đổi kho cho recording mới; video đã xác
+nhận vẫn phát lại theo channel/message ID đã lưu trong SQLite, không ghi đè
+placement cũ hoặc upload lại lịch sử. Giữ bot và volumes cũ khi đổi channel.
+
+Polling lưu identity backend và cursor. Khi chuyển backend, bot đối chiếu ID
+thật được `getUpdates` trả về trước khi phục hồi cursor thấp hơn; không xóa
+pending updates. Telegram cũng có thể chọn update ID ngẫu nhiên sau một tuần
+không có update ([Update](https://core.telegram.org/bots/api#update)).
+ACK nút hết hạn không bỏ thao tác; backoff xem video không khóa menu của
+người khác. Lượt gửi chưa xác nhận vẫn không tự gửi lại.
+
 ```text
 Camera SD → lịch 15 phút / Start sync
   → HCNetSDK hoặc ISAPI → tải recording đã đóng

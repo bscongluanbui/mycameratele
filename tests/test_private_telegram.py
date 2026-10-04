@@ -133,7 +133,7 @@ class PrivateTelegramTests(unittest.TestCase):
         self.assertEqual([r['chat_id'] for r in replies],[43,44,42])
         self.assertIn('Camera',replies[0]['text'])
         self.assertIn('Video gần đây',replies[1]['text'])
-        self.assertIn('queue',replies[2]['text'])
+        self.assertIn('Hàng đợi',replies[2]['text'])
 
     def test_viewer_callbacks_replay_file_id_to_each_viewer_without_local_bytes_or_index_mutation(self):
         key=self.confirmed()
@@ -273,34 +273,169 @@ class PrivateTelegramTests(unittest.TestCase):
         calls=self.poll_updates([self.callback(43,'v:'+key[:32])])
         self.assertEqual([method for method,_,_ in calls],['getUpdates'])
 
-    def test_replay_rate_limit_preserves_update_cursor_and_original_metadata(self):
+    def test_replay_rate_limit_consumes_event_keeps_menus_live_and_requires_manual_retry(self):
         key=self.confirmed()
         before=self.row(key)
         self.archive.state('telegram_offset',40)
-        attempts=[]
+        attempts=[];replies=[]
+        updates=[self.callback(43,'v:'+key[:32],40),self.message(44,'/status',41)]
         def fake(method,fields,**kwargs):
-            if method=='getUpdates':return [self.callback(43,'v:'+key[:32],40)]
+            if method=='getUpdates':return updates
             if method=='answerCallbackQuery':return True
+            if method=='sendMessage':replies.append(fields);return {'message_id':92}
             if method=='sendVideo':
                 attempts.append(fields)
                 if len(attempts)==1:raise ApiRejected(429,10)
                 return self.media_response(43)
             raise AssertionError(method)
         self.request.side_effect=fake
-        with self.assertRaises(ApiRejected):self.telegram.poll(self.archive)
-        self.assertEqual(self.archive.state('telegram_offset'),'40')
+        self.telegram.poll(self.archive)
+        self.assertEqual(self.archive.state('telegram_offset'),'42')
         self.assertEqual(self.row(key),before)
-        self.assertEqual(json.loads(self.archive.state('telegram_replay_attempt')),{})
+        self.assertEqual(json.loads(self.archive.state('telegram_replay_attempt')),{'update_id':40,'phase':'rejected'})
+        self.assertTrue(any(r['chat_id']==44 and 'Hàng đợi' in r['text'] for r in replies))
         retry_at=float(self.archive.state('telegram_replay_retry_at'))
         count=self.request.call_count
         self.telegram.poll(self.archive)
-        self.assertEqual(self.request.call_count,count)
+        self.assertGreater(self.request.call_count,count) # Poll always fetches updates.
+        updates[:]=[self.callback(43,'v:'+key[:32],42)]
+        self.telegram.poll(self.archive)
+        self.assertEqual(len(attempts),1)
+        self.assertEqual(self.archive.state('telegram_offset'),'43')
         with patch('archive_app.telegram.time.time',return_value=retry_at+1):
+            self.telegram.poll(self.archive) # Expiry never automatically retries a consumed event.
+            self.assertEqual(len(attempts),1)
+            updates[:]=[self.callback(43,'v:'+key[:32],43)]
             self.telegram.poll(self.archive)
         self.assertEqual(len(attempts),2)
-        self.assertEqual(self.archive.state('telegram_offset'),'41')
+        self.assertEqual(self.archive.state('telegram_offset'),'44')
         self.assertEqual(json.loads(self.archive.state('telegram_replay_attempt'))['phase'],'done')
         self.assertEqual(self.row(key),before)
+
+    def test_first_backend_adoption_recovers_actual_lower_batch_and_backs_up_exact_journal(self):
+        self.archive.state('telegram_offset','507024231')
+        journal='{"update_id":507024230,"phase":"unknown"}'
+        self.archive.state('telegram_replay_attempt',journal)
+        self.archive.state('telegram_replay_retry_at','0')
+        calls=self.poll_updates([self.message(43,'📅 Hôm nay',50213048)])
+        self.assertEqual(calls[0][1]['offset'],507024231)
+        self.assertEqual(self.archive.state('telegram_offset'),'50213049')
+        self.assertTrue(any(c[0]=='sendMessage' for c in calls))
+        diagnostic=json.loads(self.archive.state('telegram_poll_epoch'))
+        self.assertEqual(diagnostic['old_cursor'],'507024231')
+        self.assertEqual(diagnostic['replay_attempt'],journal)
+        self.assertEqual(diagnostic['new_cursor'],50213048)
+        self.assertEqual(json.loads(self.archive.state('telegram_replay_attempt')),{})
+        self.assertEqual(len(self.archive.state('telegram_poll_backend')),64)
+
+    def test_empty_first_adoption_does_not_prevent_later_actual_lower_recovery(self):
+        self.archive.state('telegram_offset',500)
+        self.poll_updates([])
+        self.assertIsNone(self.archive.state('telegram_poll_backend'))
+        self.assertEqual(self.archive.state('telegram_offset'),'500')
+        self.poll_updates([self.message(43,'/archive',20)])
+        self.assertEqual(self.archive.state('telegram_offset'),'21')
+
+    def test_known_backend_ignores_stale_lower_batch_before_seven_days(self):
+        self.archive.state('telegram_offset',500)
+        self.archive.state('telegram_poll_backend',self.telegram._poll_backend(self.archive))
+        self.archive.state('telegram_poll_last_processed_at',1000)
+        with patch('archive_app.telegram.time.time',return_value=1000+6*86400):
+            calls=self.poll_updates([self.message(43,'/archive',20)])
+        self.assertEqual([c[0] for c in calls],['getUpdates'])
+        self.assertEqual(self.archive.state('telegram_offset'),'500')
+        self.assertIsNone(self.archive.state('telegram_poll_epoch'))
+
+    def test_known_backend_recovers_lower_actual_batch_after_seven_days_idle(self):
+        self.archive.state('telegram_offset',500)
+        self.archive.state('telegram_poll_backend',self.telegram._poll_backend(self.archive))
+        self.archive.state('telegram_poll_last_processed_at',1000)
+        with patch('archive_app.telegram.time.time',return_value=1000+7*86400):
+            self.poll_updates([self.message(43,'/archive',20)])
+        self.assertEqual(self.archive.state('telegram_offset'),'21')
+        self.assertEqual(json.loads(self.archive.state('telegram_poll_epoch'))['reason'],'idle')
+
+    def test_backend_change_recovers_lower_batch_without_resetting_for_channel_change(self):
+        self.archive.state('telegram_offset',500)
+        old=self.telegram._poll_backend(self.archive)
+        self.archive.state('telegram_poll_backend',old)
+        self.settings.storage_channel_id=-100987654
+        self.assertEqual(self.telegram._poll_backend(self.archive),old)
+        self.settings.api_mode='local';self.settings.api_base='http://fixture-local:8081'
+        calls=self.poll_updates([self.message(43,'/archive',20)])
+        self.assertTrue(any(c[0]=='sendMessage' for c in calls))
+        self.assertNotEqual(self.archive.state('telegram_poll_backend'),old)
+        self.assertEqual(self.archive.state('telegram_offset'),'21')
+
+    def test_lower_batch_overlapping_uncertain_journal_keeps_guard_but_other_menus_continue(self):
+        self.archive.state('telegram_offset',500)
+        journal='{"update_id":20,"phase":"unknown"}'
+        self.archive.state('telegram_replay_attempt',journal)
+        self.archive.state('telegram_replay_retry_at','12345')
+        calls=self.poll_updates([self.callback(43,'v:'+'a'*32,20),self.message(44,'📅 Hôm nay',21)])
+        self.assertEqual([c[0] for c in calls],['getUpdates','sendMessage'])
+        self.assertEqual(self.archive.state('telegram_offset'),'22')
+        self.assertEqual(json.loads(self.archive.state('telegram_replay_attempt')),json.loads(journal))
+        self.assertEqual(self.archive.state('telegram_replay_retry_at'),'12345')
+        self.assertEqual(json.loads(self.archive.state('telegram_poll_epoch'))['replay_attempt'],journal)
+
+    def test_mixed_batch_does_not_reset_cursor_or_replay_journal(self):
+        self.archive.state('telegram_offset',500)
+        journal='{"update_id":20,"phase":"unknown"}'
+        self.archive.state('telegram_replay_attempt',journal)
+        calls=self.poll_updates([self.message(43,'/archive',20),self.message(44,'/status',501)])
+        replies=[c[1] for c in calls if c[0]=='sendMessage']
+        self.assertEqual([r['chat_id'] for r in replies],[44])
+        self.assertEqual(self.archive.state('telegram_offset'),'502')
+        self.assertEqual(self.archive.state('telegram_replay_attempt'),journal)
+        self.assertIsNone(self.archive.state('telegram_poll_epoch'))
+
+    def test_epoch_guard_blocks_later_historical_unknown_event_after_nonoverlap_recovery(self):
+        key=self.confirmed()
+        self.archive.state('telegram_offset',1000)
+        journal='{"update_id":950,"phase":"unknown"}'
+        self.archive.state('telegram_replay_attempt',journal)
+        self.poll_updates([self.message(43,'/archive',100)])
+        self.assertEqual(self.archive.state('telegram_offset'),'101')
+        self.assertEqual(json.loads(self.archive.state('telegram_replay_attempt')),{})
+        calls=self.poll_updates([self.callback(43,'v:'+key[:32],950)])
+        self.assertEqual([c[0] for c in calls],['getUpdates'])
+        self.assertEqual(self.archive.state('telegram_offset'),'951')
+        self.assertEqual(json.loads(self.archive.state('telegram_replay_attempt')),json.loads(journal))
+
+    def test_invalid_batch_cannot_supply_cursor_recovery_evidence(self):
+        self.archive.state('telegram_offset',500)
+        self.poll_updates([self.message(43,'/archive',20),{'update_id':True,'message':{}}])
+        self.assertEqual(self.archive.state('telegram_offset'),'500')
+        self.assertIsNone(self.archive.state('telegram_poll_epoch'))
+
+    def test_expired_or_rate_limited_callback_ack_does_not_drop_menu_action(self):
+        for code in (400,429):
+            with self.subTest(code=code):
+                self.archive.state('telegram_offset',code)
+                replies=[]
+                def fake(method,fields,**kwargs):
+                    if method=='getUpdates':return [self.callback(43,'root',code)]
+                    if method=='answerCallbackQuery':raise ApiRejected(code,10)
+                    if method=='sendMessage':replies.append(fields);return {'message_id':92}
+                    raise AssertionError(method)
+                self.request.side_effect=fake
+                self.telegram.poll(self.archive)
+                self.assertEqual(len(replies),1)
+                self.assertIn('Camera',replies[0]['text'])
+                self.assertEqual(self.archive.state('telegram_offset'),str(code+1))
+
+    def test_expired_callback_ack_still_performs_media_action_once(self):
+        key=self.confirmed();sends=[]
+        def fake(method,fields,**kwargs):
+            if method=='getUpdates':return [self.callback(43,'v:'+key[:32],40)]
+            if method=='answerCallbackQuery':raise ApiRejected(400)
+            if method=='sendVideo':sends.append(fields);return self.media_response(43)
+            raise AssertionError(method)
+        self.request.side_effect=fake
+        self.telegram.poll(self.archive);self.telegram.poll(self.archive)
+        self.assertEqual(len(sends),1)
+        self.assertEqual(self.archive.state('telegram_offset'),'41')
 
     def test_replay_timeout_consumes_event_once_and_new_manual_click_can_replay(self):
         key=self.confirmed()

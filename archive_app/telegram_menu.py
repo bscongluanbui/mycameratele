@@ -34,14 +34,14 @@ class TimeMenus:
     def commands():
         """Commands for Telegram's persistent Menu button (setMyCommands)."""
         return [
-            {'command': 'sync', 'description': 'Start sync tất cả camera đang bật'},
-            {'command': 'today', 'description': 'Hôm nay → chọn Camera → video'},
-            {'command': 'yesterday', 'description': 'Hôm qua → chọn Camera → video'},
-            {'command': 'last6h', 'description': '6 giờ trước → chọn Camera → video'},
-            {'command': 'archive', 'description': 'Kho video theo Camera / năm / tháng / ngày'},
+            {'command': 'sync', 'description': 'Start sync'},
+            {'command': 'today', 'description': 'Hôm nay'},
+            {'command': 'yesterday', 'description': 'Hôm qua'},
+            {'command': 'last6h', 'description': '6 giờ trước'},
+            {'command': 'archive', 'description': 'Kho video'},
             {'command': 'recent', 'description': 'Video gần đây'},
-            {'command': 'trash', 'description': 'Video đã xóa và khôi phục'},
-            {'command': 'status', 'description': 'Trạng thái hệ thống'},
+            {'command': 'trash', 'description': 'Thùng rác'},
+            {'command': 'status', 'description': 'Trạng thái'},
         ]
 
     @staticmethod
@@ -79,10 +79,7 @@ class TimeMenus:
             start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
             if start_ms < 0:
                 raise ValueError('Invalid time-menu window')
-        label = self._LABELS[kind]
-        summary = (f'{label} | {start:%d/%m/%Y %H:%M} → {end:%d/%m/%Y %H:%M}'
-                   f' ({self.telegram.settings.timezone})')
-        return start_ms, end_ms, summary
+        return start_ms, end_ms, self._LABELS[kind]
 
     @staticmethod
     def _valid_page(result, page, key):
@@ -125,8 +122,10 @@ class TimeMenus:
             buttons.append(nav)
         buttons.extend(self.shortcuts())
         buttons.append([self._button('↩ Tất cả Camera', 'root')])
-        detail = 'Chọn Camera' if result['cameras'] else 'Chưa có video trong khoảng thời gian này.'
-        return f'{summary}\n{detail} | trang {page + 1}', buttons
+        title = f'{summary} · Camera · trang {page + 1}'
+        if not result['cameras']:
+            title += '\nChưa có video.'
+        return title, buttons
 
     def _clips(self, archive, kind, anchor, token, order, page, camera_page):
         start_ms, end_ms, summary = self._window(kind, anchor)
@@ -159,12 +158,11 @@ class TimeMenus:
         if nav:
             buttons.append(nav)
         buttons.append([
-            self._button('Đổi: Mới → cũ' if order == 'a' else 'Đổi: Cũ → mới',
+            self._button('Mới → cũ' if order == 'a' else 'Cũ → mới',
                          self._clip_callback(kind, anchor, token, 'd' if order == 'a' else 'a', 0, camera_page)),
             self._button('↩ Camera', self._camera_callback(kind, anchor, order, camera_page)),
         ])
         if not lines:
-            lines.append('Chưa có video trong khoảng thời gian này.')
-        sorting = 'Cũ → mới' if order == 'a' else 'Mới → cũ'
-        title = f"{camera['name']}\n{summary}\n{sorting} | trang {page + 1} | {result['total']} video"
+            lines.append('Chưa có video.')
+        title = f"{camera['name']} · {summary} · {result['total']} video · trang {page + 1}"
         return title + '\n' + '\n'.join(lines), buttons

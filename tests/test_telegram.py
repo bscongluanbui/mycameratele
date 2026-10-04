@@ -296,9 +296,9 @@ class TelegramTests(unittest.TestCase):
         self.request.side_effect = fake_request
         self.telegram.poll(self.archive)
         self.assertEqual(self.archive.state("telegram_offset"), "102")
-        self.assertEqual(len(replies), 1)
-        self.assertEqual(replies[0]["chat_id"], 42)
-        self.assertIn("queue", replies[0]["text"])
+        self.assertEqual(len(replies), 2) # Expired ACK does not cancel the button action.
+        self.assertTrue(all(reply["chat_id"]==42 for reply in replies))
+        self.assertIn("Hàng đợi", replies[-1]["text"])
 
     def test_invalid_callback_fallback_403_does_not_pin_cursor_or_block_next_update(self):
         self.settings.allowed_users = (42,)
@@ -314,7 +314,7 @@ class TelegramTests(unittest.TestCase):
                 return True
             if method == "sendMessage":
                 sent.append(fields)
-                if "queue" not in fields["text"]:
+                if "Hàng đợi" not in fields["text"]:
                     raise ApiRejected(403)
                 return {"message_id": 65}
             raise AssertionError(f"Unexpected method {method}")
@@ -322,8 +322,8 @@ class TelegramTests(unittest.TestCase):
         self.telegram.poll(self.archive)
         self.assertEqual(self.archive.state("telegram_offset"), "202")
         self.assertEqual(len(sent), 2)
-        self.assertNotIn("queue", sent[0]["text"])
-        self.assertIn("queue", sent[1]["text"])
+        self.assertNotIn("Hàng đợi", sent[0]["text"])
+        self.assertIn("Hàng đợi", sent[1]["text"])
 
     def test_rate_limited_callback_fallback_preserves_cursor_for_retry(self):
         self.settings.allowed_users = (42,)

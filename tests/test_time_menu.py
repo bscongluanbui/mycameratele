@@ -70,6 +70,9 @@ class TimeMenuTests(unittest.TestCase):
         commands = self.menus.commands()
         self.assertEqual([command['command'] for command in commands],
                          ['sync', 'today', 'yesterday', 'last6h', 'archive', 'recent', 'trash', 'status'])
+        self.assertEqual([command['description'] for command in commands],
+                         ['Start sync', 'Hôm nay', 'Hôm qua', '6 giờ trước', 'Kho video',
+                          'Video gần đây', 'Thùng rác', 'Trạng thái'])
         for command in commands:
             self.assertRegex(command['command'], r'^[a-z0-9_]{1,32}$')
             self.assertTrue(1 <= len(command['description']) <= 256)
@@ -86,13 +89,16 @@ class TimeMenuTests(unittest.TestCase):
         self.recording('2026-10-04T00:00:00+07:00', '2026-10-04T00:01:00+07:00')
         self.recording('2026-10-03T01:00:00+07:00', '2026-10-03T01:01:00+07:00', status='downloaded')
         text, cameras = self.menus.menu(self.archive, 'today')
-        self.assertIn('03/10/2026 00:00 → 04/10/2026 00:00', text)
-        self.assertIn('Chọn Camera', text)
+        self.assertEqual(text, 'Hôm nay · Camera · trang 1')
+        self.assertEqual(self.menus._window('t', self.NOW)[:2],
+                         (stamp('2026-10-03T00:00:00+07:00'), stamp('2026-10-04T00:00:00+07:00')))
         self.assertEqual(self.callbacks(cameras, 'v:'), [])
         self.assertEqual(len(self.callbacks(cameras, 'wc:')), 1)
         self.assertIn('Cửa trước (2 video)', cameras[0][0]['text'])
         title, clips = self.menus.menu(self.archive, self.camera_selection(cameras))
-        self.assertIn('Cửa trước', title)
+        self.assertEqual(title.splitlines()[0], 'Cửa trước · Hôm nay · 2 video · trang 1')
+        self.assertIn('1. 02/10 23:59:00 → 03/10 00:01:00', title)
+        self.assertNotIn(self.settings.timezone, title)
         self.assertEqual(self.callbacks(clips, 'v:'), ['v:' + crossing[:32], 'v:' + exact_start[:32]])
         self.assertEqual(self.callbacks(clips, 'f:'), ['f:' + crossing[:32], 'f:' + exact_start[:32]])
         self.assertEqual(self.callbacks(clips, 'x:'), ['x:' + crossing[:32], 'x:' + exact_start[:32]])
@@ -102,8 +108,9 @@ class TimeMenuTests(unittest.TestCase):
         included = self.recording('2026-10-02T23:59:00+07:00', '2026-10-03T00:01:00+07:00')
         self.recording('2026-10-03T00:01:00+07:00', '2026-10-03T00:02:00+07:00')
         text, cameras = self.menus.menu(self.archive, 'yesterday')
-        self.assertIn('Hôm qua', text)
-        self.assertIn('02/10/2026 00:00 → 03/10/2026 00:00', text)
+        self.assertEqual(text, 'Hôm qua · Camera · trang 1')
+        self.assertEqual(self.menus._window('y', self.NOW)[:2],
+                         (stamp('2026-10-02T00:00:00+07:00'), stamp('2026-10-03T00:00:00+07:00')))
         _, clips = self.menus.menu(self.archive, self.camera_selection(cameras))
         self.assertEqual(self.callbacks(clips, 'v:'), ['v:' + included[:32]])
 
@@ -114,7 +121,9 @@ class TimeMenuTests(unittest.TestCase):
         self.recording('2026-10-02T20:20:00+07:00', '2026-10-02T20:30:00+07:00')
         self.recording('2026-10-03T02:30:00+07:00', '2026-10-03T02:31:00+07:00')
         text, cameras = self.menus.menu(self.archive, 'last6h')
-        self.assertIn('02/10/2026 20:30 → 03/10/2026 02:30', text)
+        self.assertEqual(text, '6 giờ trước · Camera · trang 1')
+        self.assertEqual(self.menus._window('h', self.NOW)[:2],
+                         (stamp('2026-10-02T20:30:00+07:00'), stamp('2026-10-03T02:30:00+07:00')))
         _, clips = self.menus.menu(self.archive, self.camera_selection(cameras))
         self.assertEqual(self.callbacks(clips, 'v:'), ['v:' + crossing_start[:32], 'v:' + inside[:32]])
 
@@ -126,9 +135,10 @@ class TimeMenuTests(unittest.TestCase):
         selected = self.camera_selection(cameras)
         self.clock_mock.return_value = self.NOW + 2 * 86400
         text, clips = self.menus.menu(self.archive, selected)
-        self.assertIn('03/10/2026 00:00 → 04/10/2026 00:00', text)
+        self.assertEqual(text.splitlines()[0], 'Cửa trước · Hôm nay · 1 video · trang 1')
+        self.assertIn('03/10 01:00:00 → 03/10 01:01:00', text)
         self.assertEqual(self.callbacks(clips, 'v:'), ['v:' + included[:32]])
-        sort = next(button['callback_data'] for row in clips for button in row if button['text'].startswith('Đổi:'))
+        sort = next(button['callback_data'] for row in clips for button in row if button['text'] == 'Mới → cũ')
         _, descending = self.menus.menu(self.archive, sort)
         self.assertEqual(self.callbacks(descending, 'v:'), ['v:' + included[:32]])
         back = self.callbacks(descending, 'w:')[0]
@@ -143,9 +153,10 @@ class TimeMenuTests(unittest.TestCase):
         _, cameras = self.menus.menu(self.archive, 'today')
         _, ascending = self.menus.menu(self.archive, self.camera_selection(cameras))
         self.assertEqual(self.callbacks(ascending, 'v:'), ['v:' + key[:32] for key in keys[:10]])
-        sort = next(button['callback_data'] for row in ascending for button in row if button['text'].startswith('Đổi:'))
+        sort = next(button['callback_data'] for row in ascending for button in row if button['text'] == 'Mới → cũ')
         text, descending = self.menus.menu(self.archive, sort)
-        self.assertIn('Mới → cũ', text)
+        self.assertEqual(text.splitlines()[0], 'Cửa trước · Hôm nay · 12 video · trang 1')
+        self.assertIn('Cũ → mới', [button['text'] for row in descending for button in row])
         self.assertEqual(self.callbacks(descending, 'v:'), ['v:' + key[:32] for key in keys[::-1][:10]])
         next_page = next(button['callback_data'] for row in descending for button in row if button['text'] == 'Video →')
         _, second = self.menus.menu(self.archive, next_page)
@@ -196,6 +207,24 @@ class TimeMenuTests(unittest.TestCase):
         self.assertEqual(self.callbacks(clips, 'f:'), [])
         self.assertEqual(self.callbacks(clips, 'x:'), [])
 
+    def test_time_menu_text_is_labels_only_with_timestamps_and_short_empty_state(self):
+        self.camera(name='PN')
+        key = self.recording('2026-10-03T01:00:00+07:00', '2026-10-03T01:01:00+07:00')
+        text, cameras = self.menus.menu(self.archive, 'today')
+        self.assertEqual(text, 'Hôm nay · Camera · trang 1')
+        title, clips = self.menus.menu(self.archive, self.camera_selection(cameras))
+        self.assertEqual(title, 'PN · Hôm nay · 1 video · trang 1\n1. 03/10 01:00:00 → 03/10 01:01:00')
+        for body in (text, title):
+            self.assertNotIn(self.settings.timezone, body)
+            self.assertNotIn('Chọn', body)
+            self.assertNotIn('khoảng thời gian', body)
+        self.assertIn('Mới → cũ', [button['text'] for row in clips for button in row])
+        self.archive.soft_delete(key, 43)
+        title, clips = self.menus.menu(self.archive, self.camera_selection(cameras))
+        self.assertEqual(title, 'PN · Hôm nay · 0 video · trang 1\nChưa có video.')
+        empty, _ = self.menus.menu(self.archive, 'today')
+        self.assertEqual(empty, 'Hôm nay · Camera · trang 1\nChưa có video.')
+
     def test_invalid_tampered_callbacks_and_out_of_range_pages(self):
         self.camera()
         token = self.telegram.camera_token('Front_Camera')
@@ -214,9 +243,10 @@ class TimeMenuTests(unittest.TestCase):
         key = self.recording('2010-05-01T10:00:00+07:00', '2010-05-01T10:01:00+07:00')
         old_anchor = int(datetime.fromisoformat('2010-05-01T12:00:00+07:00').timestamp())
         text, cameras = self.menus.menu(self.archive, f'w:t:{old_anchor}:a:0')
-        self.assertIn('01/05/2010', text)
-        _, clips = self.menus.menu(self.archive, self.camera_selection(cameras))
+        self.assertEqual(text, 'Hôm nay · Camera · trang 1')
+        title, clips = self.menus.menu(self.archive, self.camera_selection(cameras))
         self.assertEqual(self.callbacks(clips, 'v:'), ['v:' + key[:32]])
+        self.assertIn('01/05 10:00:00 → 01/05 10:01:00', title)
 
     def test_daily_shortcut_does_not_assume_twenty_four_hours_at_dst(self):
         # datetime.timezone is available without an OS zone database. This
