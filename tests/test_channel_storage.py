@@ -51,6 +51,8 @@ class ChannelStorageTests(unittest.TestCase):
             recipient=fields['chat_id']
             return {'chat':{'id':recipient,'type':'channel' if recipient<0 else 'private'},
                     'message_id':701,field:{'file_id':'saved-fixture-id','file_unique_id':'saved-fixture-unique'}}
+        if method=='sendMessage':return {'message_id':702,'chat':{'id':fields['chat_id'],'type':'private'}}
+        if method=='editMessageText':return {'message_id':fields['message_id']}
         return True
 
     def ingest(self, remux=False, camera='front'):
