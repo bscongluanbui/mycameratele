@@ -34,7 +34,8 @@ class Telegram:
         """Configure the Telegram Menu once per token/schema, with bounded retries."""
         if not self.settings.token:
             return False
-        state_key='telegram_commands_v4:'+hashlib.sha256(self.settings.token.encode()).hexdigest()[:16]
+        schema=json.dumps(TimeMenus.commands(),ensure_ascii=False,sort_keys=True,separators=(',',':'))
+        state_key='telegram_commands_v5:'+hashlib.sha256((self.settings.token+'\0'+schema).encode()).hexdigest()[:16]
         if archive.state(state_key)=='1':return True
         if time.time()<self._menu_retry_at:return False
         self._menu_retry_at=time.time()+60

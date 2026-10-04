@@ -1,5 +1,5 @@
 """End-to-end bot controls with synthetic SQLite/media and a fake API."""
-import json, os, shutil, tempfile, unittest, uuid
+import hashlib,json, os, shutil, tempfile, unittest, uuid
 from pathlib import Path
 from unittest.mock import patch
 from archive_app.core import Archive, Settings
@@ -125,6 +125,20 @@ class BotControlTests(unittest.TestCase):
         texts=[b['text'] for row in keyboard['keyboard'] for b in row]
         self.assertTrue({'📅 Hôm nay','📆 Hôm qua','🕕 6 giờ trước'}.issubset(texts))
 
+    def test_compact_command_labels_refresh_cached_v4_and_schema_changes(self):
+        old='telegram_commands_v4:'+hashlib.sha256(self.settings.token.encode()).hexdigest()[:16]
+        self.archive.state(old,'1')
+        self.assertTrue(self.telegram.register_commands(self.archive))
+        sent=[c for c in self.calls if c[0]=='setMyCommands']
+        self.assertEqual(len(sent),1)
+        self.assertEqual(next(c['description'] for c in sent[0][1]['commands'] if c['command']=='today'),'Hôm nay')
+        self.assertTrue(self.telegram.register_commands(self.archive))
+        self.assertEqual(len([c for c in self.calls if c[0]=='setMyCommands']),1)
+        with patch('archive_app.telegram.TimeMenus.commands',return_value=[{'command':'today','description':'Hôm nay mới'}]):
+            self.telegram._menu_retry_at=0
+            self.assertTrue(self.telegram.register_commands(self.archive))
+        self.assertEqual(len([c for c in self.calls if c[0]=='setMyCommands']),2)
+
     def test_command_and_text_shortcuts_choose_camera_before_videos(self):
         for index,label in enumerate(('/today','/yesterday','/last6h','📅 Hôm nay','📆 Hôm qua','🕕 6 giờ trước')):
             self.calls.clear()
@@ -145,4 +159,3 @@ class BotControlTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):self.telegram.register_commands(self.archive)
         count=self.request.call_count;self.assertFalse(self.telegram.register_commands(self.archive))
         self.assertEqual(self.request.call_count,count)
-
