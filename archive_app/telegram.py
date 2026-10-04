@@ -48,9 +48,20 @@ class Telegram:
 
     @staticmethod
     def reply_keyboard():
-        return {'keyboard':[[{'text':'📅 Hôm nay'},{'text':'📆 Hôm qua'},{'text':'🕕 6 giờ trước'}],
+        return {'keyboard':[[{'text':'🏠 Start'},{'text':'▶ Start sync'}],
+                            [{'text':'📅 Hôm nay'},{'text':'📆 Hôm qua'},{'text':'🕕 6 giờ trước'}],
+                            [{'text':'🗓 Tùy chọn thời gian'}],
                             [{'text':'📷 Camera'},{'text':'🕐 Video gần đây'},{'text':'🗑 Thùng rác'}],
-                            [{'text':'▶ Start sync'},{'text':'⚙ Trạng thái'}]],'resize_keyboard':True,'is_persistent':True}
+                            [{'text':'⚙ Trạng thái'}]],'resize_keyboard':True,'is_persistent':True}
+
+    def ensure_keyboard(self, archive, actor, *, force=False):
+        """Install refreshed persistent actions once, including existing viewers."""
+        schema=json.dumps(self.reply_keyboard(),ensure_ascii=False,sort_keys=True,separators=(',',':'))
+        name=f'telegram_keyboard:{actor}:'+hashlib.sha256((self.settings.token+'\0'+schema).encode()).hexdigest()[:12]
+        if force or archive.state(name) != '1':
+            self.request('sendMessage',{'chat_id':actor,'text':'🏠 Menu',
+                                       'reply_markup':self.reply_keyboard(),'disable_notification':True})
+            archive.state(name,'1')
 
     @staticmethod
     def recording_buttons(row, label):
@@ -484,13 +495,22 @@ class Telegram:
         buttons.append([{'text':'↩ Camera','callback_data':'root'}])
         return f'Video gần đây | trang {page+1}',buttons
 
-    def menu(self, archive, data='root'):
+    def menu(self, archive, data='root', actor=None):
         # Camera IDs stay immutable; friendly names never enter callback_data.
         # Keep callback payloads compact even for a 64-character camera ID.
         if data == 'status':
             return self.status_text(archive),[[{'text':'↩ Camera','callback_data':'root'}]]
-        if data in ('today','yesterday','last6h') or data.startswith(('w:','wc:')):
-            return TimeMenus(self).menu(archive,data)
+        if data == 'home':
+            buttons=TimeMenus.shortcuts()
+            buttons.extend([[{'text':'📷 Camera / Kho video','callback_data':'root'}],
+                            [{'text':'▶ Start sync tất cả','callback_data':'sync:all'}],
+                            [{'text':'📊 Tiến trình sync','callback_data':'ss:all'}],
+                            [{'text':'🕐 Video gần đây','callback_data':'recent:0'}],
+                            [{'text':'🗑 Thùng rác','callback_data':'trash:0'}],
+                            [{'text':'⚙ Trạng thái','callback_data':'status'}]])
+            return '📹 Camera · Menu',buttons
+        if data in ('today','yesterday','last6h','custom-time') or data.startswith(('w:','wc:','wq:','wqc:')):
+            return TimeMenus(self).menu(archive,data,actor=actor)
         if data.startswith('trash:'):
             return self.trash_menu(archive,int(data.split(':')[1]))
         if data.startswith('recent:'):
@@ -513,12 +533,13 @@ class Telegram:
                 nav.append({'text':'→', 'callback_data':f'r:{page+1}'})
             if nav:
                 buttons.append(nav)
-            buttons.append([{'text':'▶ Start sync tất cả','callback_data':'sync:all'},
-                            {'text':'Tiến trình sync','callback_data':'ss:all'}])
+            buttons.append([{'text':'▶ Start sync tất cả','callback_data':'sync:all'}])
+            buttons.append([{'text':'📊 Tiến trình sync','callback_data':'ss:all'}])
             buttons.extend(TimeMenus.shortcuts())
-            buttons.append([{'text':'🕐 Video gần đây','callback_data':'recent:0'},
-                            {'text':'🗑 Thùng rác','callback_data':'trash:0'},
-                            {'text':'⚙ Trạng thái','callback_data':'status'}])
+            buttons.append([{'text':'🕐 Video gần đây','callback_data':'recent:0'}])
+            buttons.append([{'text':'🗑 Thùng rác','callback_data':'trash:0'}])
+            buttons.append([{'text':'⚙ Trạng thái','callback_data':'status'}])
+            buttons.append([{'text':'🏠 Menu','callback_data':'home'}])
             return 'Chọn Camera' + ('' if cameras else ' (chưa có camera)'), buttons
         pieces = data.split(':')
         kind = pieces[0]
@@ -873,7 +894,7 @@ class Telegram:
                 self._advance_poll(archive,update['update_id'],backend)
                 continue
             chat_id=message['chat']['id']
-            persistent_keyboard=False
+            refresh_keyboard=False
             previous=self._guarded_attempt(archive,update['update_id'])
             if previous.get('update_id')==update['update_id'] and previous.get('phase') in ('pending','unknown','done','rejected'):
                 # Crash after the POST but before its durable cursor commit.
@@ -892,6 +913,8 @@ class Telegram:
                     if callback:
                         try:self.request('answerCallbackQuery',{'callback_query_id':callback['id']})
                         except Exception:pass # ACK expiry/rate limiting does not cancel the action.
+                        if callback['data'] != 'custom-time':
+                            TimeMenus(self).dismiss_input(archive,actor)
                         if callback['data'].startswith(('v:','f:')):
                             self._poll_replay(archive,callback['data'][2:],chat_id,update['update_id'],
                                         purpose='download' if callback['data'].startswith('f:') else 'view')
@@ -910,42 +933,62 @@ class Telegram:
                         elif callback['data']=='cancel-delete':
                             archive.state(f'telegram_delete_confirm:{actor}','{}')
                             text,buttons=self.menu(archive,'root')
+                        elif callback['data']=='cancel-time':
+                            TimeMenus(self).cancel(archive,actor)
+                            text,buttons=self.menu(archive,'home')
                         elif callback['data'].startswith(('sync:','up:')):
                             text,buttons=self.sync_action(archive,callback['data'],actor)
-                        else:text,buttons=self.menu(archive,callback['data'])
+                        else:text,buttons=self.menu(archive,callback['data'],actor=actor)
                     else:
                         words=message.get('text','').split()
                         command=words[0].split('@')[0] if words else ''
+                        raw_text=message.get('text','').strip()
+                        is_start=command == '/start' or raw_text in ('🏠 Start','Start','🏠 Menu')
+                        mapping={'/today':'today','/yesterday':'yesterday','/last6h':'last6h','/recent':'recent:0','/trash':'trash:0',
+                                 '/time':'custom-time','🗓 Tùy chọn thời gian':'custom-time','Tùy chọn thời gian':'custom-time',
+                                 '📅 Hôm nay':'today','Hôm nay':'today','📆 Hôm qua':'yesterday','Hôm qua':'yesterday',
+                                 '🕕 6 giờ trước':'last6h','6 giờ trước':'last6h','6 giờ gần nhất':'last6h',
+                                 '📷 Camera':'root','🕐 Video gần đây':'recent:0','🗑 Thùng rác':'trash:0','⚙ Trạng thái':'status'}
+                        # Commands, aliases, and visible actions exit an unfinished date prompt.
+                        actions={button['text'] for row in self.reply_keyboard()['keyboard'] for button in row}
+                        date_input=None
+                        if (command.startswith('/') or raw_text in actions or raw_text in mapping or
+                                is_start or raw_text in ('Start sync','Hủy')):
+                            TimeMenus(self).dismiss_input(archive,actor)
+                        else:
+                            date_input=TimeMenus(self).accept(archive,actor,raw_text)
                         if actor == self.owner and (command == '/channel' or
                                 isinstance(message.get('forward_origin'), dict) and message['forward_origin'].get('type') == 'channel' or
                                 isinstance(message.get('forward_from_chat'), dict) and message['forward_from_chat'].get('type') == 'channel'):
                             text,buttons=self.channel_setup(actor,message)
-                        elif command == '/start':
+                        elif is_start:
                             self.start_viewer(archive,actor)
-                            if len(words)>1:
+                            if command == '/start' and len(words)>1:
                                 if not words[1].startswith('play_'):
                                     raise ValueError('Unknown start payload')
                                 self._poll_replay(archive,words[1][5:],chat_id,update['update_id'])
                                 self._advance_poll(archive,update['update_id'],backend)
                                 continue
-                            text='Camera'
-                            buttons=[[{'text':'📷 Camera','callback_data':'root'},
-                                      {'text':'🕐 Video gần đây','callback_data':'recent:0'}]]
-                            persistent_keyboard=True
+                            text,buttons=self.menu(archive,'home')
+                            refresh_keyboard=True
+                        elif command in ('/cancel','/huy') or raw_text == 'Hủy':
+                            TimeMenus(self).cancel(archive,actor)
+                            text,buttons=self.menu(archive,'home')
+                        elif date_input is not None:
+                            text,buttons=date_input
                         elif command == '/status':
                             text=self.status_text(archive)
                             buttons=[[{'text':'Archive','callback_data':'root'}]]
                         elif command == '/sync' or message.get('text','').strip() in ('▶ Start sync','Start sync'):
                             text,buttons=self.sync_action(archive,'sync:all',actor)
                         else:
-                            mapping={'/today':'today','/yesterday':'yesterday','/last6h':'last6h','/recent':'recent:0','/trash':'trash:0',
-                                     '📅 Hôm nay':'today','Hôm nay':'today','📆 Hôm qua':'yesterday','Hôm qua':'yesterday',
-                                     '🕕 6 giờ trước':'last6h','6 giờ trước':'last6h','6 giờ gần nhất':'last6h',
-                                     '📷 Camera':'root','🕐 Video gần đây':'recent:0','🗑 Thùng rác':'trash:0','⚙ Trạng thái':'status'}
                             data=mapping.get(message.get('text','').strip(),mapping.get(command,'root'))
-                            text,buttons=self.menu(archive,data)
+                            text,buttons=self.menu(archive,data,actor=actor)
                     self.request('sendMessage',{'chat_id':chat_id,'text':text,
-                                               'reply_markup':self.reply_keyboard() if persistent_keyboard else {'inline_keyboard':buttons}})
+                                               'reply_markup':{'inline_keyboard':buttons}})
+                    if not callback:
+                        try:self.ensure_keyboard(archive,actor,force=refresh_keyboard)
+                        except Exception:pass # The requested action was already delivered.
                 except (ValueError,KeyError,IndexError):
                     self.request('sendMessage',{'chat_id':chat_id,'text':'Mục này đã thay đổi. Chọn lại Camera.'})
             except ApiRejected as exc:

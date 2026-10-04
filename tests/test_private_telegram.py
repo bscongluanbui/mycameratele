@@ -129,7 +129,7 @@ class PrivateTelegramTests(unittest.TestCase):
 
     def test_all_allowlisted_viewers_can_browse_their_own_private_chat(self):
         calls=self.poll_updates([self.message(43,'/archive'),self.message(44,'/recent',2),self.message(42,'/status',3)])
-        replies=[fields for method,fields,_ in calls if method=='sendMessage']
+        replies=[fields for method,fields,_ in calls if method=='sendMessage' and 'inline_keyboard' in fields.get('reply_markup',{})]
         self.assertEqual([r['chat_id'] for r in replies],[43,44,42])
         self.assertIn('Camera',replies[0]['text'])
         self.assertIn('Video gần đây',replies[1]['text'])
@@ -373,7 +373,7 @@ class PrivateTelegramTests(unittest.TestCase):
         self.archive.state('telegram_replay_attempt',journal)
         self.archive.state('telegram_replay_retry_at','12345')
         calls=self.poll_updates([self.callback(43,'v:'+'a'*32,20),self.message(44,'📅 Hôm nay',21)])
-        self.assertEqual([c[0] for c in calls],['getUpdates','sendMessage'])
+        self.assertEqual([c[0] for c in calls],['getUpdates','sendMessage','sendMessage'])
         self.assertEqual(self.archive.state('telegram_offset'),'22')
         self.assertEqual(json.loads(self.archive.state('telegram_replay_attempt')),json.loads(journal))
         self.assertEqual(self.archive.state('telegram_replay_retry_at'),'12345')
@@ -384,7 +384,7 @@ class PrivateTelegramTests(unittest.TestCase):
         journal='{"update_id":20,"phase":"unknown"}'
         self.archive.state('telegram_replay_attempt',journal)
         calls=self.poll_updates([self.message(43,'/archive',20),self.message(44,'/status',501)])
-        replies=[c[1] for c in calls if c[0]=='sendMessage']
+        replies=[c[1] for c in calls if c[0]=='sendMessage' and 'inline_keyboard' in c[1].get('reply_markup',{})]
         self.assertEqual([r['chat_id'] for r in replies],[44])
         self.assertEqual(self.archive.state('telegram_offset'),'502')
         self.assertEqual(self.archive.state('telegram_replay_attempt'),journal)

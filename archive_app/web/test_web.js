@@ -91,4 +91,139 @@ equal(helpers.validSdPassword('x'.repeat(65)), false);
 equal(helpers.validSdPassword('🔑'.repeat(16)), true);
 equal(helpers.validSdPassword('🔑'.repeat(17)), false);
 equal(helpers.validSdPassword('x\0x'), false);
+equal(helpers.syncSummary({}), 'Không có sync đang chạy');
+equal(helpers.syncSummary({a: {state: 'running'}, b: {state: 'queued'}, c: {state: 'blocked'}, d: {state: 'failed'}, e: {state: 'completed'}}), '1 đang chạy · 1 chờ · 2 cần xử lý');
+equal(helpers.syncSummary({a: null, b: {state: 'completed'}}), 'Không có sync đang chạy');
+equal(helpers.syncLine(null), 'Bấm Start sync để bắt đầu');
+equal(helpers.syncLine({phase: 'uploading', statistics: {sd_searched: 27, sd_downloaded: 27, uploaded: 16, failed: 0}}), 'Upload Telegram · SD 27 · Tải 27 · Upload 16 · Lỗi 0');
+equal(helpers.syncLine({phase: 'sd_search', statistics: {sd_searched: 0, uploaded: '4', failed: -1, sd_downloaded: NaN}}), 'Tìm recording SD · SD 0');
+equal(helpers.syncLine({phase: 'queued'}), 'Hàng đợi');
+equal(helpers.syncDetailFields({statistics: {sd_backend: 'hcnetsdk', sd_downloaded: 0, remuxed: 5, sd_error_code: null}}), [['Bộ tải SD', 'hcnetsdk'], ['Đã tải SD', '0'], ['Đã remux', '5'], ['Mã lỗi SD', '—']]);
+equal(helpers.syncDetailFields({statistics: {unknown_count: 4, bad: Infinity, negative: -1, object: {}, empty: '', flag: false}}), []);
+equal(helpers.syncDetailFields({statistics: {uploaded: 1, secret: 'synthetic-token', token: 'synthetic-token', source_path: '/synthetic/private', sd_backend: 'hcnetsdk', sd_imported: 2}}), [['Đã upload', '1'], ['Bộ tải SD', 'hcnetsdk'], ['Đã nhập SD', '2']]);
+equal(helpers.syncDetailFields({statistics: JSON.parse('{"__proto__":"synthetic-token","constructor":"synthetic-token","uploaded":0}')}), [['Đã upload', '0']]);
+equal(helpers.syncDetailFields(null), []);
+equal(helpers.syncDetailFields({statistics: {sd_error_code: '<img src=x onerror=alert(1)>'}}), [['Mã lỗi SD', '<img src=x onerror=alert(1)>']]);
+equal(helpers.syncTimestamp(null), '—');
+equal(helpers.syncTimestamp('invalid'), '—');
+equal(helpers.syncTimestamp(1e30), '—');
+equal(helpers.syncTimestamp(100), new Date(100000).toLocaleString('vi-VN'));
+equal(helpers.syncTimestamp(100, true), new Date(100000).toLocaleString('vi-VN', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'}));
+const logJobs = [{id: 'one', camera_id: 'pn', state: 'running'}, {id: 'two', camera_id: 'pn', state: 'blocked'}, {id: 'three', camera_id: 'door', state: 'completed'}, {id: 'four', camera_id: 'door', state: 'queued'}, {id: 'five', camera_id: 'door', state: 'failed'}];
+equal(helpers.syncLogFilter(logJobs).map(job => job.id), ['one', 'two', 'three', 'four', 'five']);
+equal(helpers.syncLogFilter(logJobs, 'pn').map(job => job.id), ['one', 'two']);
+equal(helpers.syncLogFilter(logJobs, '', 'active').map(job => job.id), ['one', 'four']);
+equal(helpers.syncLogFilter(logJobs, '', 'errors').map(job => job.id), ['two', 'five']);
+equal(helpers.syncLogFilter(logJobs, 'door', 'completed').map(job => job.id), ['three']);
+equal(helpers.syncLogFilter(logJobs, 'missing').length, 0);
+equal(helpers.syncLogFilter(null), []);
+
+// Exercise the real rendering functions without a browser or third-party DOM package.
+const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path');
+const markup = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+const stylesheet = fs.readFileSync(path.join(__dirname, 'style.css'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
+equal(markup.includes('href="#logs" class="nav-item" data-view="logs"'), true);
+equal(markup.includes('id="view-logs"'), true);
+equal((markup.match(/id="sync-jobs"/g) || []).length, 1);
+equal(markup.indexOf('id="sync-jobs"') > markup.indexOf('id="view-logs"'), true);
+equal(markup.slice(markup.indexOf('id="view-cameras"'), markup.indexOf('id="view-archive"')).includes('sync-job-list'), false);
+equal(source.includes('/api/sync?limit=100'), true);
+equal(source.includes('jobs.slice(0, 6)'), false);
+equal(stylesheet.includes('text-overflow:ellipsis'), true);
+equal(stylesheet.includes('.sync-row-summary:focus-visible'), true);
+equal(stylesheet.includes('grid-template-columns:75px minmax(0,1fr) max-content 43px'), true);
+
+class Element {
+  constructor(tag = 'div') {
+    this.tagName = tag.toUpperCase(); this.childNodes = []; this.dataset = {}; this.attributes = {}; this.listeners = {}; this.hidden = false; this.open = false; this.className = ''; this._text = ''; this._value = undefined;
+    this.classList = {toggle: (name, force) => {const classes = new Set(this.className.split(/\s+/).filter(Boolean)); const enabled = force ?? !classes.has(name); if (enabled) classes.add(name); else classes.delete(name); this.className = [...classes].join(' ');}};
+  }
+  append(...children) { this.childNodes.push(...children); }
+  replaceChildren(...children) { this.childNodes = [...children]; this._text = ''; if (this.tagName === 'SELECT') this._value = undefined; }
+  get textContent() { return this._text + this.childNodes.map(child => typeof child === 'string' ? child : child.textContent).join(''); }
+  set textContent(value) { this._text = String(value); this.childNodes = []; }
+  get value() { return this._value ?? (this.tagName === 'SELECT' ? this.childNodes[0]?.value : '') ?? ''; }
+  set value(value) { this._value = String(value); }
+  set innerHTML(value) { this.rawHtml = value; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) { return this.attributes[name] ?? null; }
+  removeAttribute(name) { delete this.attributes[name]; }
+  addEventListener(name, callback) { (this.listeners[name] ||= []).push(callback); }
+  fire(name) { for (const callback of this.listeners[name] || []) callback({target: this}); }
+  focus() { documentStub.activeElement = this; }
+  querySelectorAll(selector) {
+    const matches = element => selector === 'details[data-sync-key]' ? element.tagName === 'DETAILS' && element.dataset.syncKey : selector === 'summary' ? element.tagName === 'SUMMARY' : selector === 'button' ? element.tagName === 'BUTTON' : false;
+    return this.childNodes.flatMap(child => child instanceof Element ? [...(matches(child) ? [child] : []), ...child.querySelectorAll(selector)] : []);
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+}
+const elements = new Map();
+for (const match of markup.matchAll(/<([a-z]+)[^>]*\bid="([^"]+)"[^>]*>/g)) elements.set(match[2], new Element(match[1]));
+const viewNodes = ['cameras', 'archive', 'logs', 'system'].map(name => {const item = elements.get('view-' + name); item.id = 'view-' + name; return item;});
+const navNodes = viewNodes.map(item => {const link = new Element('a'); link.dataset.view = item.id.slice(5); return link;});
+const documentStub = {activeElement: null, getElementById: id => elements.get(id), createElement: tag => new Element(tag), createElementNS: (_, tag) => new Element(tag), querySelectorAll: selector => selector === '.view' ? viewNodes : selector === '[data-view]' ? navNodes : [], contains: target => {
+  const contains = element => element === target || element.childNodes.some(child => child instanceof Element && contains(child));
+  return [...elements.values()].some(contains);
+}};
+const context = {document: documentStub, Node: Element, module: {exports: {}}, window: {addEventListener() {}}, location: {hash: '#cameras'}, URL, TextEncoder, Date, Intl, setTimeout, clearTimeout};
+vm.createContext(context);
+const bootLine = 'switchView(location.hash.slice(1), false); boot();';
+equal(source.includes(bootLine), true);
+vm.runInContext(source.replace(bootLine, 'globalThis.testUi = {state, renderCameras, renderSync, renderLogs, switchView, syncDisclosure};'), context);
+const ui = context.testUi;
+ui.state.cameras = [{id: 'pn', name: 'PN', enabled: true, host: '192.168.1.2'}, {id: 'door', name: 'Cửa trước', enabled: true}];
+const job = {id: 'job-1', camera_id: 'pn', camera_name: 'PN', state: 'running', phase: 'uploading', message: '<img src=x onerror=alert(1)>', code: 'fixture_code', source: 'dashboard', created_at: 100, started_at: 101, updated_at: 102, finished_at: null, statistics: {sd_searched: 27, sd_downloaded: 27, uploaded: 16, failed: 0, remuxed: 20, sd_error_code: 'fixture_error'}};
+ui.state.sync = {jobs: [job], latest: {pn: job}, worker_alive: true};
+ui.renderSync(); ui.renderCameras();
+equal(elements.get('sync-summary').textContent, '1 đang chạy · 0 chờ · 0 cần xử lý');
+equal(elements.get('sync-jobs').querySelectorAll('details[data-sync-key]').length, 1);
+equal(elements.get('camera-grid').querySelectorAll('details[data-sync-key]').length, 2);
+let logRow = elements.get('sync-jobs').childNodes[0];
+equal(logRow.tagName, 'DETAILS');
+equal(logRow.childNodes[0].tagName, 'SUMMARY');
+equal(logRow.open, false);
+equal(logRow.textContent.includes(job.message), true);
+equal(logRow.childNodes[1].childNodes[0].rawHtml, undefined);
+equal(logRow.textContent.includes('Đã remux20'), true);
+equal(logRow.textContent.includes('Mã lỗi SDfixture_error'), true);
+equal(logRow.childNodes[0].getAttribute('aria-label').includes('Chi tiết đồng bộ PN'), true);
+equal(logRow.childNodes[0].getAttribute('aria-label').includes('Đang chạy · Upload Telegram · SD 27'), true);
+logRow.open = true; logRow.fire('toggle'); logRow.childNodes[0].focus();
+ui.state.sync.jobs[0] = {...job, statistics: {...job.statistics, uploaded: 17}};
+ui.renderLogs();
+logRow = elements.get('sync-jobs').childNodes[0];
+equal(logRow.open, true);
+equal(documentStub.activeElement, logRow.childNodes[0]);
+equal(logRow.childNodes[0].textContent.includes('Upload 17'), true);
+logRow.open = false; logRow.fire('toggle'); ui.renderLogs();
+equal(elements.get('sync-jobs').childNodes[0].open, false);
+let cameraRow = elements.get('camera-grid').querySelectorAll('details[data-sync-key]')[0];
+cameraRow.open = true; cameraRow.fire('toggle'); cameraRow.childNodes[0].focus(); ui.renderCameras();
+cameraRow = elements.get('camera-grid').querySelectorAll('details[data-sync-key]')[0];
+equal(cameraRow.open, true);
+equal(documentStub.activeElement, cameraRow.childNodes[0]);
+ui.state.sync.latest.pn = {...job, id: 'job-2'}; ui.renderCameras();
+equal(elements.get('camera-grid').querySelectorAll('details[data-sync-key]')[0].open, true);
+elements.get('logs-camera').value = 'door'; ui.renderLogs();
+equal(elements.get('sync-jobs').childNodes.length, 0);
+equal(elements.get('logs-empty').hidden, false);
+elements.get('logs-camera').value = ''; elements.get('logs-status').value = 'errors'; ui.renderLogs();
+equal(elements.get('sync-jobs').childNodes.length, 0);
+elements.get('logs-status').value = ''; ui.renderLogs();
+equal(elements.get('sync-jobs').childNodes.length, 1);
+logRow = elements.get('sync-jobs').childNodes[0]; logRow.open = true; logRow.fire('toggle');
+elements.get('logs-camera').value = 'door'; ui.renderLogs();
+elements.get('logs-camera').value = ''; ui.renderLogs();
+equal(elements.get('sync-jobs').childNodes[0].open, true);
+// An old node's delayed close event must not erase the new node's remembered state.
+logRow.open = false; logRow.fire('toggle'); ui.renderLogs();
+equal(elements.get('sync-jobs').childNodes[0].open, true);
+ui.switchView('logs', false);
+equal(elements.get('view-logs').hidden, false);
+equal(elements.get('view-cameras').hidden, true);
+equal(elements.get('topbar-page').textContent, 'Logs');
+equal(navNodes.find(item => item.dataset.view === 'logs').getAttribute('aria-current'), 'page');
+ui.state.sync.jobs = []; ui.renderLogs();
+equal(elements.get('logs-empty').textContent.includes('Chưa có lịch sử'), true);
 console.log(`WEB_HELPERS: checks=${checks} passed=${checks} failed=0`);

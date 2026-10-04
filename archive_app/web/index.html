@@ -55,6 +55,7 @@
       <nav class="nav-list">
         <a href="#cameras" class="nav-item active" data-view="cameras" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="m16 10 5-3v10l-5-3"/></svg>Camera<span id="nav-camera-count" class="nav-count">0</span></a>
         <a href="#archive" class="nav-item" data-view="archive"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v14H3zM2 3h20v4H2zM9 11h6"/></svg>Thư viện video</a>
+        <a href="#logs" class="nav-item" data-view="logs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h14v18H5zM8 7h8M8 11h8M8 15h5"/></svg>Logs</a>
         <a href="#system" class="nav-item" data-view="system"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1M5.6 18.4l2.1-2.1m8.6-8.6 2.1-2.1"/><circle cx="12" cy="12" r="4"/></svg>Hệ thống</a>
       </nav>
       <div class="sidebar-note"><span class="note-line"></span><strong>Gọn gàng. Có thứ tự.</strong><p>Camera → Năm → Tháng → Ngày</p></div>
@@ -68,7 +69,7 @@
 
         <section id="view-cameras" class="view" aria-labelledby="cameras-title">
           <div class="page-heading"><div><p class="eyebrow">CAMERA MANAGEMENT</p><h1 id="cameras-title">Camera của bạn<span class="heading-dot">.</span></h1><p class="muted">Thêm thiết bị, đặt tên dễ nhớ và theo dõi tải SD / upload trong cùng một nơi.</p></div><div class="heading-actions"><button id="start-all-button" class="button secondary" type="button">Start tất cả</button><button id="add-camera-button" class="button primary" type="button"><span aria-hidden="true" class="plus">+</span>Thêm camera</button></div></div>
-          <section class="sync-overview" aria-labelledby="sync-title"><div class="section-heading"><h2 id="sync-title">Tiến trình đồng bộ</h2><span id="sync-worker-status" class="status-chip neutral">Đang đọc worker</span></div><p id="sync-summary" class="small muted" role="status" aria-live="polite" aria-atomic="true">Đang đọc hàng đợi…</p><p class="field-hint">Start gửi công việc vào hàng đợi. Tải SD và upload do worker thực hiện; trạng thái “Cần xử lý” hiển thị nguyên nhân thật.</p><p id="sync-error" class="form-error" role="alert" hidden></p><div id="sync-jobs" class="sync-job-list"></div></section>
+          <section class="sync-overview" aria-labelledby="sync-title"><div class="sync-overview-line"><h2 id="sync-title">Đồng bộ</h2><span id="sync-worker-status" class="status-chip neutral">Đang đọc worker</span><p id="sync-summary" class="small muted" role="status" aria-live="polite" aria-atomic="true">Đang đọc hàng đợi…</p><a class="sync-logs-link" href="#logs">Logs <span aria-hidden="true">→</span></a></div><p id="sync-error" class="form-error" role="alert" hidden></p></section>
           <div class="stats-grid" aria-label="Thống kê camera"><div class="stat-card"><span class="stat-label">Tổng camera</span><strong id="stat-cameras">—</strong><span class="stat-detail">Thiết bị đã cấu hình</span></div><div class="stat-card"><span class="stat-label">Đang bật</span><strong id="stat-enabled">—</strong><span class="stat-detail">Tham gia quy trình lưu trữ</span></div><div class="stat-card"><span class="stat-label">Video đã lập chỉ mục</span><strong id="stat-recordings">—</strong><span class="stat-detail">Số bản ghi trong cơ sở dữ liệu</span></div><div class="stat-card"><span class="stat-label">Đã lưu Telegram</span><strong id="stat-uploaded">—</strong><span class="stat-detail">Upload đã xác nhận thành công</span></div></div>
           <div class="section-heading"><h2>Danh sách thiết bị</h2><label class="search-control"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Tìm camera</span><input id="camera-search" type="search" placeholder="Tìm theo tên, model hoặc IP…"></label></div>
           <div id="camera-loading" class="loading-state" role="status">Đang tải camera…</div>
@@ -97,6 +98,17 @@
           <div id="archive-table-wrap" class="table-wrap" hidden tabindex="0" aria-label="Bảng video, cuộn ngang trên màn hình nhỏ"><table><thead><tr><th scope="col">Camera / Video</th><th scope="col">Bắt đầu</th><th scope="col">Thời lượng</th><th scope="col">Dung lượng</th><th scope="col">Trạng thái</th><th scope="col" class="align-right">Telegram</th></tr></thead><tbody id="archive-rows"></tbody></table></div>
           <nav id="archive-pagination" class="pagination" aria-label="Phân trang video" hidden><span id="pagination-summary" class="muted small"></span><div><button id="previous-page" class="button secondary compact" type="button">← Trước</button><button id="next-page" class="button secondary compact" type="button">Tiếp →</button></div></nav>
           <p class="small muted archive-footnote">Liên kết Telegram mở video trong bot; ID Telegram của bạn cần nằm trong danh sách được phép truy cập.</p>
+        </section>
+
+        <section id="view-logs" class="view" hidden aria-labelledby="logs-title">
+          <div class="page-heading"><div><p class="eyebrow">SYNC ACTIVITY</p><h1 id="logs-title">Logs<span class="heading-dot">.</span></h1><p class="muted">Lịch sử đồng bộ SD → Telegram. Bấm Detail để xem chi tiết.</p></div><button id="logs-refresh" class="button secondary" type="button">Làm mới logs</button></div>
+          <div class="logs-panel">
+            <div class="logs-toolbar"><div class="field"><label for="logs-camera">Camera</label><select id="logs-camera"><option value="">Tất cả camera</option></select></div><div class="field"><label for="logs-status">Trạng thái</label><select id="logs-status"><option value="">Tất cả trạng thái</option><option value="active">Đang chờ / chạy</option><option value="completed">Hoàn tất</option><option value="errors">Cần xử lý / lỗi</option></select></div><span id="logs-worker-status" class="status-chip neutral">Đang đọc worker</span></div>
+            <div class="logs-caption"><span id="logs-count" class="small muted">Đang đọc lịch sử…</span><span class="small muted">Tối đa 100 lượt gần nhất · tự cập nhật</span></div>
+            <p id="logs-error" class="form-error" role="alert" hidden></p>
+            <div id="sync-jobs" class="sync-log-list" aria-label="Lịch sử công việc đồng bộ"></div>
+            <p id="logs-empty" class="logs-empty small muted" hidden>Chưa có lịch sử đồng bộ.</p>
+          </div>
         </section>
 
         <section id="view-system" class="view" hidden aria-labelledby="system-title">

@@ -66,12 +66,13 @@ class TimeMenuTests(unittest.TestCase):
         return next(data for data in self.callbacks(buttons, 'wc:') if f':{token}:' in data)
 
     def test_shortcut_buttons_and_persistent_commands(self):
-        self.assertEqual(self.callbacks(self.menus.shortcuts()), ['today', 'yesterday', 'last6h'])
+        self.assertEqual(self.callbacks(self.menus.shortcuts()), ['today', 'yesterday', 'last6h', 'custom-time'])
+        self.assertTrue(all(len(row) == 1 for row in self.menus.shortcuts()))
         commands = self.menus.commands()
         self.assertEqual([command['command'] for command in commands],
-                         ['sync', 'today', 'yesterday', 'last6h', 'archive', 'recent', 'trash', 'status'])
+                         ['start', 'sync', 'today', 'yesterday', 'last6h', 'time', 'archive', 'recent', 'trash', 'status'])
         self.assertEqual([command['description'] for command in commands],
-                         ['Start sync', 'Hôm nay', 'Hôm qua', '6 giờ trước', 'Kho video',
+                         ['Start / Menu', 'Start sync', 'Hôm nay', 'Hôm qua', '6 giờ trước', 'Tùy chọn thời gian', 'Kho video',
                           'Video gần đây', 'Thùng rác', 'Trạng thái'])
         for command in commands:
             self.assertRegex(command['command'], r'^[a-z0-9_]{1,32}$')

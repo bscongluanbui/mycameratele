@@ -5,7 +5,8 @@ bot hiện có làm giao diện tra cứu. Recording mới chỉ upload vào pri
 owner/viewer nhận phản hồi trong private chat **khi chủ động yêu cầu**, không nhận
 mỗi recording mới. Mục lục: **Camera → Năm → Tháng → Ngày → Video**, có Cũ → Mới.
 
-Menu dùng nhãn ngắn: **Hôm nay → Camera → Video**, **Hôm qua**, **6 giờ trước**.
+Menu dùng các nút một cột với nhãn ngắn: **Start / Menu**, **Hôm nay → Camera → Video**,
+**Hôm qua**, **6 giờ trước**, **Tùy chọn thời gian** và **Start sync**.
 Đổi `TELEGRAM_STORAGE_CHANNEL_ID` chỉ đổi kho cho recording mới; video đã xác
 nhận vẫn phát lại theo channel/message ID đã lưu trong SQLite, không ghi đè
 placement cũ hoặc upload lại lịch sử. Giữ bot và volumes cũ khi đổi channel.
@@ -369,6 +370,19 @@ commands của Telegram; gửi `/start` để nhận bàn phím nhanh phía dư�
 Hôm nay / Hôm qua / 6 giờ trước → chọn Camera → danh sách video
                               → Xem / Tải / Xóa
 ```
+
+**Start / Menu** luôn có trong danh sách lệnh Telegram (`/start`). Chọn
+**Tùy chọn thời gian** hoặc `/time`, nhập lần lượt thời gian bắt đầu và kết thúc
+theo `DD/MM/YYYY HH:mm` (ví dụ `04/10/2026 08:00`); cũng nhận `YYYY-MM-DD HH:mm`.
+Bot dùng `DISPLAY_TIMEZONE`, khoảng tối đa 31 ngày, có nút Hủy. Khoảng đã chọn
+gắn riêng với ID người dùng; bấm Camera, phân trang hoặc đổi thứ tự không đổi
+khoảng thời gian.
+
+Dashboard gom trạng thái đồng bộ thành một dòng trên mỗi camera. Bấm **Detail**
+để mở bộ đếm SD/tải/upload, mã lỗi và thời gian cập nhật. Mục **Logs** riêng giữ
+100 lượt đồng bộ gần nhất, có lọc camera/trạng thái, tự làm mới và giữ dòng đang
+mở. Dữ liệu Logs lấy từ lịch sử job trong SQLite, không phải thông báo giả hoặc
+phần trăm suy đoán.
 
 Hôm nay/Hôm qua theo ngày lịch của `DISPLAY_TIMEZONE`. “6 giờ trước” là **6 giờ
 gần nhất đến thời điểm bấm**, không phải một thời điểm đơn lẻ. Bot chỉ liệt kê

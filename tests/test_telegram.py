@@ -296,9 +296,9 @@ class TelegramTests(unittest.TestCase):
         self.request.side_effect = fake_request
         self.telegram.poll(self.archive)
         self.assertEqual(self.archive.state("telegram_offset"), "102")
-        self.assertEqual(len(replies), 2) # Expired ACK does not cancel the button action.
+        self.assertEqual(len(replies), 3) # Requested menu plus refreshed persistent actions.
         self.assertTrue(all(reply["chat_id"]==42 for reply in replies))
-        self.assertIn("Hàng đợi", replies[-1]["text"])
+        self.assertTrue(any("Hàng đợi" in reply["text"] for reply in replies))
 
     def test_invalid_callback_fallback_403_does_not_pin_cursor_or_block_next_update(self):
         self.settings.allowed_users = (42,)
@@ -321,7 +321,7 @@ class TelegramTests(unittest.TestCase):
         self.request.side_effect = fake_request
         self.telegram.poll(self.archive)
         self.assertEqual(self.archive.state("telegram_offset"), "202")
-        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(sent), 3)
         self.assertNotIn("Hàng đợi", sent[0]["text"])
         self.assertIn("Hàng đợi", sent[1]["text"])
 

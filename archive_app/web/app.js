@@ -91,6 +91,34 @@
       const age = seconds < 60 ? `${seconds} giây` : seconds < 3600 ? `${Math.floor(seconds / 60)} phút` : `${Math.floor(seconds / 3600)} giờ`;
       return `Cập nhật ${age} trước · ${new Date(updated).toLocaleString("vi-VN")}`;
     },
+    syncSummary(latest) {
+      const jobs = Object.values(latest || {});
+      const running = jobs.filter(job => job?.state === "running").length;
+      const queued = jobs.filter(job => job?.state === "queued").length;
+      const blocked = jobs.filter(job => ["blocked", "failed"].includes(job?.state)).length;
+      return running || queued || blocked ? `${running} đang chạy · ${queued} chờ · ${blocked} cần xử lý` : "Không có sync đang chạy";
+    },
+    syncLine(job) {
+      if (!job) return "Bấm Start sync để bắt đầu";
+      const statistics = job.statistics || {}, parts = [helpers.syncPhase(job)];
+      for (const [key, label] of [["sd_searched", "SD"], ["sd_downloaded", "Tải"], ["uploaded", "Upload"], ["failed", "Lỗi"]]) {
+        const value = statistics[key];
+        if (typeof value === "number" && Number.isFinite(value) && value >= 0) parts.push(`${label} ${value}`);
+      }
+      return parts.join(" · ");
+    },
+    syncDetailFields(job) {
+      const labels = { manifests: "Manifest", matched: "Khớp nguồn", imported: "Đã nhập", already_known: "Đã có", uploaded: "Đã upload", failed: "Lỗi", ready: "Sẵn sàng", pending: "Chờ upload", remuxed: "Đã remux", remux_failed: "Lỗi remux", remux_budget_blocked: "Chờ dung lượng cache", needs_review: "Cần kiểm tra", upload_unknown: "Upload chưa xác nhận", deleted: "Đã xóa", failed_records: "Bản ghi lỗi", probe_tcp_open: "Cổng TCP mở", probe_error_type: "Lỗi kết nối", sd_backend: "Bộ tải SD", sd_searched: "Tìm thấy SD", sd_downloaded: "Đã tải SD", sd_imported: "Đã nhập SD", sd_deferred: "SD chờ tải", sd_backlog: "SD tồn đọng", sd_error_code: "Mã lỗi SD" };
+      return Object.entries(job?.statistics || {}).filter(([key, value]) => Object.prototype.hasOwnProperty.call(labels, key) && (value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value) && value >= 0))).map(([key, value]) => [labels[key], value === null || value === "" ? "—" : String(value)]);
+    },
+    syncTimestamp(value, compact = false) {
+      const milliseconds = helpers.checkedMillis(value);
+      if (milliseconds === null || !Number.isFinite(new Date(milliseconds).getTime())) return "—";
+      return new Date(milliseconds).toLocaleString("vi-VN", compact ? { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" } : undefined);
+    },
+    syncLogFilter(jobs, camera = "", status = "") {
+      return (Array.isArray(jobs) ? jobs : []).filter(job => (!camera || job.camera_id === camera) && (!status || (status === "active" ? helpers.syncActive(job) : status === "errors" ? ["blocked", "failed"].includes(job.state) : job.state === status)));
+    },
     validSdPassword(password) { return typeof password === "string" && !password.includes("\0") && new TextEncoder().encode(password).length <= 64; },
     validUsername(value) { return typeof value === "string" && /^[A-Za-z0-9_.-]{3,64}$/.test(value); },
     accountValidation(values) {
@@ -106,7 +134,7 @@
   if (typeof document === "undefined") return;
 
   const $ = id => document.getElementById(id);
-  const state = { cameras: [], status: {}, csrf: "", probes: new Map(), calendar: [], offset: 0, limit: 25, total: 0, archiveRequest: 0, calendarRequest: 0, editing: null, view: "cameras", authenticated: false, sessionRevision: 0, account: null, accountRequired: false, loginBusy: false, accountBusy: false, logoutBusy: false, sync: {jobs: [], latest: {}, worker_alive: false}, syncRequest: 0, syncTimer: null, syncBusy: new Set(), syncSummary: "" };
+  const state = { cameras: [], status: {}, csrf: "", probes: new Map(), calendar: [], offset: 0, limit: 25, total: 0, archiveRequest: 0, calendarRequest: 0, editing: null, view: "cameras", authenticated: false, sessionRevision: 0, account: null, accountRequired: false, loginBusy: false, accountBusy: false, logoutBusy: false, sync: {jobs: [], latest: {}, worker_alive: false}, syncRequest: 0, syncTimer: null, syncBusy: new Set(), syncSummary: "", expandedSync: new Set() };
   let toastTimer;
   function node(tag, className, text) {
     const item = document.createElement(tag);
@@ -154,7 +182,7 @@
     if (field && $(field)) { $(field).setAttribute("aria-invalid", "true"); $(field).focus(); } else errorBox.focus();
   }
   function showLogin({ username = state.account?.username || "", message = "" } = {}) {
-    stopSyncPolling(); state.syncRequest++; state.sync = {jobs: [], latest: {}, worker_alive: false}; state.syncBusy.clear();
+    stopSyncPolling(); state.syncRequest++; state.sync = {jobs: [], latest: {}, worker_alive: false}; state.syncBusy.clear(); state.expandedSync.clear();
     state.authenticated = false; state.sessionRevision++; state.archiveRequest++; state.calendarRequest++;
     state.account = null; state.accountRequired = false; state.csrf = ""; state.cameras = []; state.status = {}; state.calendar = []; state.probes.clear();
     $("app-shell").hidden = true; $("account-screen").hidden = true; $("boot-loading").hidden = true; $("login-screen").hidden = false;
@@ -240,9 +268,62 @@
     const open = values.filter(value => helpers.probeState(value)[1] === "green").length;
     return open ? [`${open}/${values.length} cổng mở`, "green"] : ["Chưa thấy cổng mở", "amber"];
   }
+  function rememberSyncRows(target) {
+    const focused = document.activeElement;
+    let focusKey = null;
+    for (const row of target.querySelectorAll("details[data-sync-key]")) {
+      if (row.open) state.expandedSync.add(row.dataset.syncKey); else state.expandedSync.delete(row.dataset.syncKey);
+      if (row.querySelector("summary") === focused) focusKey = row.dataset.syncKey;
+    }
+    return focusKey;
+  }
+  function restoreSyncFocus(target, key) {
+    if (!key) return;
+    for (const row of target.querySelectorAll("details[data-sync-key]")) {
+      if (row.dataset.syncKey === key) { row.querySelector("summary")?.focus({preventScroll: true}); break; }
+    }
+  }
+  function syncDisclosure(job, camera, scope) {
+    const details = node("details", scope === "logs" ? "sync-log-row" : "camera-sync-row");
+    const key = scope === "logs" ? `logs:${job.id}` : `camera:${camera.id}`;
+    details.dataset.syncKey = key; details.open = state.expandedSync.has(key);
+    const summary = node("summary", "sync-row-summary");
+    const name = job?.camera_name || camera.name || camera.id;
+    if (scope === "logs") {
+      const time = node("time", "sync-log-time", helpers.syncTimestamp(job.created_at, true));
+      const milliseconds = helpers.checkedMillis(job.created_at);
+      if (milliseconds !== null && Number.isFinite(new Date(milliseconds).getTime())) time.dateTime = new Date(milliseconds).toISOString();
+      time.title = helpers.syncTimestamp(job.created_at);
+      summary.append(time, node("strong", "sync-log-camera", name));
+    }
+    summary.append(chip(...helpers.syncState(job)), node("span", "sync-row-line", helpers.syncLine(job)), node("span", "sync-detail-label", "Detail"));
+    summary.setAttribute("aria-label", `Chi tiết đồng bộ ${name}${scope === "logs" ? ` · ${helpers.syncTimestamp(job.created_at)}` : ""} · ${helpers.syncState(job)[0]} · ${helpers.syncLine(job)}`);
+    const body = node("div", "sync-row-detail");
+    if (!job) body.append(node("p", "small muted", "Chưa có công việc sync. Bấm Start sync để bắt đầu."));
+    else {
+      body.append(node("p", "sync-detail-message", job.message || "Chưa có thông báo"));
+      const fields = node("dl", "sync-detail-fields");
+      const metadata = [["Camera", name], ["Trạng thái", helpers.syncState(job)[0]], ["Giai đoạn", helpers.syncPhase(job)], ["Nguồn", job.source || "—"], ["Tạo lúc", helpers.syncTimestamp(job.created_at)], ["Bắt đầu", helpers.syncTimestamp(job.started_at)], ["Cập nhật", helpers.syncTimestamp(job.updated_at)], ["Kết thúc", helpers.syncTimestamp(job.finished_at)]];
+      if (job.code) metadata.push(["Mã kết quả", job.code]);
+      if (job.id) metadata.push(["Mã công việc", job.id]);
+      for (const [label, value] of [...metadata, ...helpers.syncDetailFields(job)]) {
+        const field = node("div"); field.append(node("dt", "", label), node("dd", "", value)); fields.append(field);
+      }
+      body.append(fields);
+      if (helpers.syncHelp(job)) body.append(node("p", "field-hint sync-detail-help", helpers.syncHelp(job)));
+    }
+    details.append(summary, body);
+    details.addEventListener("toggle", () => {
+      // Ignore delayed toggle events from nodes replaced by a polling refresh.
+      if (!document.contains(details)) return;
+      if (details.open) state.expandedSync.add(key); else state.expandedSync.delete(key);
+    });
+    return details;
+  }
   function renderCameras() {
     const focused = document.activeElement;
     const focusKey = focused?.dataset?.cameraStart ? ["cameraStart", focused.dataset.cameraStart] : focused?.dataset?.cameraUpload ? ["cameraUpload", focused.dataset.cameraUpload] : null;
+    const syncFocus = rememberSyncRows($("camera-grid"));
     const query = $("camera-search").value.toLocaleLowerCase("vi-VN").trim();
     const cameras = state.cameras.filter(camera => [camera.name, camera.id, camera.model, camera.host].some(value => String(value || "").toLocaleLowerCase("vi-VN").includes(query)));
     $("camera-grid").replaceChildren(); $("camera-empty").hidden = state.cameras.length > 0; $("camera-no-match").hidden = !state.cameras.length || cameras.length > 0;
@@ -256,15 +337,7 @@
       const total = helpers.cameraCount(camera, "total"), uploaded = helpers.cameraCount(camera, "uploaded");
       info.append(infoRow("Video / Đã lưu", `${displayCount(total)} / ${displayCount(uploaded)}`));
       const job = state.sync.latest?.[camera.id] || camera.sync;
-      info.append(infoRow("Đồng bộ", chip(...helpers.syncState(job))));
-      const syncDetail = node("div", "camera-sync-detail");
-      if (job) {
-        syncDetail.append(node("p", "sync-phase", helpers.syncPhase(job)), node("p", "small muted", job.message || ""));
-        if (job.code) syncDetail.append(node("code", "sync-code", job.code));
-        if (helpers.syncHelp(job)) syncDetail.append(node("p", "field-hint", helpers.syncHelp(job)));
-        if (helpers.syncStatistics(job)) syncDetail.append(node("p", "field-hint", helpers.syncStatistics(job)));
-        if (helpers.syncUpdated(job)) syncDetail.append(node("p", "small muted", helpers.syncUpdated(job)));
-      } else syncDetail.append(node("p", "small muted", "Chưa có công việc sync. Bấm Start để gửi vào worker."));
+      const syncDetail = syncDisclosure(job, camera, "camera");
       const upload = node("button", "upload-switch"); upload.type = "button"; upload.setAttribute("role", "switch");
       upload.setAttribute("aria-checked", String(helpers.uploadEnabled(camera))); upload.setAttribute("aria-label", `Upload Telegram cho ${camera.name || camera.id}`);
       upload.dataset.cameraUpload = camera.id; upload.disabled = state.syncBusy.has("upload:" + camera.id);
@@ -282,6 +355,7 @@
     renderStats();
     $("start-all-button").disabled = !state.cameras.some(camera => camera.enabled !== false) || state.syncBusy.has("all");
     if (focusKey) for (const control of $("camera-grid").querySelectorAll("button")) { if (control.dataset[focusKey[0]] === focusKey[1] && !control.disabled) { control.focus({preventScroll: true}); break; } }
+    restoreSyncFocus($("camera-grid"), syncFocus);
   }
   function stopSyncPolling() { if (state.syncTimer !== null) clearTimeout(state.syncTimer); state.syncTimer = null; }
   function scheduleSyncPolling() {
@@ -291,39 +365,46 @@
     state.syncTimer = setTimeout(() => { state.syncTimer = null; loadSync(); }, active ? 2500 : 15000);
   }
   function renderSync() {
-    const jobs = Array.isArray(state.sync.jobs) ? state.sync.jobs : [];
-    const active = Object.values(state.sync.latest || {}).filter(helpers.syncActive).length;
-    const blocked = Object.values(state.sync.latest || {}).filter(job => ["blocked", "failed"].includes(job.state)).length;
-    const summary = active ? `${active} camera đang chờ hoặc chạy sync. Tiến trình tự cập nhật.` : blocked ? `${blocked} camera cần xử lý. Xem mã và hướng dẫn ở tiến trình bên dưới.` : "Không có sync đang chạy. Start để đồng bộ camera.";
+    const summary = helpers.syncSummary(state.sync.latest);
     if (summary !== state.syncSummary) { state.syncSummary = summary; $("sync-summary").textContent = summary; }
     $("sync-worker-status").textContent = state.sync.worker_alive ? "Worker hoạt động" : "Chưa thấy heartbeat worker";
     $("sync-worker-status").className = `status-chip ${state.sync.worker_alive ? "green" : "amber"}`;
-    const target = $("sync-jobs"); target.replaceChildren();
-    for (const job of jobs.slice(0, 6)) {
-      const item = node("article", "sync-job"), top = node("div", "sync-job-heading");
-      top.append(node("strong", "", job.camera_name || cameraName(job.camera_id)), chip(...helpers.syncState(job))); item.append(top);
-      item.append(node("p", "sync-phase", helpers.syncPhase(job)), node("p", "small muted", job.message || ""));
-      if (job.code) item.append(node("code", "sync-code", job.code));
-      if (helpers.syncHelp(job)) item.append(node("p", "field-hint", helpers.syncHelp(job)));
-      if (helpers.syncStatistics(job)) item.append(node("p", "field-hint", helpers.syncStatistics(job)));
-      if (helpers.syncUpdated(job)) item.append(node("p", "small muted", helpers.syncUpdated(job)));
-      target.append(item);
-    }
-    if (!jobs.length) target.append(node("p", "small muted", "Chưa có lịch sử sync. Thêm camera tự tạo công việc đầu tiên."));
+    $("logs-worker-status").textContent = $("sync-worker-status").textContent;
+    $("logs-worker-status").className = $("sync-worker-status").className;
+    const oldCamera = $("logs-camera").value;
+    $("logs-camera").replaceChildren(option("", "Tất cả camera"));
+    for (const camera of state.cameras) $("logs-camera").append(option(camera.id, camera.name || camera.id));
+    // Deleted cameras may still have history, which remains available in Logs.
+    const known = new Set(state.cameras.map(camera => camera.id));
+    for (const job of state.sync.jobs || []) if (!known.has(job.camera_id)) { known.add(job.camera_id); $("logs-camera").append(option(job.camera_id, job.camera_name || job.camera_id)); }
+    if (known.has(oldCamera)) $("logs-camera").value = oldCamera;
+    renderLogs();
+  }
+  function renderLogs() {
+    const allJobs = Array.isArray(state.sync.jobs) ? state.sync.jobs : [];
+    const jobs = helpers.syncLogFilter(allJobs, $("logs-camera").value, $("logs-status").value);
+    const target = $("sync-jobs"), focusKey = rememberSyncRows(target); target.replaceChildren();
+    for (const job of jobs) target.append(syncDisclosure(job, {id: job.camera_id, name: cameraName(job.camera_id)}, "logs"));
+    $("logs-empty").hidden = jobs.length > 0;
+    $("logs-empty").textContent = allJobs.length ? "Không có lượt đồng bộ phù hợp với bộ lọc." : "Chưa có lịch sử đồng bộ. Bấm Start sync để bắt đầu.";
+    $("logs-count").textContent = `${jobs.length} / ${allJobs.length} lượt gần nhất`;
+    restoreSyncFocus(target, focusKey);
   }
   async function loadSync() {
     if (!state.authenticated || state.accountRequired || !$("account-screen").hidden) return;
     const revision = state.sessionRevision, request = ++state.syncRequest;
     try {
-      const result = await api("/api/sync?limit=20");
+      const result = await api("/api/sync?limit=100");
       if (!state.authenticated || state.accountRequired || revision !== state.sessionRevision || request !== state.syncRequest || !$("account-screen").hidden) return;
       const previous = JSON.stringify(Object.values(state.sync.latest || {}).map(job => [job.id, job.state, job.statistics]));
       state.sync = { jobs: Array.isArray(result.jobs) ? result.jobs : [], latest: result.latest || {}, worker_alive: result.worker_alive === true };
-      $("sync-error").hidden = true; renderSync(); renderCameras();
+      $("sync-error").hidden = true; $("logs-error").hidden = true; renderSync(); renderCameras();
       const next = JSON.stringify(Object.values(state.sync.latest).map(job => [job.id, job.state, job.statistics]));
       if (previous !== next && state.sync.jobs.length && !Object.values(state.sync.latest).some(helpers.syncActive)) await refresh();
     } catch (error) {
-      if (revision === state.sessionRevision && error.httpStatus !== 401 && error.code !== "password_change_required") { $("sync-error").textContent = error.message; $("sync-error").hidden = false; }
+      if (revision === state.sessionRevision && error.httpStatus !== 401 && error.code !== "password_change_required") {
+        for (const id of ["sync-error", "logs-error"]) { $(id).textContent = error.message; $(id).hidden = false; }
+      }
     } finally { if (revision === state.sessionRevision && request === state.syncRequest) scheduleSyncPolling(); }
   }
   async function startSync(cameraId = null, control = $("start-all-button")) {
@@ -365,7 +446,7 @@
     const details = [
       ["Phiên bản", status.version || "—"], ["Múi giờ lưu trữ", timezone],
       ["Upload Telegram", status.upload_enabled === true ? "Đã bật" : status.upload_enabled === false ? "Đang tắt" : "Chưa rõ"],
-      ["Nơi lưu video", status.telegram_destination === "owner_private_chat" ? "Chat riêng của owner" : "—"],
+      ["Nơi lưu video", status.telegram_destination === "channel" ? "Private channel" : ["owner_private", "owner_private_chat"].includes(status.telegram_destination) ? "Chat riêng của owner" : "—"],
       ["Owner /start", status.owner_started === true ? "Đã kết nối" : "Chờ owner mở bot và /start"],
       ["ID được phép xem", status.allowed_users_count ?? "—"],
       ["Bot API", status.api_mode || status.telegram_api_mode || "—"],
@@ -417,13 +498,14 @@
     } finally { $("refresh-button").disabled = false; $("camera-loading").hidden = true; }
   }
   function switchView(name, load = true) {
-    if (!["cameras", "archive", "system"].includes(name)) name = "cameras";
+    if (!["cameras", "archive", "logs", "system"].includes(name)) name = "cameras";
     state.view = name;
     for (const item of document.querySelectorAll(".view")) item.hidden = item.id !== `view-${name}`;
     for (const link of document.querySelectorAll("[data-view]")) { const active = link.dataset.view === name; link.classList.toggle("active", active); if (active) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current"); }
-    $("topbar-page").textContent = { cameras: "Camera", archive: "Thư viện video", system: "Hệ thống" }[name];
+    $("topbar-page").textContent = { cameras: "Camera", archive: "Thư viện video", logs: "Logs", system: "Hệ thống" }[name];
     if (name === "archive" && load && state.authenticated && !state.accountRequired) { loadCalendar(true).then(loadArchive).catch(error => globalError(error.message)); }
     if (name === "system") renderSystem();
+    if (name === "logs") { renderLogs(); if (load && state.authenticated && !state.accountRequired) loadSync(); }
   }
   async function openCameraArchive(id) {
     $("filter-camera").value = id; state.offset = 0;
@@ -601,6 +683,8 @@
   });
   $("refresh-button").addEventListener("click", refresh); $("camera-search").addEventListener("input", renderCameras);
   $("start-all-button").addEventListener("click", () => startSync());
+  $("logs-refresh").addEventListener("click", loadSync);
+  for (const id of ["logs-camera", "logs-status"]) $(id).addEventListener("change", renderLogs);
   async function logout() {
     if (state.logoutBusy) return;
     state.logoutBusy = true; $("logout-button").disabled = true; $("account-logout").disabled = true;
