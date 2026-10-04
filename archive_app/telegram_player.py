@@ -234,6 +234,9 @@ class TelegramPlayer:
         return base+'/player/'+cap
 
     def resolve(self, archive, cap):
+        # Removing the web-player setting disables previously issued links too.
+        if not self.settings.player_public_url:
+            raise PlayerDenied()
         if not isinstance(cap, str) or not self.CAP_RE.fullmatch(cap):
             raise PlayerDenied()
         nonce, signature = cap.split('.')

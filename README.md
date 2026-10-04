@@ -390,12 +390,34 @@ Lượt gửi gặp 429 được chờ lại; POST không rõ kết quả hoặc
 
 ### Xem trực tiếp từ danh sách
 
-Đặt `TELEGRAM_PLAYER_PUBLIC_URL=https://camera.example.com` (hoặc địa chỉ
-`http://VPS_IP:8080` đang sử dụng), rồi `docker compose up -d archive dashboard`.
-Nút **Xem** mở trình phát web ngay, không tạo thêm video bên dưới chat. Trình phát
-dùng `autoplay muted` + controls; bật âm thanh bằng nút loa. Trình duyệt vẫn quyết
-định quyền autoplay/codec; dữ liệu video được giữ nguyên, không tạo bản encode.
-Khi URL chưa cấu hình, nút cũ tiếp tục phát lại video trong chat.
+Trong chế độ **channel**, nút **Xem** mở video gốc trong Telegram bằng liên kết
+`https://t.me/c/<channel>/<message>?single&t=1`. Máy người xem tải/phát trực tiếp
+từ Telegram; bot chỉ dựng liên kết từ placement đã xác nhận trong SQLite.
+Thao tác này không gọi `getFile`, không proxy media qua VPS, không tạo cache
+phát trên VPS, không gửi thêm video xuống dưới danh sách và không transcode.
+Channel mode luôn ưu tiên liên kết native, kể cả còn cấu hình URL web cũ.
+
+Người xem phải **tham gia private channel** và vẫn cần allowlist để dùng bot.
+Hai quyền này độc lập: bỏ ID khỏi allowlist không tự xóa tư cách thành viên
+channel; xóa logic khỏi catalog không thu hồi liên kết channel đã biết.
+Chủ channel quản lý thành viên và quyền đọc lịch sử riêng trong Telegram.
+
+Tham số `t=1` mở ở **giây 1**, có thể tua về đầu. Telegram iOS xử lý mốc dương
+bằng trình xem media; một số client, gồm đường dẫn private-channel trên Android,
+chỉ đi đến bản tin và cần chạm video. Bot không điều khiển được autoplay/toàn
+màn hình của mọi client. `single` chọn đúng clip khi bản tin thuộc album.
+Xem [Telegram message links](https://core.telegram.org/api/links#message-links).
+Document mở bản tin gốc không kèm mốc video. Chọn lại danh sách sau cập nhật để
+thay các nút web/callback cũ bằng liên kết Telegram.
+
+Để tắt hẳn player web cũ, để trống `TELEGRAM_PLAYER_PUBLIC_URL` và recreate
+`archive dashboard`; các capability đã cấp cũng bị từ chối. Không xóa volume
+`bot-api-state`: Local Bot API vẫn dùng volume này cho upload/lưu trạng thái API.
+
+Chỉ ở chế độ **owner_private**, URL web tùy chọn còn hoạt động khi đặt
+`TELEGRAM_PLAYER_PUBLIC_URL=https://camera.example.com`. Nút **Xem** khi đó mở
+trình phát web `autoplay muted` + controls, không tạo thêm video bên dưới chat.
+Khi URL chưa cấu hình, chế độ private giữ phát lại bằng file_id trong chat.
 
 Liên kết chỉ sống 15 phút, gắn với người được bot cấp, bot/tenant/placement và
 bị thu hồi khi video bị xóa hoặc ID bị bỏ khỏi allowlist. Đây là capability:
@@ -422,9 +444,9 @@ nguyên khoảng ban đầu; bấm shortcut lại để lấy khoảng mới.
 
 ### Xem, tải và Thùng rác chung
 
-- **Xem:** bot gửi lại media qua file_id vào private chat người được phép
-  khi có yêu cầu. MP4 phù hợp có thể preview; định dạng/codec khác có thể cần
-  tải về phần mềm tương thích, không encode lại chỉ để ép preview.
+- **Xem (channel):** mở video gốc bằng liên kết Telegram; không gửi thêm media
+  vào chat bot và không dùng VPS làm trình phát. Người xem cần là thành viên
+  channel. Chế độ private giữ phát lại qua file_id/web tùy cấu hình.
 - **Tải:** bot gửi lại media gốc và hướng dẫn dùng nút tải / menu Telegram
   `Save to Downloads`. Loại lưu (video/document) theo media phù hợp và giữ khi
   replay: video dùng sendVideo, document tiếp tục
@@ -442,6 +464,8 @@ Thùng rác là **xóa logic khỏi ứng dụng**, giữ metadata để khôi p
 bản tin Telegram đã gửi hoặc bản đã tải về thiết bị. Telegram giới hạn
 [deleteMessage ở bản tin dưới 48 giờ](https://core.telegram.org/bots/api#deletemessage);
 tính năng này không tuyên bố xóa vật lý mọi bản sao media trên Telegram.
+Thành viên channel vẫn xem được bản tin gốc hoặc liên kết native đã biết sau
+khi catalog xóa logic; quản lý thành viên channel nằm ngoài allowlist của bot.
 Cache đã upload vẫn theo retention hiện có; file nguồn `input` giữ nguyên.
 
 Bot lưu message ID, `file_id` và `file_unique_id` sau upload được xác nhận/commit.

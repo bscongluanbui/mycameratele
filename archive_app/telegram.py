@@ -71,12 +71,33 @@ class Telegram:
                 {'text':'⬇ Tải','callback_data':'f:'+prefix},
                 {'text':'🗑 Xóa','callback_data':'x:'+prefix}]
 
+    def native_video_link(self, archive, row, actor):
+        """Open the original channel post; the Telegram client fetches media."""
+        try:archive._archive_actor(actor)
+        except (PermissionError,ValueError,TypeError):raise ValueError('Viewer is not authorized') from None
+        channel=self.settings.storage_channel_id
+        message=row.get('storage_message_id')
+        prefix,separator,_=self.settings.token.partition(':')
+        bot=prefix if separator and prefix.isdecimal() else archive.state('telegram_bot_id')
+        if (not self.channel_mode or type(channel) is not int or
+                not re.fullmatch(r'-100[1-9][0-9]*',str(channel)) or
+                row.get('status')!='uploaded' or row.get('deleted_at') is not None or
+                row.get('storage_kind')!='channel' or
+                type(row.get('storage_chat_id')) is not int or row['storage_chat_id']!=channel or
+                type(message) is not int or message<=0 or
+                not isinstance(bot,str) or not bot.isdecimal() or int(bot)<=0 or
+                type(row.get('bot_id')) is not int or row['bot_id']!=int(bot) or
+                row.get('media_type') not in ('video','document')):
+            raise ValueError('Unknown channel video selection')
+        # Telegram iOS discards a zero timecode; a positive timestamp opens
+        # the native media viewer. Other clients may only focus the post.
+        query='?single&t=1' if row['media_type']=='video' else '?single'
+        return f'https://t.me/c/{str(channel)[4:]}/{message}'+query
+
     def player_buttons(self, archive, buttons, actor):
-        """Turn requested view actions into short-lived, scoped player URLs."""
-        if not self.settings.player_public_url:
+        """Channel views stay in Telegram; private-mode web play is optional."""
+        if not self.channel_mode and not self.settings.player_public_url:
             return buttons
-        from .telegram_player import TelegramPlayer
-        player=TelegramPlayer(self.settings)
         result=[]
         for line in buttons:
             new_line=[]
@@ -85,7 +106,12 @@ class Telegram:
                 if callback.startswith('v:'):
                     row=archive.find_recording(callback[2:])
                     if not row:raise ValueError('Unknown player selection')
-                    new_line.append({'text':button['text'],'url':player.issue(archive,row,actor)})
+                    if self.channel_mode:
+                        url=self.native_video_link(archive,row,actor)
+                    else:
+                        from .telegram_player import TelegramPlayer
+                        url=TelegramPlayer(self.settings).issue(archive,row,actor)
+                    new_line.append({'text':button['text'],'url':url})
                 else:new_line.append(dict(button))
             result.append(new_line)
         return result
