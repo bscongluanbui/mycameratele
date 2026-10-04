@@ -1,5 +1,6 @@
 """Custom date ranges are viewer-bound, frozen, and require no media I/O."""
 import json
+from datetime import datetime
 import unittest
 from unittest.mock import patch
 
@@ -103,6 +104,29 @@ class CustomTimeMenuTests(unittest.TestCase):
             self.assertEqual(session['end_ms']-session['start_ms'],31*86400000+3600000)
             self.assertEqual(self.menus._custom_window(self.archive,43,session['token'])[:2],
                              (session['start_ms'],session['end_ms']))
+
+    def test_future_date_menus_do_not_use_platform_time_t_fromtimestamp(self):
+        class NarrowTimeDateTime(datetime):
+            @classmethod
+            def fromtimestamp(cls, *args, **kwargs):
+                raise OverflowError('synthetic 32-bit time_t overflow')
+
+        self.camera()
+        key=self.recording('2069-01-01T08:00:00+07:00','2069-01-01T08:01:00+07:00')
+        self.clock_mock.return_value=fixtures.stamp('2069-01-01T12:00:00+07:00')//1000
+        with patch('archive_app.telegram_menu.datetime',NarrowTimeDateTime),patch('archive_app.core.datetime',NarrowTimeDateTime):
+            self.assertEqual(self.menus.parse_timestamp('01/01/69'),fixtures.stamp('2069-01-01T00:00:00+07:00'))
+            title,cameras=self.select(start='01/01/69',end='02/01/69')
+            self.assertIn('01/01/69 → 02/01/69',title)
+            _,clips=self.menus.menu(self.archive,self.callbacks(cameras,'wqc:')[0],actor=43)
+            self.assertEqual(self.callbacks(clips,'v:'),['v:'+key[:32]])
+            self.assertIn('01/01 08:00:00 → 01/01 08:01:00',self.menus.menu(self.archive,self.callbacks(cameras,'wqc:')[0],actor=43)[0])
+            selected=self.menus.download_window(self.archive,self.callbacks(clips,'bwq:')[0],43)
+            self.assertEqual(selected['end_ms'],fixtures.stamp('2069-01-03T00:00:00+07:00'))
+            title,_=self.select(start='01/01/2069 00:00',end='02/01/2069 00:00')
+            self.assertIn('01/01/2069 00:00 → 02/01/2069 00:00',title)
+            for preset in ('today','yesterday','last6h','thisweek','lastweek'):
+                self.assertIn('Camera',self.menus.menu(self.archive,preset)[0])
 
     def test_custom_cross_midnight_range_lists_cameras_then_only_overlapping_video(self):
         self.camera()

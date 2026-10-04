@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-from .core import get_zone
+from .core import get_zone,from_epoch_ms
 from .telegram_menu import TimeMenus
 
 
@@ -106,8 +106,8 @@ class Telegram:
 
     def caption(self, archive, row):
         zone = get_zone(self.settings.timezone)
-        start = datetime.fromtimestamp(row['start_ms']/1000, zone)
-        end = datetime.fromtimestamp(row['end_ms']/1000, zone)
+        start = from_epoch_ms(row['start_ms'],zone)
+        end = from_epoch_ms(row['end_ms'],zone)
         return f"{archive.camera_name(row['camera'])} | {start.isoformat()} → {end.isoformat()}\nArchive: {row['key']}"
 
     @property
@@ -503,7 +503,7 @@ class Telegram:
         zone = get_zone(self.settings.timezone)
         buttons = []
         for row in result['recordings']:
-            stamp = datetime.fromtimestamp(row['start_ms']/1000,zone).strftime('%d/%m %H:%M:%S')
+            stamp = from_epoch_ms(row['start_ms'],zone).strftime('%d/%m %H:%M:%S')
             buttons.append(self.recording_buttons(row,archive.camera_name(row['camera'])+' | '+stamp+' ▶'))
         nav = []
         if page:
@@ -608,7 +608,7 @@ class Telegram:
         zone = get_zone(self.settings.timezone)
         buttons = []
         for row in rows[page*10:page*10+10]:
-            stamp = datetime.fromtimestamp(row['start_ms']/1000, zone).strftime('%H:%M:%S')
+            stamp = from_epoch_ms(row['start_ms'],zone).strftime('%H:%M:%S')
             buttons.append(self.recording_buttons(row,stamp+' ▶'))
         nav = []
         if page:
@@ -741,7 +741,7 @@ class Telegram:
             rows = [r for r in rows if r['camera']==camera]
             buttons=[]
             for row in rows[page*10:page*10+10]:
-                stamp=datetime.fromtimestamp(row['start_ms']/1000,zone).strftime('%H:%M:%S')
+                stamp=from_epoch_ms(row['start_ms'],zone).strftime('%H:%M:%S')
                 buttons.append(self.recording_buttons(row,stamp+' ▶'))
             nav=[]
             if page:
@@ -759,7 +759,7 @@ class Telegram:
         if page and not result['recordings']:raise ValueError('Invalid trash page')
         buttons=[];zone=get_zone(self.settings.timezone)
         for row in result['recordings']:
-            stamp=datetime.fromtimestamp(row['start_ms']/1000,zone).strftime('%d/%m %H:%M:%S')
+            stamp=from_epoch_ms(row['start_ms'],zone).strftime('%d/%m %H:%M:%S')
             buttons.append([{'text':f"↩ Khôi phục {archive.camera_name(row['camera'])} | {stamp}",
                              'callback_data':'u:'+row['key'][:32]}])
         nav=[]

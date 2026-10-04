@@ -20,6 +20,12 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 
+def from_epoch_ms(milliseconds, zone):
+    """Portable UTC milliseconds -> local datetime, including 32-bit ARM >2038."""
+    return (datetime(1970, 1, 1, tzinfo=timezone.utc) +
+            timedelta(milliseconds=milliseconds)).astimezone(zone)
+
+
 def get_zone(name):
     match = re.fullmatch(r'UTC([+-])(\d{2}):(\d{2})', name)
     if match:
@@ -664,8 +670,8 @@ class Archive:
     def calendar(self,camera):
         zone=get_zone(self.settings.timezone);tree={}
         for start,end in self.conn.execute("SELECT start_ms,end_ms FROM recordings WHERE camera=? AND status='uploaded' AND deleted_at IS NULL",(camera,)):
-            first=datetime.fromtimestamp(start/1000,zone).date()
-            last=datetime.fromtimestamp((end-1)/1000,zone).date()
+            first=from_epoch_ms(start,zone).date()
+            last=from_epoch_ms(end-1,zone).date()
             while first<=last:
                 tree.setdefault(first.year,{}).setdefault(first.month,set()).add(first.day)
                 first+=timedelta(days=1)
@@ -1177,7 +1183,7 @@ class Archive:
         root.mkdir(exist_ok=True)
         if root.resolve() != root:
             raise ValueError('Backup directory outside state')
-        today = datetime.fromtimestamp(time.time(), get_zone(self.settings.timezone)).date()
+        today = from_epoch_ms(time.time()*1000, get_zone(self.settings.timezone)).date()
         destination = _confined_path(root / f'archive-{today.isoformat()}.db', root, allow_missing=True)
         with self._backup_lock(root) as acquired:
             if not acquired or destination.exists():

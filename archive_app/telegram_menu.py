@@ -11,7 +11,7 @@ import re
 import secrets
 import time
 
-from .core import get_zone
+from .core import from_epoch_ms, get_zone
 
 
 class TimeMenus:
@@ -158,7 +158,7 @@ class TimeMenus:
             raise ValueError('Ambiguous selected local time')
         result = int(selected.timestamp() * 1000)
         if (0 <= result < 4133980800000 and
-                datetime.fromtimestamp(result / 1000, zone).replace(tzinfo=None) == naive):
+                from_epoch_ms(result, zone).replace(tzinfo=None) == naive):
             return result
         raise ValueError('Invalid selected time')
 
@@ -189,7 +189,7 @@ class TimeMenus:
         if not date_only:
             return end - start <= self.MAX_RANGE_MS
         zone = get_zone(self.telegram.settings.timezone)
-        begin, finish = (datetime.fromtimestamp(value / 1000, zone) for value in (start, end))
+        begin, finish = (from_epoch_ms(value, zone) for value in (start, end))
         return (begin.time() == datetime.min.time() and finish.time() == datetime.min.time()
                 and 1 <= (finish.date() - begin.date()).days <= 31)
 
@@ -208,7 +208,7 @@ class TimeMenus:
                 zone = get_zone(self.telegram.settings.timezone)
                 # Inclusive selected end date; construct tomorrow's midnight
                 # in the configured zone, not an elapsed 86,400-second offset.
-                end_date = datetime.fromtimestamp(selected / 1000, zone).date() + timedelta(days=1)
+                end_date = from_epoch_ms(selected, zone).date() + timedelta(days=1)
                 selected = self._local_timestamp(datetime.combine(end_date, datetime.min.time()))
         except (ValueError, OverflowError, OSError):
             return 'Ngày giờ chưa đúng.\n'+self._format_hint(), self._cancel_buttons()
@@ -236,22 +236,22 @@ class TimeMenus:
             raise ValueError('Expired custom time selection')
         zone = get_zone(self.telegram.settings.timezone)
         if session.get('date_only') is True:
-            finish = datetime.fromtimestamp(end / 1000, zone).date() - timedelta(days=1)
-            label = f'{datetime.fromtimestamp(start / 1000, zone):%d/%m/%y} → {finish:%d/%m/%y}'
+            finish = from_epoch_ms(end, zone).date() - timedelta(days=1)
+            label = f'{from_epoch_ms(start, zone):%d/%m/%y} → {finish:%d/%m/%y}'
         else:
-            label = f'{datetime.fromtimestamp(start / 1000, zone):%d/%m/%Y %H:%M} → {datetime.fromtimestamp(end / 1000, zone):%d/%m/%Y %H:%M}'
+            label = f'{from_epoch_ms(start, zone):%d/%m/%Y %H:%M} → {from_epoch_ms(end, zone):%d/%m/%Y %H:%M}'
         return start, end, label
 
     def _window(self, kind, anchor):
         if kind not in self._LABELS or type(anchor) is not int or anchor <= 0 or anchor > int(time.time()) + 300:
             raise ValueError('Invalid time-menu window')
         zone = get_zone(self.telegram.settings.timezone)
-        selected = datetime.fromtimestamp(anchor, zone)
+        selected = from_epoch_ms(anchor * 1000, zone)
         if kind == 'h':
             start_ms, end_ms = (anchor - 6 * 3600) * 1000, anchor * 1000
             if start_ms < 0:
                 raise ValueError('Invalid time-menu window')
-            start = datetime.fromtimestamp(start_ms / 1000, zone)
+            start = from_epoch_ms(start_ms, zone)
             end = selected
         else:
             # Construct local calendar midnights rather than assume all days
@@ -344,8 +344,8 @@ class TimeMenus:
             key = recording['key']
             if not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{64}', key):
                 raise ValueError('Invalid recording identity')
-            start = datetime.fromtimestamp(recording['start_ms'] / 1000, zone)
-            end = datetime.fromtimestamp(recording['end_ms'] / 1000, zone)
+            start = from_epoch_ms(recording['start_ms'], zone)
+            end = from_epoch_ms(recording['end_ms'], zone)
             lines.append(f'{index}. {start:%d/%m %H:%M:%S} → {end:%d/%m %H:%M:%S}')
             prefix = key[:32]
             buttons.append([
