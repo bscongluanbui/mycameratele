@@ -61,6 +61,8 @@ class PlayerHTTPTests(unittest.TestCase):
             with_archive.close()
         with patch.dict(os.environ, {'DASHBOARD_COOKIE_SECURE': 'false'}):
             self.server = DashboardServer(('127.0.0.1', 0), self.settings)
+        # Drain request handlers before deleting SQLite files on Windows.
+        self.server.daemon_threads = False
         self.settings.player_public_url = 'http://127.0.0.1:'+str(self.server.server_port)
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        kwargs={'poll_interval': 0.02}, daemon=True)
