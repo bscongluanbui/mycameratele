@@ -6,7 +6,7 @@ owner/viewer nhận phản hồi trong private chat **khi chủ động yêu c�
 mỗi recording mới. Mục lục: **Camera → Năm → Tháng → Ngày → Video**, có Cũ → Mới.
 
 Menu dùng các nút một cột với nhãn ngắn: **Start / Menu**, **Hôm nay → Camera → Video**,
-**Hôm qua**, **6 giờ trước**, **Tùy chọn thời gian** và **Start sync**.
+**Hôm qua**, **6 giờ trước**, **Tuần này**, **Tuần trước**, **Tùy chọn thời gian** và **Start sync**.
 Đổi `TELEGRAM_STORAGE_CHANNEL_ID` chỉ đổi kho cho recording mới; video đã xác
 nhận vẫn phát lại theo channel/message ID đã lưu trong SQLite, không ghi đè
 placement cũ hoặc upload lại lịch sử. Giữ bot và volumes cũ khi đổi channel.
@@ -372,11 +372,40 @@ Hôm nay / Hôm qua / 6 giờ trước → chọn Camera → danh sách video
 ```
 
 **Start / Menu** luôn có trong danh sách lệnh Telegram (`/start`). Chọn
-**Tùy chọn thời gian** hoặc `/time`, nhập lần lượt thời gian bắt đầu và kết thúc
-theo `DD/MM/YYYY HH:mm` (ví dụ `04/10/2026 08:00`); cũng nhận `YYYY-MM-DD HH:mm`.
+**Tùy chọn thời gian** hoặc `/time`, nhập lần lượt ngày bắt đầu và kết thúc
+theo `DD/MM/YY` (ví dụ `01/10/26` → `04/10/26`). Ngày kết thúc được tính trọn ngày;
+hai ngày giống nhau chọn đúng một ngày. Năm hai chữ số là 2000–2099.
+Định dạng cũ `DD/MM/YYYY HH:mm` và `YYYY-MM-DD HH:mm` vẫn được chấp nhận.
 Bot dùng `DISPLAY_TIMEZONE`, khoảng tối đa 31 ngày, có nút Hủy. Khoảng đã chọn
 gắn riêng với ID người dùng; bấm Camera, phân trang hoặc đổi thứ tự không đổi
 khoảng thời gian.
+
+**Tuần này** / `/thisweek` và **Tuần trước** / `/lastweek` theo thứ Hai → Chủ nhật
+của `DISPLAY_TIMEZONE`. Mọi danh sách ngày/tuần/khoảng có **⬇ Tải toàn bộ (N)**;
+N bao gồm toàn bộ kết quả, không chỉ trang đang hiển thị. Bot xếp hàng gửi các
+album tối đa 10 video/tệp bằng `file_id` đã lưu, không đọc lại SD, không ZIP,
+không transcode. Có tiến trình và nút Hủy; việc gửi chạy riêng với sync/menu.
+Lượt gửi gặp 429 được chờ lại; POST không rõ kết quả hoặc worker dừng giữa POST
+được đánh dấu chưa xác nhận, không gửi lại mù quáng.
+
+### Xem trực tiếp từ danh sách
+
+Đặt `TELEGRAM_PLAYER_PUBLIC_URL=https://camera.example.com` (hoặc địa chỉ
+`http://VPS_IP:8080` đang sử dụng), rồi `docker compose up -d archive dashboard`.
+Nút **Xem** mở trình phát web ngay, không tạo thêm video bên dưới chat. Trình phát
+dùng `autoplay muted` + controls; bật âm thanh bằng nút loa. Trình duyệt vẫn quyết
+định quyền autoplay/codec; dữ liệu video được giữ nguyên, không tạo bản encode.
+Khi URL chưa cấu hình, nút cũ tiếp tục phát lại video trong chat.
+
+Liên kết chỉ sống 15 phút, gắn với người được bot cấp, bot/tenant/placement và
+bị thu hồi khi video bị xóa hoặc ID bị bỏ khỏi allowlist. Đây là capability:
+người có liên kết hợp lệ dùng được đến khi hết hạn; không chia sẻ liên kết.
+HTTPS bảo vệ đường truyền khi có domain; bot token và đường dẫn Telegram không
+xuất hiện ở trình duyệt. Chọn lại danh sách để lấy liên kết mới sau khi hết hạn.
+Player hỗ trợ Range/HEAD để xem/tua, không yêu cầu đăng nhập admin dashboard.
+Local Bot API trả đường dẫn server; dashboard đọc volume `bot-api-state` ở
+`/var/lib/telegram-bot-api` **read-only**, không sửa dữ liệu API. Cloud dùng proxy
+server-side theo giới hạn tải file của Bot API; chọn Local API cho file lớn.
 
 Dashboard gom trạng thái đồng bộ thành một dòng trên mỗi camera. Bấm **Detail**
 để mở bộ đếm SD/tải/upload, mã lỗi và thời gian cập nhật. Mục **Logs** riêng giữ

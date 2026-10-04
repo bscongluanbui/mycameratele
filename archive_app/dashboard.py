@@ -27,6 +27,7 @@ class DashboardServer(ThreadingHTTPServer):
         self.cookie_secure=os.environ.get('DASHBOARD_COOKIE_SECURE','false').strip().lower()=='true'
         self.sessions={};self.login_attempts={};self.account_attempts={};self.session_lock=threading.Lock()
         self.auth_lock=threading.Lock()
+        self.player_slots=threading.BoundedSemaphore(8)
         self.web=Path(__file__).parent/'web'
         with_archive=Archive(settings);with_archive.close()
         super().__init__(address,DashboardHandler)
@@ -109,12 +110,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):self.handle_request('GET')
+    def do_HEAD(self):self.handle_request('HEAD')
     def do_POST(self):self.handle_request('POST')
     def do_PATCH(self):self.handle_request('PATCH')
 
     def handle_request(self,method):
         parsed=urlsplit(self.path);path=parsed.path
         try:
+            if path.startswith('/player/') and method in ('GET','HEAD'):
+                from .telegram_player import TelegramPlayer
+                if not self.server.player_slots.acquire(blocking=False):
+                    self.send(503,{'error':'Thử lại sau'});return
+                try:
+                    archive=Archive(self.server.settings)
+                    try:TelegramPlayer(self.server.settings).handle(self,archive,path,head=method=='HEAD')
+                    finally:archive.close()
+                finally:self.server.player_slots.release()
+                return
             if path=='/healthz' and method=='GET':
                 self.send(200,{'healthy':True,'service':'dashboard','version':'2.4'});return
             if not path.startswith('/api/'):

@@ -24,10 +24,85 @@ class CustomTimeMenuTests(unittest.TestCase):
         expected=fixtures.stamp('2026-10-03T02:30:00+07:00')
         self.assertEqual(self.menus.parse_timestamp('03/10/2026 02:30'), expected)
         self.assertEqual(self.menus.parse_timestamp('2026-10-03 02:30'), expected)
-        for value in ('31/02/2026 10:00','03/10/2026 25:00','03/10/2026','10/03/26 02:30',
+        for value in ('31/02/2026 10:00','03/10/2026 25:00','31/02/2026','10/03/26 02:30',
                       '2026-10-03T02:30+00:00','01/01/2500 00:00','01/01/1960 00:00','x'*33,None):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.menus.parse_timestamp(value)
+
+    def test_dd_mm_yy_dates_start_at_local_midnight_with_explicit_century(self):
+        self.assertEqual(self.menus.parse_timestamp('03/10/26'),fixtures.stamp('2026-10-03T00:00:00+07:00'))
+        self.assertEqual(self.menus.parse_timestamp('03/10/2026'),fixtures.stamp('2026-10-03T00:00:00+07:00'))
+        self.assertEqual(self.menus.parse_timestamp('01/01/69'),fixtures.stamp('2069-01-01T00:00:00+07:00'))
+        self.assertEqual(self.menus.parse_timestamp('29/02/28'),fixtures.stamp('2028-02-29T00:00:00+07:00'))
+        for value in ('31/02/26','29/02/26','03/13/26','3/10/26','10/3/26','03/10/2','03/10/026'):
+            with self.subTest(value=value),self.assertRaises(ValueError):self.menus.parse_timestamp(value)
+        self.assertIn('DD/MM/YY',self.menus.begin(self.archive,43)[0])
+
+    def test_date_only_same_day_includes_entire_end_date_and_excludes_next_day(self):
+        self.camera()
+        included=self.recording('2026-10-03T23:59:00+07:00','2026-10-04T00:00:00+07:00')
+        self.recording('2026-10-02T23:59:00+07:00','2026-10-03T00:00:00+07:00')
+        self.recording('2026-10-04T00:00:00+07:00','2026-10-04T00:01:00+07:00')
+        title,cameras=self.select(start='03/10/26',end='03/10/26')
+        self.assertIn('03/10/26 → 03/10/26',title)
+        session=self.menus._session(self.archive,43)
+        self.assertTrue(session['date_only'])
+        self.assertEqual((session['start_ms'],session['end_ms']),
+                         (fixtures.stamp('2026-10-03T00:00:00+07:00'),fixtures.stamp('2026-10-04T00:00:00+07:00')))
+        _,clips=self.menus.menu(self.archive,self.callbacks(cameras,'wqc:')[0],actor=43)
+        self.assertEqual(self.callbacks(clips,'v:'),['v:'+included[:32]])
+
+    def test_date_only_cross_month_and_thirty_one_calendar_day_limit(self):
+        title,_=self.select(start='30/09/26',end='03/10/26')
+        self.assertIn('30/09/26 → 03/10/26',title)
+        title,_=self.select(start='01/10/26',end='31/10/26')
+        self.assertIn('Camera',title)
+        self.assertEqual(self.menus._session(self.archive,43)['end_ms'],fixtures.stamp('2026-11-01T00:00:00+07:00'))
+        for value in ('30/09/26','01/11/26'):
+            self.menus.begin(self.archive,43)
+            self.menus.accept(self.archive,43,'01/10/26')
+            title,_=self.menus.accept(self.archive,43,value)
+            self.assertTrue('sau giờ bắt đầu' in title or 'tối đa 31 ngày' in title)
+            self.assertEqual(self.menus._session(self.archive,43)['step'],'end')
+
+    def test_date_end_and_datetime_start_keep_compatibility(self):
+        self.select(start='02/10/2026 23:30',end='03/10/26')
+        session=self.menus._session(self.archive,43)
+        self.assertFalse(session['date_only'])
+        self.assertEqual(session['end_ms'],fixtures.stamp('2026-10-04T00:00:00+07:00'))
+
+    def test_date_custom_bulk_window_matches_all_pages_and_actor_bound_selection(self):
+        self.camera()
+        for minute in range(12):self.recording(f'2026-10-03T01:{minute:02}:00+07:00',f'2026-10-03T01:{minute:02}:30+07:00')
+        _,cameras=self.select(start='03/10/26',end='03/10/26')
+        _,clips=self.menus.menu(self.archive,self.callbacks(cameras,'wqc:')[0],actor=43)
+        bulk=self.callbacks(clips,'bwq:')[0]
+        selection=self.menus.download_window(self.archive,bulk,43)
+        self.assertEqual(selection['camera'],'Front_Camera')
+        self.assertEqual(selection['order'],'asc')
+        self.assertEqual(self.archive.list_window(selection['start_ms'],selection['end_ms'],camera=selection['camera'])['total'],12)
+        self.assertIn('⬇ Tải toàn bộ (12)',[b['text'] for row in clips for b in row])
+        self.assertIsNone(self.menus.download_window(self.archive,self.callbacks(cameras,'bwq:')[0],43)['camera'])
+        with self.assertRaises(ValueError):self.menus.download_window(self.archive,bulk,42)
+        self.clock_mock.return_value=self.NOW+TimeMenus.RANGE_TTL+1
+        with self.assertRaises(ValueError):self.menus.download_window(self.archive,bulk,43)
+
+    def test_date_only_dst_days_and_thirty_one_day_fall_range_use_local_midnights(self):
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:zone=ZoneInfo('America/New_York')
+        except ZoneInfoNotFoundError:self.skipTest('OS fixture has no DST zone database')
+        self.settings.timezone='America/New_York'
+        with patch('archive_app.telegram_menu.get_zone',return_value=zone):
+            for day,hours in (('08/03/26',23),('01/11/26',25)):
+                self.select(start=day,end=day)
+                session=self.menus._session(self.archive,43)
+                self.assertEqual(session['end_ms']-session['start_ms'],hours*3600000)
+            title,_=self.select(start='15/10/26',end='14/11/26')
+            self.assertIn('Camera',title)
+            session=self.menus._session(self.archive,43)
+            self.assertEqual(session['end_ms']-session['start_ms'],31*86400000+3600000)
+            self.assertEqual(self.menus._custom_window(self.archive,43,session['token'])[:2],
+                             (session['start_ms'],session['end_ms']))
 
     def test_custom_cross_midnight_range_lists_cameras_then_only_overlapping_video(self):
         self.camera()

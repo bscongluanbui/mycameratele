@@ -141,9 +141,9 @@ class BotControlTests(unittest.TestCase):
 
     def test_custom_time_text_flow_selects_camera_then_video_and_cancel_returns_home(self):
         self.message('/time')
-        self.assertTrue(any('Từ lúc nào' in c[1].get('text','') for c in self.calls))
+        self.assertTrue(any('Từ ngày nào' in c[1].get('text','') for c in self.calls))
         self.message('03/10/2026 09:59',update_id=2)
-        self.assertTrue(any('Đến lúc nào' in c[1].get('text','') for c in self.calls))
+        self.assertTrue(any('Đến ngày nào' in c[1].get('text','') for c in self.calls))
         self.calls.clear();self.message('03/10/2026 10:02',update_id=3)
         fields=next(c[1] for c in self.calls if c[0]=='sendMessage')
         selection=next(b['callback_data'] for row in fields['reply_markup']['inline_keyboard'] for b in row if b['callback_data'].startswith('wqc:'))
@@ -185,7 +185,7 @@ class BotControlTests(unittest.TestCase):
                 self.assertFalse(any('Ngày giờ chưa đúng' in text for text in replies))
                 if label=='Tùy chọn thời gian':
                     self.assertEqual(json.loads(self.archive.state('telegram_time_selection:43'))['step'],'start')
-                    self.assertTrue(any('Từ lúc nào' in text for text in replies))
+                    self.assertTrue(any('Từ ngày nào' in text for text in replies))
                 else:
                     self.assertEqual(self.archive.state('telegram_time_selection:43'),'{}')
                 if label=='Start sync':self.assertTrue(any('Đã tiếp nhận sync' in text for text in replies))

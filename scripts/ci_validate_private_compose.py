@@ -44,4 +44,8 @@ for service in ('archive', 'dashboard'):
     assert settings['KEEP_CACHE'] == 'false' and settings['CACHE_RETENTION_HOURS'] == '1'
     assert settings['ENABLE_UPLOAD'] == 'false' and 'build' not in local['services'][service]
 assert all(v.get('target')!='/cache' for v in local['services']['telegram-bot-api'].get('volumes',[]))
+player_mount=next(v for v in local['services']['dashboard']['volumes'] if v['target']=='/var/lib/telegram-bot-api')
+assert player_mount['type']=='volume' and player_mount['read_only'] is True
+assert player_mount['source']=='bot-api-state'
+assert all(v.get('target')!='/var/lib/telegram-bot-api' for v in local['services']['archive']['volumes'])
 print('HOUSE01_COMPOSE: cloud=OK local=OK channel=required-at-upload remux=streamcopy retention=1h SD=900s volumes=preserved API_cache_mount=none exit=0')

@@ -94,6 +94,8 @@ class Settings:
     # Library/test constructors remain byte-preserving. A deployment may
     # explicitly select MP4 container remuxing with video/audio stream copy.
     media_mode: str = 'raw'
+    player_public_url: str = ''
+    bot_api_file_root: Path = Path('/var/lib/telegram-bot-api')
 
     @property
     def effective_owner(self):
@@ -161,6 +163,8 @@ class Settings:
             os.environ.get('PASSTHROUGH_PROBE_METADATA', 'false').lower() == 'true',
             tenant_id=tenant, telegram_destination=destination, storage_channel_id=channel,
             media_mode=media_mode,
+            player_public_url=os.environ.get('TELEGRAM_PLAYER_PUBLIC_URL', '').strip().rstrip('/'),
+            bot_api_file_root=Path(os.environ.get('TELEGRAM_BOT_API_FILE_ROOT', '/var/lib/telegram-bot-api')),
         )
         get_zone(result.timezone)
         limit = 2000000000 if mode == 'local' else 50000000
@@ -704,7 +708,9 @@ class Archive:
         if type(start_ms) is not int or type(end_ms) is not int:
             raise ValueError('Window bounds must be integer UTC milliseconds')
         maximum = 4133980800000  # 2101-01-01T00:00:00Z; includes all of 2100.
-        if not 0 <= start_ms < end_ms <= maximum or end_ms - start_ms > 31 * 86400000:
+        # A 31-local-calendar-day selection can include a DST fall-back hour.
+        # TimeMenus enforces the calendar limit; the catalog keeps a hard ceiling.
+        if not 0 <= start_ms < end_ms <= maximum or end_ms - start_ms > 32 * 86400000:
             raise ValueError('Invalid archive window')
 
     def list_window(self, start_ms, end_ms, camera=None, order='asc', offset=0, limit=10):

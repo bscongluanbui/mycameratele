@@ -140,7 +140,25 @@ def main():
             finally:
                 poll_archive.close()
         poll_thread=threading.Thread(target=poll_commands,daemon=True)
+        from .telegram_bulk import TelegramBulk
+        # File-ID album delivery has its own connection/thread: camera SD jobs
+        # and command polling remain responsive during large selected ranges.
+        bulk=TelegramBulk(Telegram(settings))
+        bulk.recover(archive)
         poll_thread.start()
+        def bulk_downloads():
+            bulk_archive=Archive(settings)
+            try:
+                while not heartbeat_stop.is_set():
+                    try:
+                        result=bulk.process_one(bulk_archive)
+                        if result:emit('telegram_bulk',**result)
+                        bulk.notify_one(bulk_archive)
+                    except Exception as exc:emit('telegram_bulk_error',error_type=type(exc).__name__)
+                    heartbeat_stop.wait(2)
+            finally:bulk_archive.close()
+        bulk_thread=threading.Thread(target=bulk_downloads,daemon=True)
+        bulk_thread.start()
         emit('started',**archive.status())
         while running:
             if time.monotonic()>=next_sync:
@@ -172,7 +190,7 @@ def main():
                 if not running:break
                 if archive.conn.execute("SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1").fetchone():break
                 time.sleep(1)
-        heartbeat_stop.set();heartbeat_thread.join(timeout=11);poll_thread.join(timeout=36)
+        heartbeat_stop.set();heartbeat_thread.join(timeout=11);poll_thread.join(timeout=36);bulk_thread.join(timeout=36)
         emit('stopped');return 0
     finally:
         archive.close()

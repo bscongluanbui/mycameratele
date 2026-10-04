@@ -50,6 +50,7 @@ class Telegram:
     def reply_keyboard():
         return {'keyboard':[[{'text':'🏠 Start'},{'text':'▶ Start sync'}],
                             [{'text':'📅 Hôm nay'},{'text':'📆 Hôm qua'},{'text':'🕕 6 giờ trước'}],
+                            [{'text':'📅 Tuần này'},{'text':'📆 Tuần trước'}],
                             [{'text':'🗓 Tùy chọn thời gian'}],
                             [{'text':'📷 Camera'},{'text':'🕐 Video gần đây'},{'text':'🗑 Thùng rác'}],
                             [{'text':'⚙ Trạng thái'}]],'resize_keyboard':True,'is_persistent':True}
@@ -69,6 +70,25 @@ class Telegram:
         return [{'text':label,'callback_data':'v:'+prefix},
                 {'text':'⬇ Tải','callback_data':'f:'+prefix},
                 {'text':'🗑 Xóa','callback_data':'x:'+prefix}]
+
+    def player_buttons(self, archive, buttons, actor):
+        """Turn requested view actions into short-lived, scoped player URLs."""
+        if not self.settings.player_public_url:
+            return buttons
+        from .telegram_player import TelegramPlayer
+        player=TelegramPlayer(self.settings)
+        result=[]
+        for line in buttons:
+            new_line=[]
+            for button in line:
+                callback=button.get('callback_data','')
+                if callback.startswith('v:'):
+                    row=archive.find_recording(callback[2:])
+                    if not row:raise ValueError('Unknown player selection')
+                    new_line.append({'text':button['text'],'url':player.issue(archive,row,actor)})
+                else:new_line.append(dict(button))
+            result.append(new_line)
+        return result
 
     @property
     def owner(self):
@@ -509,7 +529,7 @@ class Telegram:
                             [{'text':'🗑 Thùng rác','callback_data':'trash:0'}],
                             [{'text':'⚙ Trạng thái','callback_data':'status'}]])
             return '📹 Camera · Menu',buttons
-        if data in ('today','yesterday','last6h','custom-time') or data.startswith(('w:','wc:','wq:','wqc:')):
+        if data in ('today','yesterday','last6h','thisweek','lastweek','custom-time') or data.startswith(('w:','wc:','wq:','wqc:')):
             return TimeMenus(self).menu(archive,data,actor=actor)
         if data.startswith('trash:'):
             return self.trash_menu(archive,int(data.split(':')[1]))
@@ -598,6 +618,9 @@ class Telegram:
         if nav:
             buttons.append(nav)
         self._controls(buttons, f'p:{token}:{day}:{{order}}:0', f'm:{token}:{day[:7]}:{order}', order)
+        if rows:
+            buttons.insert(len(buttons)-1,[{'text':f'⬇ Tải toàn bộ ({len(rows)})',
+                                          'callback_data':f'bd:{token}:{day}:'+('a' if order=='asc' else 'd')}])
         return f'{name} | {day} | trang {page+1} | '+('Cũ → mới' if order == 'asc' else 'Mới → cũ'), buttons
 
     @staticmethod
@@ -920,7 +943,21 @@ class Telegram:
                                         purpose='download' if callback['data'].startswith('f:') else 'view')
                             self._advance_poll(archive,update['update_id'],backend)
                             continue
-                        if callback['data'].startswith('x:'):
+                        if callback['data'].startswith(('bw:','bwq:','bd:')):
+                            from .telegram_bulk import TelegramBulk
+                            bulk=TelegramBulk(self)
+                            selection=TimeMenus(self).download_window(archive,callback['data'],actor)
+                            job=bulk.enqueue(archive,actor,selection,update_id=update['update_id'])
+                            if job['id'] is None:
+                                text,buttons='Chưa có video.',[[{'text':'🏠 Menu','callback_data':'home'}]]
+                            else:text,buttons=bulk.menu(archive,actor,job['id'])
+                        elif callback['data'].startswith(('bulk-status:','bulk-cancel:')):
+                            from .telegram_bulk import TelegramBulk
+                            bulk=TelegramBulk(self)
+                            job_id=callback['data'].split(':',1)[1]
+                            if callback['data'].startswith('bulk-cancel:'):bulk.cancel(archive,actor,job_id)
+                            text,buttons=bulk.menu(archive,actor,job_id)
+                        elif callback['data'].startswith('x:'):
                             text,buttons=self.deletion_menu(archive,callback['data'][2:],actor)
                         elif callback['data'].startswith('xc:'):
                             text,buttons=self.confirm_deletion(archive,callback['data'],actor)
@@ -944,10 +981,12 @@ class Telegram:
                         command=words[0].split('@')[0] if words else ''
                         raw_text=message.get('text','').strip()
                         is_start=command == '/start' or raw_text in ('🏠 Start','Start','🏠 Menu')
-                        mapping={'/today':'today','/yesterday':'yesterday','/last6h':'last6h','/recent':'recent:0','/trash':'trash:0',
+                        mapping={'/today':'today','/yesterday':'yesterday','/last6h':'last6h','/thisweek':'thisweek','/lastweek':'lastweek','/recent':'recent:0','/trash':'trash:0',
                                  '/time':'custom-time','🗓 Tùy chọn thời gian':'custom-time','Tùy chọn thời gian':'custom-time',
                                  '📅 Hôm nay':'today','Hôm nay':'today','📆 Hôm qua':'yesterday','Hôm qua':'yesterday',
                                  '🕕 6 giờ trước':'last6h','6 giờ trước':'last6h','6 giờ gần nhất':'last6h',
+                                 '📅 Tuần này':'thisweek','Tuần này':'thisweek','📆 Tuần trước':'lastweek','Tuần trước':'lastweek',
+                                 '🗓 Tuần này':'thisweek','🗓 Tuần trước':'lastweek',
                                  '📷 Camera':'root','🕐 Video gần đây':'recent:0','🗑 Thùng rác':'trash:0','⚙ Trạng thái':'status'}
                         # Commands, aliases, and visible actions exit an unfinished date prompt.
                         actions={button['text'] for row in self.reply_keyboard()['keyboard'] for button in row}
@@ -984,6 +1023,7 @@ class Telegram:
                         else:
                             data=mapping.get(message.get('text','').strip(),mapping.get(command,'root'))
                             text,buttons=self.menu(archive,data,actor=actor)
+                    buttons=self.player_buttons(archive,buttons,actor)
                     self.request('sendMessage',{'chat_id':chat_id,'text':text,
                                                'reply_markup':{'inline_keyboard':buttons}})
                     if not callback:

@@ -252,7 +252,7 @@ class ArchiveDeletionTests(unittest.TestCase):
     def test_window_rejects_invalid_bounds(self):
         for start, end in ((True, self.end), (self.begin, False), (float(self.begin), self.end),
                            (self.begin, self.begin), (self.end, self.begin), (-1, 1),
-                           (self.begin, self.begin+31*86400000+1), (4133980800000, 4133980800001)):
+                           (self.begin, self.begin+32*86400000+1), (4133980800000, 4133980800001)):
             for method in (self.archive.list_window, self.archive.window_cameras):
                 with self.subTest(start=start, end=end, method=method.__name__), self.assertRaises(ValueError):
                     method(start, end)

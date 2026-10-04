@@ -66,13 +66,13 @@ class TimeMenuTests(unittest.TestCase):
         return next(data for data in self.callbacks(buttons, 'wc:') if f':{token}:' in data)
 
     def test_shortcut_buttons_and_persistent_commands(self):
-        self.assertEqual(self.callbacks(self.menus.shortcuts()), ['today', 'yesterday', 'last6h', 'custom-time'])
+        self.assertEqual(self.callbacks(self.menus.shortcuts()), ['today', 'yesterday', 'last6h', 'thisweek', 'lastweek', 'custom-time'])
         self.assertTrue(all(len(row) == 1 for row in self.menus.shortcuts()))
         commands = self.menus.commands()
         self.assertEqual([command['command'] for command in commands],
-                         ['start', 'sync', 'today', 'yesterday', 'last6h', 'time', 'archive', 'recent', 'trash', 'status'])
+                         ['start', 'sync', 'today', 'yesterday', 'last6h', 'thisweek', 'lastweek', 'time', 'archive', 'recent', 'trash', 'status'])
         self.assertEqual([command['description'] for command in commands],
-                         ['Start / Menu', 'Start sync', 'Hôm nay', 'Hôm qua', '6 giờ trước', 'Tùy chọn thời gian', 'Kho video',
+                         ['Start / Menu', 'Start sync', 'Hôm nay', 'Hôm qua', '6 giờ trước', 'Tuần này', 'Tuần trước', 'Tùy chọn thời gian', 'Kho video',
                           'Video gần đây', 'Thùng rác', 'Trạng thái'])
         for command in commands:
             self.assertRegex(command['command'], r'^[a-z0-9_]{1,32}$')
@@ -127,6 +127,54 @@ class TimeMenuTests(unittest.TestCase):
                          (stamp('2026-10-02T20:30:00+07:00'), stamp('2026-10-03T02:30:00+07:00')))
         _, clips = self.menus.menu(self.archive, self.camera_selection(cameras))
         self.assertEqual(self.callbacks(clips, 'v:'), ['v:' + crossing_start[:32], 'v:' + inside[:32]])
+
+    def test_week_presets_monday_to_monday_use_local_calendar(self):
+        self.camera()
+        current=self.recording('2026-09-28T00:00:00+07:00','2026-09-28T00:01:00+07:00')
+        previous=self.recording('2026-09-27T23:59:00+07:00','2026-09-28T00:00:00+07:00')
+        self.recording('2026-10-05T00:00:00+07:00','2026-10-05T00:01:00+07:00')
+        for preset,kind,begin,end,key,label in (
+                ('thisweek','s','2026-09-28T00:00:00+07:00','2026-10-05T00:00:00+07:00',current,'Tuần này'),
+                ('lastweek','p','2026-09-21T00:00:00+07:00','2026-09-28T00:00:00+07:00',previous,'Tuần trước')):
+            with self.subTest(preset=preset):
+                title,cameras=self.menus.menu(self.archive,preset)
+                self.assertEqual(title,label+' · Camera · trang 1')
+                self.assertEqual(self.menus._window(kind,self.NOW)[:2],(stamp(begin),stamp(end)))
+                _,clips=self.menus.menu(self.archive,self.camera_selection(cameras))
+                self.assertEqual(self.callbacks(clips,'v:'),['v:'+key[:32]])
+
+    def test_week_selection_bulk_and_sort_are_frozen_and_match_all_not_current_page(self):
+        self.camera()
+        keys=[self.recording(f'2026-10-03T01:{minute:02}:00+07:00',f'2026-10-03T01:{minute:02}:30+07:00') for minute in range(12)]
+        _,cameras=self.menus.menu(self.archive,'thisweek')
+        camera_all=self.callbacks(cameras,'bw:')[0]
+        selection=self.camera_selection(cameras)
+        self.clock_mock.return_value=self.NOW+9*86400
+        _,clips=self.menus.menu(self.archive,selection)
+        self.assertIn('⬇ Tải toàn bộ (12)',[b['text'] for row in clips for b in row])
+        bulk=self.callbacks(clips,'bw:')[0]
+        selected=self.menus.download_window(self.archive,bulk,43)
+        self.assertEqual(selected['start_ms'],stamp('2026-09-28T00:00:00+07:00'))
+        self.assertEqual(selected['end_ms'],stamp('2026-10-05T00:00:00+07:00'))
+        self.assertEqual(selected['camera'],'Front_Camera')
+        self.assertEqual(selected['order'],'asc')
+        self.assertEqual(self.archive.list_window(selected['start_ms'],selected['end_ms'],camera=selected['camera'])['total'],12)
+        self.assertIsNone(self.menus.download_window(self.archive,camera_all,43)['camera'])
+        sort=next(b['callback_data'] for row in clips for b in row if b['text']=='Mới → cũ')
+        _,descending=self.menus.menu(self.archive,sort)
+        self.assertEqual(self.callbacks(descending,'v:'),['v:'+key[:32] for key in keys[::-1][:10]])
+        self.assertEqual(self.menus.download_window(self.archive,self.callbacks(descending,'bw:')[0],43)['order'],'desc')
+        self.assertTrue(all(len(c.encode())<=64 for c in self.callbacks(clips)))
+
+    def test_bulk_window_rejects_unknown_actor_camera_tampering_and_future_anchors(self):
+        self.camera()
+        token=self.telegram.camera_token('Front_Camera')
+        valid=f'bw:t:{self.NOW}:{token}:a'
+        for actor in (None,True,999):
+            with self.subTest(actor=actor),self.assertRaises(ValueError):self.menus.download_window(self.archive,valid,actor)
+        for data in (None,'',f'bw:t:{self.NOW+301}:{token}:a',f'bw:t:{self.NOW}:000000000000:a',
+                     f'bw:t:{self.NOW}:{token}:asc',f'bw:z:{self.NOW}:all:a',f'bw:t:0:all:a','bw:'+'x'*65):
+            with self.subTest(data=data),self.assertRaises(ValueError):self.menus.download_window(self.archive,data,43)
 
     def test_window_is_frozen_through_midnight_sort_and_back(self):
         self.camera()
@@ -266,6 +314,18 @@ class TimeMenuTests(unittest.TestCase):
         with patch('archive_app.telegram_menu.get_zone', return_value=ShiftedZone()):
             start, end, _ = self.menus._window('t', anchor)
         self.assertEqual(end - start, 23 * 3600000)
+
+    def test_week_dst_transition_is_calendar_week_not_elapsed_168_hours(self):
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:zone=ZoneInfo('America/New_York')
+        except ZoneInfoNotFoundError:self.skipTest('OS fixture has no DST zone database')
+        self.settings.timezone='America/New_York'
+        for when,hours in (('2026-03-07T12:00:00-05:00',167),('2026-10-31T12:00:00-04:00',169)):
+            anchor=int(datetime.fromisoformat(when).timestamp())
+            self.clock_mock.return_value=anchor
+            with patch('archive_app.telegram_menu.get_zone',return_value=zone):
+                begin,end,_=self.menus._window('s',anchor)
+            self.assertEqual(end-begin,hours*3600000)
 
 
 if __name__ == '__main__':
