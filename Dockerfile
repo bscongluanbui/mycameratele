@@ -20,8 +20,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 archive \
     && useradd --uid 10001 --gid archive --no-create-home --shell /usr/sbin/nologin archive \
-    && mkdir -p /app /data /cache /input \
-    && chown 10001:10001 /data /cache
+    && mkdir -p /app /data /cache /input /network \
+    && chown 10001:10001 /data /cache /network
 
 WORKDIR /app
 COPY --chown=10001:10001 archive_app/ ./archive_app/

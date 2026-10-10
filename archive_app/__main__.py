@@ -40,12 +40,26 @@ def main():
     dashboard=subs.add_parser('dashboard');dashboard.add_argument('--host',default=os.environ.get('DASHBOARD_HOST','0.0.0.0'));dashboard.add_argument('--port',type=int,default=int(os.environ.get('DASHBOARD_PORT','8080')))
     ingest=subs.add_parser('ingest');ingest.add_argument('--manifest',required=True);ingest.add_argument('--dry-run',action='store_true')
     subs.add_parser('run');subs.add_parser('health');subs.add_parser('backup')
+    routes=subs.add_parser('network-routes',help='Publish host LAN/Tailscale subnet routes; no camera scan or credentials.')
+    routes.add_argument('--output',default='/network/subnets.json')
+    routes.add_argument('--interval',type=float,default=30)
+    routes.add_argument('--once',action='store_true')
     listing=subs.add_parser('list');listing.add_argument('--date',required=True);listing.add_argument('--camera');listing.add_argument('--order',choices=('asc','desc'),default='asc')
     reconcile=subs.add_parser('reconcile');reconcile.add_argument('--key',required=True);reconcile.add_argument('--chat-id',required=True)
     reconcile.add_argument('--message-id',type=int,required=True);reconcile.add_argument('--file-id',required=True)
     reconcile.add_argument('--file-unique-id');reconcile.add_argument('--media-type',choices=('video','document'))
     retry=subs.add_parser('retry-oversize');retry.add_argument('--key',required=True)
     args=parser.parse_args()
+    if args.command=='network-routes':
+        from .network_routes import collect_subnets, write_snapshot, collect_loop
+        if not 5<=args.interval<=3600:raise ValueError('Route refresh interval must be between 5 and 3600 seconds')
+        if args.once:
+            write_snapshot(args.output,collect_subnets());return 0
+        stop_event=threading.Event()
+        signal.signal(signal.SIGTERM,lambda *_:stop_event.set())
+        signal.signal(signal.SIGINT,lambda *_:stop_event.set())
+        collect_loop(args.output,interval=args.interval,stop_event=stop_event)
+        return 0
     settings=Settings.from_env()
     if args.command=='dashboard':
         from .dashboard import serve

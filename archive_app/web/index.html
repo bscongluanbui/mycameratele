@@ -68,7 +68,7 @@
         <div id="global-error" class="notice error-notice" role="alert" hidden></div>
 
         <section id="view-cameras" class="view" aria-labelledby="cameras-title">
-          <div class="page-heading"><div><p class="eyebrow">CAMERA MANAGEMENT</p><h1 id="cameras-title">Camera của bạn<span class="heading-dot">.</span></h1><p class="muted">Thêm thiết bị, đặt tên dễ nhớ và theo dõi tải SD / upload trong cùng một nơi.</p></div><div class="heading-actions"><button id="start-all-button" class="button secondary" type="button">Start tất cả</button><button id="add-camera-button" class="button primary" type="button"><span aria-hidden="true" class="plus">+</span>Thêm camera</button></div></div>
+          <div class="page-heading"><div><p class="eyebrow">CAMERA MANAGEMENT</p><h1 id="cameras-title">Camera của bạn<span class="heading-dot">.</span></h1><p class="muted">Thêm thiết bị, đặt tên dễ nhớ và theo dõi tải SD / upload trong cùng một nơi.</p></div><div class="heading-actions"><button id="discover-camera-button" class="button secondary" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 7v6M5 17v-4h14v4"/></svg>Quét camera LAN</button><button id="start-all-button" class="button secondary" type="button">Start tất cả</button><button id="add-camera-button" class="button primary" type="button"><span aria-hidden="true" class="plus">+</span>Thêm camera</button></div></div>
           <section class="sync-overview" aria-labelledby="sync-title"><div class="sync-overview-line"><h2 id="sync-title">Đồng bộ</h2><span id="sync-worker-status" class="status-chip neutral">Đang đọc worker</span><p id="sync-summary" class="small muted" role="status" aria-live="polite" aria-atomic="true">Đang đọc hàng đợi…</p><a class="sync-logs-link" href="#logs">Logs <span aria-hidden="true">→</span></a></div><p id="sync-error" class="form-error" role="alert" hidden></p></section>
           <div class="stats-grid" aria-label="Thống kê camera"><div class="stat-card"><span class="stat-label">Tổng camera</span><strong id="stat-cameras">—</strong><span class="stat-detail">Thiết bị đã cấu hình</span></div><div class="stat-card"><span class="stat-label">Đang bật</span><strong id="stat-enabled">—</strong><span class="stat-detail">Tham gia quy trình lưu trữ</span></div><div class="stat-card"><span class="stat-label">Video đã lập chỉ mục</span><strong id="stat-recordings">—</strong><span class="stat-detail">Số bản ghi trong cơ sở dữ liệu</span></div><div class="stat-card"><span class="stat-label">Đã lưu Telegram</span><strong id="stat-uploaded">—</strong><span class="stat-detail">Upload đã xác nhận thành công</span></div></div>
           <div class="section-heading"><h2>Danh sách thiết bị</h2><label class="search-control"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Tìm camera</span><input id="camera-search" type="search" placeholder="Tìm theo tên, model hoặc IP…"></label></div>
@@ -124,6 +124,30 @@
   <div id="boot-loading" class="boot-loading" role="status"><div class="loading-ring" aria-hidden="true"></div><span>Đang mở workspace…</span></div>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
+  <dialog id="discovery-dialog" aria-labelledby="discovery-dialog-title" aria-describedby="discovery-intro">
+    <div class="discovery-dialog-content">
+      <div class="dialog-heading"><div><p class="eyebrow">NETWORK DISCOVERY</p><h2 id="discovery-dialog-title">Quét camera LAN</h2></div><button id="close-discovery-dialog" class="icon-button" type="button" aria-label="Đóng quét camera"><span aria-hidden="true">×</span></button></div>
+      <p id="discovery-intro" class="muted dialog-intro">Chọn subnet VPS thấy qua LAN / Tailscale, hoặc nhập dải IP. Quét không đăng nhập và không tải video.</p>
+      <form id="discovery-scan-form">
+        <div class="discovery-network-grid"><div class="field"><label for="discovery-subnet">Subnet được phát hiện</label><select id="discovery-subnet" aria-describedby="discovery-route-note"><option value="">Nhập dải IP riêng</option></select></div><button id="discovery-refresh-routes" class="button secondary compact" type="button">Làm mới subnet</button></div>
+        <p id="discovery-route-note" class="field-hint" role="status">Đang đọc route của VPS…</p>
+        <div class="field discovery-target-field"><label for="discovery-target">Dải IP cần quét <span class="required">*</span></label><input id="discovery-target" required maxlength="80" placeholder="192.168.31.0/24" autocapitalize="none" spellcheck="false" aria-describedby="discovery-target-hint"><p id="discovery-target-hint" class="field-hint">CIDR, IP đơn hoặc 192.168.31.1-192.168.31.254 · tối đa 1.024 IP / lượt.</p></div>
+        <div class="discovery-scan-actions"><button id="discovery-start" class="button primary" type="submit">Bắt đầu quét</button><button id="discovery-cancel" class="button secondary" type="button" hidden>Dừng quét</button></div>
+      </form>
+      <section id="discovery-progress-section" class="discovery-progress-section" aria-label="Tiến trình quét" hidden><div class="discovery-progress-line"><span id="discovery-state" class="status-chip neutral">Sẵn sàng</span><p id="discovery-progress-label" class="small" role="status" aria-live="polite" aria-atomic="true"></p></div><progress id="discovery-progress" max="1" value="0" aria-label="Số IP đã kiểm tra"></progress></section>
+      <p id="discovery-error" class="form-error" role="alert" tabindex="-1" hidden></p>
+      <section id="discovery-results-section" class="discovery-results-section" aria-labelledby="discovery-results-title" hidden>
+        <div class="section-heading"><h3 id="discovery-results-title">Camera tìm thấy</h3><label class="discovery-select-all"><input id="discovery-select-all" type="checkbox"><span>Chọn tất cả camera mới</span></label></div>
+        <p class="field-hint">“Có thể là camera” là kết quả theo dịch vụ phản hồi; model và khả năng tải SD được kiểm chứng khi sync.</p>
+        <div id="discovery-results" class="discovery-results" aria-label="Camera tìm thấy trong dải IP"></div>
+        <p id="discovery-empty" class="discovery-empty muted small" hidden>Chưa phát hiện camera. Kiểm tra subnet route và dải IP.</p>
+        <details class="discovery-credentials"><summary>Tài khoản thiết bị dùng chung (tùy chọn)</summary><div class="form-grid"><div class="field"><label for="discovery-sd-username">Tên đăng nhập thiết bị</label><input id="discovery-sd-username" value="admin" maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false"></div><div class="field"><label for="discovery-sd-password">Mật khẩu / mã xác thực</label><input id="discovery-sd-password" type="password" maxlength="64" autocomplete="new-password" aria-describedby="discovery-credential-note"></div></div></details>
+        <p id="discovery-credential-note" class="field-hint">Để trống: camera được thêm ở trạng thái tạm dừng; vào Chỉnh sửa để nhập mật khẩu và bật. Có mật khẩu: camera được bật và gửi Start. Upload mặc định ON.</p>
+      </section>
+      <p id="discovery-add-status" class="form-status" role="status" aria-live="polite" hidden></p>
+      <div class="dialog-actions"><button id="discovery-done" class="button secondary" type="button">Đóng</button><button id="discovery-add" class="button primary" type="button" disabled>Thêm camera đã chọn (0)</button></div>
+    </div>
+  </dialog>
   <dialog id="camera-dialog" aria-labelledby="camera-dialog-title">
     <form id="camera-form">
       <div class="dialog-heading"><div><p class="eyebrow">CAMERA CONFIGURATION</p><h2 id="camera-dialog-title">Thêm camera</h2></div><button id="close-camera-dialog" class="icon-button" type="button" aria-label="Đóng hộp thoại"><span aria-hidden="true">×</span></button></div>

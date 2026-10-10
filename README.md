@@ -103,6 +103,42 @@ cùng toàn bộ tập file Compose trong mọi lệnh update. Không dùng `dow
 
 ### Dashboard
 
+#### Quét camera LAN / subnet Tailscale
+
+Trong **Camera → Quét camera LAN**, chọn subnet ở danh sách xổ xuống hoặc nhập
+`192.168.31.0/24`, `192.168.31.100-192.168.31.200` hay một IP. Bấm **Quét**,
+chọn các kết quả cần thêm, sửa tên rồi **Thêm camera đã chọn**. Nút **Thêm camera**
+thủ công vẫn giữ nguyên. Camera đã có được đánh dấu, không chọn lại.
+
+Mỗi lượt tối đa 1.024 địa chỉ, chỉ chạy khi bấm quét; có tiến trình và nút dừng.
+Tool kiểm tra unicast TCP 8000/554/80 và dấu hiệu RTSP/ISAPI, không đăng nhập,
+không tải SD. Kết quả chỉ có cổng mở được ghi là **camera tiềm năng**;
+phát hiện thiết bị không đồng nghĩa firmware đã hỗ trợ tải SD. Có thể nhập
+thông tin thiết bị khi thêm; camera thiếu mật khẩu được lưu ở trạng thái tắt
+để bạn chỉnh sửa và bật sau. Upload từng camera vẫn mặc định bật.
+
+Service `route-discovery` đọc các bảng route IPv4 của **Docker host Linux**,
+kể cả route Tailscale, cập nhật mỗi 30 giây. Nó không có cổng lắng nghe, không
+nhận `.env`, không dùng Docker socket hoặc quyền `NET_ADMIN`; dashboard chỉ
+đọc JSON subnet qua volume `network-routes`. Chỉ danh sách route đã có trên
+VPS được hiển thị; route chưa được quảng bá/chấp nhận cần cấu hình Tailscale
+trước. Docker bridge/default/loopback không được liệt kê. Mỗi nhà dùng volume
+riêng theo project, không dùng chung database hay thông tin bot.
+
+```bash
+docker compose pull dashboard route-discovery
+docker compose up -d dashboard route-discovery
+```
+
+Giữ nguyên các file override đang dùng trong cả hai lệnh. Nếu chạy dashboard
+ngoài Compose, bạn vẫn nhập dải IP thủ công được; để tự liệt kê route hãy chạy
+`python -m archive_app network-routes --output /network/subnets.json` trên
+Linux host và đặt `DISCOVERY_ROUTES_FILE` cho dashboard đọc file đó.
+
+Thiết kế dùng [subnet routing của Tailscale](https://tailscale.com/docs/features/subnet-routers)
+và [host network của Docker](https://docs.docker.com/engine/network/drivers/host/)
+chỉ cho collector; dashboard/worker/Bot API vẫn ở bridge network hiện tại.
+
 Mở **`http://IP_VPS:8080`**, thay `IP_VPS` bằng IP public của máy chạy Docker.
 Compose mặc định publish `0.0.0.0:8080`; không cần SSH tunnel hay nhập token.
 Với máy trong LAN, dùng `http://IP_MAY_DOCKER:8080`. VPS có firewall/security

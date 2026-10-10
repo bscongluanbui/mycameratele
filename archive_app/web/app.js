@@ -119,6 +119,47 @@
     syncLogFilter(jobs, camera = "", status = "") {
       return (Array.isArray(jobs) ? jobs : []).filter(job => (!camera || job.camera_id === camera) && (!status || (status === "active" ? helpers.syncActive(job) : status === "errors" ? ["blocked", "failed"].includes(job.state) : job.state === status)));
     },
+    discoveryActive(scan) { return !!scan && scan.state === "running"; },
+    discoveryTarget(value, maximum = 1024) {
+      const target = String(value || "").trim();
+      const ipv4 = text => {
+        if (!/^\d+(\.\d+){3}$/.test(text)) return null;
+        const parts = text.split(".");
+        if (parts.some(part => String(Number(part)) !== part || Number(part) > 255)) return null;
+        return parts.reduce((total, part) => total * 256 + Number(part), 0);
+      };
+      const privateIp = ip => (ip >= 167772160 && ip <= 184549375) || (ip >= 2886729728 && ip <= 2887778303) || (ip >= 3232235520 && ip <= 3232301055);
+      let first, last, count;
+      if (target.includes("/")) {
+        const parts = target.split("/"); const address = ipv4(parts[0]);
+        if (parts.length !== 2 || address === null || !/^\d{1,2}$/.test(parts[1]) || Number(parts[1]) > 32) return {error: "Nhập CIDR hợp lệ, ví dụ 192.168.31.0/24."};
+        const prefix = Number(parts[1]), size = 2 ** (32 - prefix);
+        first = Math.floor(address / size) * size; last = first + size - 1; count = size > 2 ? size - 2 : size;
+      } else {
+        const parts = target.split(/\s*-\s*/);
+        if (parts.length > 2 || (first = ipv4(parts[0])) === null || (last = ipv4(parts[1] || parts[0])) === null || last < first) return {error: "Nhập IPv4, CIDR hoặc dải IP đầu-cuối hợp lệ."};
+        count = last - first + 1;
+      }
+      if (!privateIp(first) || !privateIp(last)) return {error: "Chọn dải LAN riêng: 10.x, 172.16–31.x hoặc 192.168.x."};
+      if (count > maximum) return {error: `Mỗi lượt quét tối đa ${maximum} IP. Chọn dải nhỏ hơn.`};
+      return {target, count};
+    },
+    discoveryKnown(result, cameras) {
+      return result.existing_camera_id || (Array.isArray(cameras) ? cameras : []).find(camera => String(camera.host || "").toLowerCase() === String(result.host || "").toLowerCase() && Number(camera.device_port || 8000) === Number(result.device_port || 8000))?.id || "";
+    },
+    discoveryPayload(result, name, cameras, username = "admin", password = "") {
+      if (!helpers.validHost(result.host) || !/^\d+(\.\d+){3}$/.test(result.host)) throw new Error("IP camera chưa hợp lệ. Quét lại dải IP.");
+      if (helpers.discoveryKnown(result, cameras)) throw new Error("Camera này đã có trong danh sách.");
+      if (!String(name).trim() || String(name).trim().length > 120) throw new Error("Tên camera cần có 1–120 ký tự.");
+      if (!helpers.validSdPassword(password)) throw new Error("Mật khẩu thiết bị cần dài tối đa 64 byte UTF-8 và không chứa ký tự NUL.");
+      const ids = new Set((Array.isArray(cameras) ? cameras : []).map(camera => camera.id));
+      const base = `cam-${result.host.replaceAll(".", "-")}`;
+      let id = base, suffix = 2;
+      while (ids.has(id)) id = `${base}-${suffix++}`;
+      const payload = {id, name: String(name).trim(), model: String(result.model || "").slice(0, 100), host: result.host, device_port: result.device_port || 8000, rtsp_port: result.rtsp_port || 554, http_port: result.http_port || 80, enabled: !!password, upload_enabled: true, sd_backend: "auto", sd_username: String(username).trim() || "admin"};
+      if (password) payload.sd_password = password;
+      return payload;
+    },
     validSdPassword(password) { return typeof password === "string" && !password.includes("\0") && new TextEncoder().encode(password).length <= 64; },
     validUsername(value) { return typeof value === "string" && /^[A-Za-z0-9_.-]{3,64}$/.test(value); },
     accountValidation(values) {
@@ -134,7 +175,7 @@
   if (typeof document === "undefined") return;
 
   const $ = id => document.getElementById(id);
-  const state = { cameras: [], status: {}, csrf: "", probes: new Map(), calendar: [], offset: 0, limit: 25, total: 0, archiveRequest: 0, calendarRequest: 0, editing: null, view: "cameras", authenticated: false, sessionRevision: 0, account: null, accountRequired: false, loginBusy: false, accountBusy: false, logoutBusy: false, sync: {jobs: [], latest: {}, worker_alive: false}, syncRequest: 0, syncTimer: null, syncBusy: new Set(), syncSummary: "", expandedSync: new Set() };
+  const state = { cameras: [], status: {}, csrf: "", probes: new Map(), calendar: [], offset: 0, limit: 25, total: 0, archiveRequest: 0, calendarRequest: 0, editing: null, view: "cameras", authenticated: false, sessionRevision: 0, account: null, accountRequired: false, loginBusy: false, accountBusy: false, logoutBusy: false, sync: {jobs: [], latest: {}, worker_alive: false}, syncRequest: 0, syncTimer: null, syncBusy: new Set(), syncSummary: "", expandedSync: new Set(), discovery: {scan: null, choices: new Map(), timer: null, revision: 0, starting: false, adding: false, cancelling: false} };
   let toastTimer;
   function node(tag, className, text) {
     const item = document.createElement(tag);
@@ -182,6 +223,7 @@
     if (field && $(field)) { $(field).setAttribute("aria-invalid", "true"); $(field).focus(); } else errorBox.focus();
   }
   function showLogin({ username = state.account?.username || "", message = "" } = {}) {
+    resetDiscovery();
     stopSyncPolling(); state.syncRequest++; state.sync = {jobs: [], latest: {}, worker_alive: false}; state.syncBusy.clear(); state.expandedSync.clear();
     state.authenticated = false; state.sessionRevision++; state.archiveRequest++; state.calendarRequest++;
     state.account = null; state.accountRequired = false; state.csrf = ""; state.cameras = []; state.status = {}; state.calendar = []; state.probes.clear();
@@ -193,6 +235,7 @@
     (username ? $("login-password") : $("login-username")).focus();
   }
   function showAccount(account, required = !!account?.password_change_required) {
+    closeDiscovery();
     stopSyncPolling(); state.syncRequest++;
     state.account = account; state.accountRequired = required; state.archiveRequest++; state.calendarRequest++;
     $("app-shell").hidden = true; $("login-screen").hidden = true; $("boot-loading").hidden = true; $("account-screen").hidden = false;
@@ -225,7 +268,7 @@
       if (response.status === 409 && code === "password_change_required") showAccount({ ...(state.account || { username: "admin" }), password_change_required: true }, true);
       const messages = { current_password_invalid: "Mật khẩu hiện tại chưa đúng. Kiểm tra lại rồi thử lưu.", authentication_failed: "Tên đăng nhập hoặc mật khẩu chưa đúng.", invalid_credentials: "Tên đăng nhập hoặc mật khẩu chưa đúng.", authentication_required: "Phiên đăng nhập đã kết thúc. Đăng nhập lại để tiếp tục.", password_change_required: "Đổi mật khẩu mặc định trước khi mở dashboard." };
       const error = new Error(messages[code] || result.error || result.message || `Yêu cầu chưa hoàn tất (HTTP ${response.status}).`);
-      error.httpStatus = response.status; error.code = code; throw error;
+      error.httpStatus = response.status; error.code = code; error.existingCameraId = result.existing_camera_id; throw error;
     }
     return result;
   }
@@ -512,6 +555,199 @@
     for (const name of ["year", "month", "day"]) $("filter-" + name).value = "";
     if (location.hash !== "#archive") { location.hash = "archive"; } else { await loadCalendar(false); await loadArchive(); }
   }
+  function stopDiscoveryPolling() { clearTimeout(state.discovery.timer); state.discovery.timer = null; }
+  function resetDiscovery() {
+    stopDiscoveryPolling(); state.discovery.revision++;
+    state.discovery.scan = null; state.discovery.choices.clear(); state.discovery.starting = false; state.discovery.adding = false; state.discovery.cancelling = false;
+    $("discovery-sd-password").value = "";
+    if ($("discovery-dialog").open) $("discovery-dialog").close();
+  }
+  function closeDiscovery() {
+    const scan = state.discovery.scan;
+    if (helpers.discoveryActive(scan) && state.authenticated) api(`/api/discovery/scans/${encodeURIComponent(scan.id)}/cancel`, {method: "POST", body: {}}).catch(() => {});
+    resetDiscovery();
+  }
+  function discoveryError(message, field = "") {
+    $("discovery-error").textContent = message || ""; $("discovery-error").hidden = !message;
+    $("discovery-target").removeAttribute("aria-invalid");
+    if (message && field) { $(field).setAttribute("aria-invalid", "true"); $(field).focus(); }
+  }
+  function discoveryControls() {
+    const d = state.discovery, active = helpers.discoveryActive(d.scan);
+    const editable = [...d.choices.values()].filter(choice => !choice.added && !helpers.discoveryKnown(choice.result, state.cameras));
+    const selected = editable.filter(choice => choice.selected).length;
+    for (const id of ["discovery-target", "discovery-subnet", "discovery-refresh-routes", "discovery-start"]) $(id).disabled = d.starting || d.adding || active;
+    $("discovery-start").textContent = d.starting ? "Đang bắt đầu…" : d.scan ? "Quét lại" : "Bắt đầu quét";
+    $("discovery-cancel").hidden = !active; $("discovery-cancel").disabled = d.cancelling;
+    $("discovery-cancel").textContent = d.cancelling ? "Đang dừng…" : "Dừng quét";
+    $("discovery-add").textContent = d.adding ? "Đang thêm camera…" : `Thêm camera đã chọn (${selected})`;
+    $("discovery-add").disabled = !selected || d.adding || d.starting || active;
+    $("discovery-select-all").disabled = !editable.length || d.adding;
+    $("discovery-select-all").checked = editable.length > 0 && selected === editable.length;
+    $("discovery-select-all").indeterminate = selected > 0 && selected < editable.length;
+    for (const id of ["close-discovery-dialog", "discovery-done", "discovery-sd-username", "discovery-sd-password"]) $(id).disabled = d.adding;
+  }
+  function renderDiscoveryResults() {
+    const target = $("discovery-results");
+    for (const choice of state.discovery.choices.values()) {
+      const result = choice.result, known = helpers.discoveryKnown(result, state.cameras);
+      if (!choice.element) {
+        const row = node("article", "discovery-result"), top = node("div", "discovery-result-top"), selectLabel = node("label", "discovery-result-select");
+        const check = node("input"); check.type = "checkbox"; check.setAttribute("aria-label", `Chọn camera ${result.host}`);
+        selectLabel.append(check, node("strong", "mono", result.host));
+        const identity = node("span", "discovery-result-identity", [result.vendor, result.model].filter(Boolean).join(" · ") || "Chưa xác định model");
+        const confidence = chip(result.confidence === "identified" ? "Nhận diện camera" : "Có thể là camera", result.confidence === "identified" ? "green" : "amber");
+        top.append(selectLabel, confidence);
+        const nameField = node("div", "field"), nameLabel = node("label", "", `Tên camera · ${result.host}`), nameInput = node("input");
+        nameInput.id = `discovery-name-${result.host.replaceAll(".", "-")}`; nameInput.value = choice.name; nameInput.maxLength = 120; nameLabel.htmlFor = nameInput.id;
+        nameField.append(nameLabel, nameInput);
+        const ports = node("p", "field-hint", `Cổng mở: ${(Array.isArray(result.ports) ? result.ports : []).join(", ") || "—"}`), status = node("p", "discovery-result-status small"); status.setAttribute("role", "status");
+        row.append(top, identity, ports, nameField, status); target.append(row);
+        check.addEventListener("change", () => { choice.selected = check.checked; discoveryControls(); });
+        nameInput.addEventListener("input", () => { choice.name = nameInput.value; });
+        choice.element = row; choice.check = check; choice.nameInput = nameInput; choice.status = status;
+      }
+      choice.check.checked = !!choice.selected && !known && !choice.added;
+      choice.check.disabled = !!known || choice.added || state.discovery.adding;
+      choice.nameInput.disabled = !!known || choice.added || state.discovery.adding;
+      choice.status.textContent = choice.error || (choice.added ? "Đã thêm" : known ? `Đã cấu hình · ${cameraName(known)}` : "");
+      choice.status.classList.toggle("error-text", !!choice.error);
+      choice.status.hidden = !choice.status.textContent;
+    }
+    $("discovery-empty").hidden = state.discovery.choices.size > 0 || helpers.discoveryActive(state.discovery.scan);
+    discoveryControls();
+  }
+  function renderDiscoveryJob(scan) {
+    state.discovery.scan = scan;
+    $("discovery-progress-section").hidden = false; $("discovery-results-section").hidden = false;
+    const names = {running: ["Đang quét", "blue"], completed: ["Hoàn tất", "green"], cancelled: ["Đã dừng", "neutral"], failed: ["Lỗi quét", "red"]};
+    const [label, tone] = names[scan.state] || ["Đang chờ", "neutral"];
+    $("discovery-state").textContent = label; $("discovery-state").className = `status-chip ${tone}`;
+    const total = Math.max(0, Number(scan.total) || 0), scanned = Math.min(total, Math.max(0, Number(scan.scanned) || 0));
+    $("discovery-progress").max = Math.max(1, total); $("discovery-progress").value = scanned;
+    for (const result of Array.isArray(scan.results) ? scan.results : []) {
+      if (!result?.host) continue;
+      const previous = state.discovery.choices.get(result.host);
+      if (previous) previous.result = result;
+      else state.discovery.choices.set(result.host, {result, name: `${result.model || "Camera"} ${result.host}`, selected: false, added: false, error: ""});
+    }
+    $("discovery-progress-label").textContent = `${scanned.toLocaleString("vi-VN")} / ${total.toLocaleString("vi-VN")} IP · ${state.discovery.choices.size} camera / ứng viên · ${scan.target || ""}`;
+    $("discovery-empty").textContent = scan.state === "cancelled" ? "Đã dừng quét. Bạn có thể quét lại hoặc đổi dải IP." : "Chưa phát hiện camera. Kiểm tra subnet route và dải IP.";
+    if (scan.error) discoveryError(String(scan.error));
+    renderDiscoveryResults();
+  }
+  async function loadDiscoverySubnets() {
+    const revision = state.discovery.revision, session = state.sessionRevision;
+    $("discovery-refresh-routes").disabled = true;
+    try {
+      const data = await api("/api/discovery/subnets");
+      if (revision !== state.discovery.revision || session !== state.sessionRevision || !$("discovery-dialog").open) return;
+      const old = $("discovery-subnet").value, subnets = Array.isArray(data.subnets) ? data.subnets : [];
+      $("discovery-subnet").replaceChildren(option("", "Nhập dải IP riêng"));
+      for (const subnet of subnets) if (typeof subnet.cidr === "string") $("discovery-subnet").append(option(subnet.cidr, subnet.label || `${subnet.cidr} · ${subnet.source === "tailscale" ? "Tailscale" : "LAN"}${subnet.interface ? ` · ${subnet.interface}` : ""}`));
+      if (subnets.some(subnet => subnet.cidr === old)) $("discovery-subnet").value = old;
+      $("discovery-route-note").textContent = data.stale ? "Danh sách route đã cũ. Làm mới hoặc nhập dải IP riêng." : subnets.length ? `${subnets.length} subnet VPS đang thấy. Chọn đúng dải của nhà cần thêm camera.` : "Chưa thấy subnet LAN. Có thể nhập dải IP riêng; kiểm tra Tailscale nhận route nếu quét không có kết quả.";
+      if (data.error && !subnets.length) $("discovery-route-note").textContent = "Chưa đọc được route của VPS. Nhập dải IP riêng hoặc kiểm tra dịch vụ route-discovery.";
+    } catch (error) {
+      if (revision === state.discovery.revision && session === state.sessionRevision && $("discovery-dialog").open) $("discovery-route-note").textContent = error.message;
+    } finally { if (revision === state.discovery.revision && session === state.sessionRevision) discoveryControls(); }
+  }
+  async function openDiscovery() {
+    if (!state.authenticated || state.accountRequired) return;
+    resetDiscovery(); $("discovery-scan-form").reset(); $("discovery-sd-username").value = "admin";
+    $("discovery-results").replaceChildren(); $("discovery-progress-section").hidden = true; $("discovery-results-section").hidden = true; $("discovery-add-status").hidden = true;
+    $("discovery-subnet").replaceChildren(option("", "Nhập dải IP riêng")); $("discovery-route-note").textContent = "Đang đọc route của VPS…";
+    discoveryError(""); discoveryControls(); $("discovery-dialog").showModal(); $("discovery-subnet").focus(); await loadDiscoverySubnets();
+  }
+  function scheduleDiscoveryPolling(revision, session) {
+    stopDiscoveryPolling();
+    if (!helpers.discoveryActive(state.discovery.scan) || !$("discovery-dialog").open || revision !== state.discovery.revision || session !== state.sessionRevision) return;
+    state.discovery.timer = setTimeout(() => pollDiscovery(revision, session), 1000);
+  }
+  async function pollDiscovery(revision, session) {
+    state.discovery.timer = null; const id = state.discovery.scan?.id;
+    if (!id || !state.authenticated || !$("discovery-dialog").open || revision !== state.discovery.revision || session !== state.sessionRevision) return;
+    try {
+      const data = await api(`/api/discovery/scans/${encodeURIComponent(id)}`);
+      if (revision !== state.discovery.revision || session !== state.sessionRevision || !$("discovery-dialog").open) return;
+      discoveryError(""); renderDiscoveryJob(data.scan);
+    } catch (error) {
+      if (revision === state.discovery.revision && session === state.sessionRevision && $("discovery-dialog").open) discoveryError(error.message);
+    } finally { scheduleDiscoveryPolling(revision, session); }
+  }
+  async function startDiscovery(event) {
+    event.preventDefault(); if (state.discovery.starting || state.discovery.adding || helpers.discoveryActive(state.discovery.scan)) return;
+    const parsed = helpers.discoveryTarget($("discovery-target").value);
+    discoveryError(""); if (parsed.error) { discoveryError(parsed.error, "discovery-target"); return; }
+    stopDiscoveryPolling(); const revision = ++state.discovery.revision, session = state.sessionRevision;
+    state.discovery.starting = true; state.discovery.scan = null; state.discovery.choices.clear(); $("discovery-results").replaceChildren();
+    $("discovery-results-section").hidden = true; $("discovery-progress-section").hidden = true; $("discovery-add-status").hidden = true; discoveryControls();
+    try {
+      const data = await api("/api/discovery/scans", {method: "POST", body: {target: parsed.target}});
+      if (revision !== state.discovery.revision || session !== state.sessionRevision || !$("discovery-dialog").open) {
+        if (session === state.sessionRevision && state.authenticated && data.scan?.id) api(`/api/discovery/scans/${encodeURIComponent(data.scan.id)}/cancel`, {method: "POST", body: {}}).catch(() => {});
+        return;
+      }
+      renderDiscoveryJob(data.scan); scheduleDiscoveryPolling(revision, session);
+    } catch (error) { if (revision === state.discovery.revision && session === state.sessionRevision && $("discovery-dialog").open) discoveryError(error.message); }
+    finally { if (revision === state.discovery.revision && session === state.sessionRevision) { state.discovery.starting = false; discoveryControls(); } }
+  }
+  async function cancelDiscovery() {
+    if (state.discovery.cancelling || !helpers.discoveryActive(state.discovery.scan)) return;
+    stopDiscoveryPolling();
+    const revision = ++state.discovery.revision, session = state.sessionRevision, id = state.discovery.scan.id;
+    state.discovery.cancelling = true; discoveryControls();
+    try {
+      const data = await api(`/api/discovery/scans/${encodeURIComponent(id)}/cancel`, {method: "POST", body: {}});
+      if (revision === state.discovery.revision && session === state.sessionRevision && $("discovery-dialog").open) { renderDiscoveryJob(data.scan); scheduleDiscoveryPolling(revision, session); }
+    } catch (error) { if (revision === state.discovery.revision && session === state.sessionRevision) discoveryError(error.message); }
+    finally { if (revision === state.discovery.revision && session === state.sessionRevision) { state.discovery.cancelling = false; discoveryControls(); } }
+  }
+  async function addDiscoveredCameras() {
+    const d = state.discovery;
+    if (d.adding || d.starting || helpers.discoveryActive(d.scan)) return;
+    const selected = [...d.choices.values()].filter(choice => choice.selected && !choice.added && !helpers.discoveryKnown(choice.result, state.cameras));
+    if (!selected.length) return;
+    const username = $("discovery-sd-username").value.trim() || "admin", password = $("discovery-sd-password").value;
+    discoveryError("");
+    for (const choice of selected) {
+      try { helpers.discoveryPayload(choice.result, choice.name, state.cameras, username, password); }
+      catch (error) {
+        discoveryError(error.message);
+        if (!String(choice.name).trim() || String(choice.name).trim().length > 120) choice.nameInput.focus();
+        else if (!helpers.validSdPassword(password)) $("discovery-sd-password").focus();
+        else $("discovery-error").focus();
+        return;
+      }
+    }
+    const revision = d.revision, session = state.sessionRevision; d.adding = true; renderDiscoveryResults();
+    $("discovery-add-status").hidden = false; let added = 0, failed = 0, existing = 0;
+    // Sequential creation makes each partial result explicit and avoids a burst of SD sync jobs.
+    for (const choice of selected) {
+      if (!state.authenticated || revision !== d.revision || session !== state.sessionRevision) break;
+      $("discovery-add-status").textContent = `Đang thêm ${added + failed + existing + 1} / ${selected.length} camera…`;
+      try {
+        const payload = helpers.discoveryPayload(choice.result, choice.name, state.cameras, username, password);
+        await api("/api/cameras", {method: "POST", body: {...payload, discovery_scan_id: d.scan.id}});
+        if (revision !== d.revision || session !== state.sessionRevision) break;
+        // Retain only non-secret camera metadata in browser state.
+        const {sd_password, ...metadata} = payload; state.cameras.push(metadata);
+        choice.added = true; choice.selected = false; choice.error = ""; added++;
+      } catch (error) {
+        if (revision !== d.revision || session !== state.sessionRevision) break;
+        if (error.code === "camera_already_exists" && typeof error.existingCameraId === "string") {
+          choice.result.existing_camera_id = error.existingCameraId; choice.selected = false; choice.error = ""; existing++;
+        } else { choice.error = error.message; failed++; }
+        if (error.httpStatus === 401 || error.code === "password_change_required") break;
+      }
+      renderDiscoveryResults();
+    }
+    if (revision !== d.revision || session !== state.sessionRevision) return;
+    d.adding = false; $("discovery-sd-password").value = ""; renderDiscoveryResults();
+    $("discovery-add-status").textContent = `Đã thêm ${added} camera${existing ? ` · ${existing} đã có sẵn` : ""}${failed ? ` · ${failed} chưa thêm được` : ""}.${added ? password ? " Đã bật và gửi Start." : " Đang tạm dừng; vào Chỉnh sửa để nhập mật khẩu và bật." : ""}`;
+    if (failed) discoveryError("Một số camera chưa được thêm. Xem kết quả từng camera rồi thử lại.");
+    if (added || existing || failed) await refresh();
+  }
   function openCameraForm(camera = null) {
     state.editing = camera?.id || null; $("camera-form").reset(); $("camera-form-error").hidden = true;
     $("camera-dialog-title").textContent = camera ? "Chỉnh sửa camera" : "Thêm camera";
@@ -694,6 +930,20 @@
   }
   $("logout-button").addEventListener("click", logout); $("account-logout").addEventListener("click", logout);
   $("add-camera-button").addEventListener("click", () => openCameraForm()); $("empty-add-camera").addEventListener("click", () => openCameraForm());
+  $("discover-camera-button").addEventListener("click", openDiscovery);
+  $("discovery-scan-form").addEventListener("submit", startDiscovery);
+  $("discovery-refresh-routes").addEventListener("click", loadDiscoverySubnets);
+  $("discovery-subnet").addEventListener("change", () => { $("discovery-target").value = $("discovery-subnet").value; discoveryError(""); $("discovery-target").focus(); });
+  $("discovery-target").addEventListener("input", () => { $("discovery-subnet").value = ""; $("discovery-target").removeAttribute("aria-invalid"); });
+  $("discovery-cancel").addEventListener("click", cancelDiscovery);
+  $("discovery-select-all").addEventListener("change", () => {
+    for (const choice of state.discovery.choices.values()) if (!choice.added && !helpers.discoveryKnown(choice.result, state.cameras)) choice.selected = $("discovery-select-all").checked;
+    renderDiscoveryResults();
+  });
+  $("discovery-add").addEventListener("click", addDiscoveredCameras);
+  for (const id of ["close-discovery-dialog", "discovery-done"]) $(id).addEventListener("click", () => { if (!state.discovery.adding) closeDiscovery(); });
+  $("discovery-dialog").addEventListener("cancel", event => { event.preventDefault(); if (!state.discovery.adding) closeDiscovery(); });
+  $("discovery-dialog").addEventListener("close", () => { if (state.discovery.scan || state.discovery.timer || $("discovery-sd-password").value) closeDiscovery(); });
   for (const id of ["close-camera-dialog", "cancel-camera-dialog"]) $(id).addEventListener("click", () => { $("camera-sd-password").value = ""; $("camera-dialog").close(); });
   $("camera-dialog").addEventListener("close", () => { $("camera-sd-password").value = ""; });
   $("camera-form").addEventListener("submit", saveCamera);

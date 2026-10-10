@@ -105,6 +105,10 @@ services:
       SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-900}
       HCNETSDK_DIR: /opt/hcnetsdk
       DASHBOARD_COOKIE_SECURE: ${DASHBOARD_COOKIE_SECURE:-false}
+      DISCOVERY_ROUTES_FILE: /network/subnets.json
+    depends_on:
+      route-discovery:
+        condition: service_started
     ports:
       - "${DASHBOARD_BIND_IP:-0.0.0.0}:${DASHBOARD_PORT:-8080}:8080"
     volumes:
@@ -112,6 +116,7 @@ services:
       - archive-cache:/cache
       # Local getFile returns a server path. The player only reads this volume.
       - bot-api-state:/var/lib/telegram-bot-api:ro
+      - network-routes:/network:ro
       - type: bind
         source: ${INPUT_HOST_DIR:-./input}
         target: /input
@@ -133,6 +138,34 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+
+  # Read the host's IPv4 routing tables (including Tailscale table 52).
+  # No listener, credentials, Docker socket, NET_ADMIN or camera traffic here.
+  route-discovery:
+    image: ${ARCHIVE_IMAGE:-ghcr.io/bscongluanbui/mycameratele:latest}
+    pull_policy: missing
+    command: [network-routes, --output, /network/subnets.json, --interval, "30"]
+    user: "10001:10001"
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    volumes:
+      - network-routes:/network
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 5s
+    healthcheck:
+      test: [CMD, python, -c, "from archive_app.network_routes import load_subnets; d=load_subnets('/network/subnets.json',max_age=120); raise SystemExit(bool(d['stale'] or d['error']))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
 
   # Initialize only the new spool's root ownership, never persistent Bot API
   # state. Published multiarch app image provides Python; no source build.
@@ -204,3 +237,4 @@ volumes:
   archive-cache:
   bot-api-state:
   bot-api-spool:
+  network-routes:

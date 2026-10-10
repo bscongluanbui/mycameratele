@@ -117,6 +117,23 @@ equal(helpers.syncLogFilter(logJobs, '', 'errors').map(job => job.id), ['two', '
 equal(helpers.syncLogFilter(logJobs, 'door', 'completed').map(job => job.id), ['three']);
 equal(helpers.syncLogFilter(logJobs, 'missing').length, 0);
 equal(helpers.syncLogFilter(null), []);
+equal(helpers.discoveryActive({state: 'running'}), true);
+equal(helpers.discoveryActive({state: 'completed'}), false);
+equal(helpers.discoveryActive(null), false);
+for (const [target, count] of [['192.168.31.0/24', 254], ['192.168.31.166', 1], ['10.0.0.1-10.0.0.3', 3], ['172.16.0.0/22', 1022], ['192.168.0.2/31', 2], ['192.168.0.2/32', 1]]) equal(helpers.discoveryTarget(target), {target, count});
+for (const target of ['', 'example.local', '192.168.01.1', '192.168.1.256', 'http://192.168.1.1', '192.168.1.1/33', '192.168.1.1/24/24', '192.168.1.4-192.168.1.1', '192.168.1.1-192.168.1.2-192.168.1.3', '127.0.0.1', '169.254.169.254', '8.8.8.8', '100.64.0.1', '172.32.0.1', '10.0.0.0/8', '10.0.0.0/21']) equal(typeof helpers.discoveryTarget(target).error, 'string');
+equal(helpers.discoveryTarget(' 192.168.31.1 - 192.168.31.3 ').count, 3);
+const discoveryCamera = {host: '192.168.31.166', device_port: 8000, rtsp_port: 554, http_port: 80, model: 'CS-C6N'};
+equal(helpers.discoveryKnown(discoveryCamera, [{id: 'pn', host: '192.168.31.166', device_port: 8000}]), 'pn');
+equal(helpers.discoveryKnown(discoveryCamera, [{id: 'pn', host: '192.168.31.166', device_port: 9000}]), '');
+equal(helpers.discoveryKnown({...discoveryCamera, existing_camera_id: 'known'}, []), 'known');
+equal(helpers.discoveryKnown(discoveryCamera, null), '');
+const draftDiscovery = helpers.discoveryPayload(discoveryCamera, ' Phòng ngủ ', [], 'admin', '');
+equal(draftDiscovery, {id: 'cam-192-168-31-166', name: 'Phòng ngủ', model: 'CS-C6N', host: '192.168.31.166', device_port: 8000, rtsp_port: 554, http_port: 80, enabled: false, upload_enabled: true, sd_backend: 'auto', sd_username: 'admin'});
+equal(helpers.discoveryPayload(discoveryCamera, 'PN', [{id: 'cam-192-168-31-166'}, {id: 'cam-192-168-31-166-2'}], ' admin ', 'fixture-password').id, 'cam-192-168-31-166-3');
+const readyDiscovery = helpers.discoveryPayload(discoveryCamera, 'PN', [], 'admin', 'fixture-password');
+equal(readyDiscovery.enabled, true); equal(readyDiscovery.upload_enabled, true); equal(readyDiscovery.sd_password, 'fixture-password');
+for (const args of [[discoveryCamera, '', []], [discoveryCamera, 'a'.repeat(121), []], [{host: 'bad.local'}, 'PN', []], [discoveryCamera, 'PN', [{id: 'pn', host: '192.168.31.166'}]], [discoveryCamera, 'PN', [], 'admin', 'a'.repeat(65)], [discoveryCamera, 'PN', [], 'admin', '\0']]) { checks++; assert.throws(() => helpers.discoveryPayload(...args)); }
 
 // Exercise the real rendering functions without a browser or third-party DOM package.
 const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path');
@@ -133,6 +150,15 @@ equal(source.includes('jobs.slice(0, 6)'), false);
 equal(stylesheet.includes('text-overflow:ellipsis'), true);
 equal(stylesheet.includes('.sync-row-summary:focus-visible'), true);
 equal(stylesheet.includes('grid-template-columns:75px minmax(0,1fr) max-content 43px'), true);
+equal(markup.includes('id="discover-camera-button"'), true);
+equal(markup.includes('id="add-camera-button"'), true);
+equal(markup.includes('id="discovery-dialog" aria-labelledby="discovery-dialog-title"'), true);
+equal(markup.includes('id="discovery-progress-label" class="small" role="status" aria-live="polite"'), true);
+equal(markup.includes('id="discovery-sd-password" type="password"'), true);
+equal(stylesheet.includes('.discovery-results{grid-template-columns:1fr}'), true);
+equal(stylesheet.includes('.discovery-credentials>summary:focus-visible'), true);
+equal(source.includes('discovery_scan_id: d.scan.id'), true);
+equal(source.includes('const {sd_password, ...metadata} = payload'), true);
 
 class Element {
   constructor(tag = 'div') {
@@ -152,6 +178,9 @@ class Element {
   addEventListener(name, callback) { (this.listeners[name] ||= []).push(callback); }
   fire(name) { for (const callback of this.listeners[name] || []) callback({target: this}); }
   focus() { documentStub.activeElement = this; }
+  showModal() { this.open = true; }
+  close() { this.open = false; this.fire('close'); }
+  reset() { this.resetCount = (this.resetCount || 0) + 1; }
   querySelectorAll(selector) {
     const matches = element => selector === 'details[data-sync-key]' ? element.tagName === 'DETAILS' && element.dataset.syncKey : selector === 'summary' ? element.tagName === 'SUMMARY' : selector === 'button' ? element.tagName === 'BUTTON' : false;
     return this.childNodes.flatMap(child => child instanceof Element ? [...(matches(child) ? [child] : []), ...child.querySelectorAll(selector)] : []);
@@ -170,7 +199,7 @@ const context = {document: documentStub, Node: Element, module: {exports: {}}, w
 vm.createContext(context);
 const bootLine = 'switchView(location.hash.slice(1), false); boot();';
 equal(source.includes(bootLine), true);
-vm.runInContext(source.replace(bootLine, 'globalThis.testUi = {state, renderCameras, renderSync, renderLogs, switchView, syncDisclosure};'), context);
+vm.runInContext(source.replace(bootLine, 'globalThis.testUi = {state, renderCameras, renderSync, renderLogs, switchView, syncDisclosure, renderDiscoveryJob, renderDiscoveryResults, discoveryControls, closeDiscovery, resetDiscovery, openDiscovery, startDiscovery, pollDiscovery, cancelDiscovery, addDiscoveredCameras};'), context);
 const ui = context.testUi;
 ui.state.cameras = [{id: 'pn', name: 'PN', enabled: true, host: '192.168.1.2'}, {id: 'door', name: 'Cửa trước', enabled: true}];
 const job = {id: 'job-1', camera_id: 'pn', camera_name: 'PN', state: 'running', phase: 'uploading', message: '<img src=x onerror=alert(1)>', code: 'fixture_code', source: 'dashboard', created_at: 100, started_at: 101, updated_at: 102, finished_at: null, statistics: {sd_searched: 27, sd_downloaded: 27, uploaded: 16, failed: 0, remuxed: 20, sd_error_code: 'fixture_error'}};
@@ -226,4 +255,132 @@ equal(elements.get('topbar-page').textContent, 'Logs');
 equal(navNodes.find(item => item.dataset.view === 'logs').getAttribute('aria-current'), 'page');
 ui.state.sync.jobs = []; ui.renderLogs();
 equal(elements.get('logs-empty').textContent.includes('Chưa có lịch sử'), true);
-console.log(`WEB_HELPERS: checks=${checks} passed=${checks} failed=0`);
+// Render scan results with untrusted labels as text and keep edits through polling.
+elements.get('discovery-dialog').open = true;
+ui.renderDiscoveryJob({id: 'scan-1', target: '192.168.31.0/24', state: 'running', total: 254, scanned: 80, results: [discoveryCamera, {host: '192.168.31.137', model: '<img src=x onerror=alert(1)>', vendor: 'fixture', confidence: 'identified', ports: [8000, 554]}]});
+equal(elements.get('discovery-results').childNodes.length, 2);
+equal(Number(elements.get('discovery-progress').value), 80);
+equal(elements.get('discovery-progress').max, 254);
+equal(elements.get('discovery-start').disabled, true);
+equal(elements.get('discovery-cancel').hidden, false);
+equal(elements.get('discovery-results').textContent.includes('<img src=x onerror=alert(1)>'), true);
+equal(elements.get('discovery-results').childNodes[1].childNodes[1].rawHtml, undefined);
+const choices = ui.state.discovery.choices;
+const discoveryChoice = choices.get('192.168.31.137'), originalElement = discoveryChoice.element;
+discoveryChoice.nameInput.value = 'Sân trước'; discoveryChoice.nameInput.fire('input');
+discoveryChoice.check.checked = true; discoveryChoice.check.fire('change');
+equal(discoveryChoice.name, 'Sân trước'); equal(discoveryChoice.selected, true);
+equal(elements.get('discovery-add').disabled, true);
+ui.renderDiscoveryJob({id: 'scan-1', target: '192.168.31.0/24', state: 'completed', total: 254, scanned: 254, results: [{...discoveryCamera, confidence: 'candidate', ports: [8000, 554]}, {...discoveryChoice.result}]});
+equal(discoveryChoice.element, originalElement);
+equal(discoveryChoice.nameInput.value, 'Sân trước');
+equal(discoveryChoice.check.checked, true);
+equal(elements.get('discovery-add').disabled, false);
+equal(elements.get('discovery-add').textContent, 'Thêm camera đã chọn (1)');
+equal(elements.get('discovery-cancel').hidden, true);
+elements.get('discovery-select-all').checked = true; elements.get('discovery-select-all').fire('change');
+equal(elements.get('discovery-add').textContent, 'Thêm camera đã chọn (2)');
+ui.state.cameras.push({id: 'known-c6n', name: 'Đã có', host: discoveryCamera.host, device_port: 8000}); ui.renderDiscoveryResults();
+equal(choices.get(discoveryCamera.host).check.disabled, true);
+equal(choices.get(discoveryCamera.host).status.textContent, 'Đã cấu hình · Đã có');
+equal(elements.get('discovery-add').textContent, 'Thêm camera đã chọn (1)');
+discoveryChoice.error = '<script>fixture-error</script>'; ui.renderDiscoveryResults();
+equal(discoveryChoice.status.textContent, '<script>fixture-error</script>');
+equal(discoveryChoice.status.rawHtml, undefined);
+ui.state.discovery.adding = true; ui.renderDiscoveryResults();
+equal(discoveryChoice.check.disabled, true); equal(discoveryChoice.nameInput.disabled, true);
+equal(elements.get('close-discovery-dialog').disabled, true);
+equal(elements.get('discovery-sd-password').disabled, true);
+ui.state.discovery.adding = false; elements.get('discovery-sd-password').value = 'fixture-password';
+const discoveryRevision = ui.state.discovery.revision;
+ui.resetDiscovery();
+equal(elements.get('discovery-dialog').open, false);
+equal(elements.get('discovery-sd-password').value, '');
+equal(ui.state.discovery.scan, null); equal(ui.state.discovery.choices.size, 0);
+equal(ui.state.discovery.revision, discoveryRevision + 1);
+// Exercise real async paths with synthetic API replies, never LAN traffic.
+(async () => {
+  const requests = [], apiCameras = [], fixtureResults = [{host: '192.168.5.10', ports: [8000, 554], confidence: 'candidate'}, {host: '192.168.5.11', ports: [8000, 554, 80], model: 'CS-H6c', vendor: 'EZVIZ', confidence: 'identified'}];
+  const scanReply = state => ({scan: {id: 'fixture-scan', target: '192.168.5.0/24', state, total: 254, scanned: state === 'running' ? 50 : 254, results: fixtureResults}});
+  let addFailure = null;
+  context.setTimeout = () => 321; context.clearTimeout = () => {};
+  context.fetch = async (url, options) => {
+    requests.push({url, ...options}); let status = 200, result;
+    if (url === '/api/discovery/subnets') result = {subnets: [{cidr: '192.168.5.0/24', source: 'tailscale', interface: 'tailscale0'}, {cidr: '10.2.0.0/24', source: 'lan', interface: 'eth0'}], stale: false};
+    else if (url === '/api/discovery/scans') result = scanReply('running');
+    else if (url === '/api/discovery/scans/fixture-scan/cancel') result = scanReply('cancelled');
+    else if (url === '/api/discovery/scans/fixture-scan') result = scanReply('completed');
+    else if (url === '/api/cameras' && options.method === 'POST') {
+      const payload = JSON.parse(options.body);
+      if (addFailure) { status = addFailure.status; result = addFailure.result; }
+      else { const {sd_password, discovery_scan_id, ...metadata} = payload; apiCameras.push(metadata); result = {camera: metadata}; }
+    } else if (url === '/api/status') result = {csrf_token: 'fixture-csrf', counts: {recordings: 0, uploaded: 0}};
+    else if (url === '/api/cameras') result = {cameras: apiCameras};
+    else if (url === '/api/sync?limit=100') result = {jobs: [], latest: {}, worker_alive: true};
+    else throw new Error('Unexpected fixture request: ' + url);
+    return {ok: status < 400, status, json: async () => JSON.parse(JSON.stringify(result))};
+  };
+  ui.state.authenticated = true; ui.state.csrf = 'fixture-csrf'; ui.state.cameras = [];
+  elements.get('account-screen').hidden = true;
+  await ui.openDiscovery();
+  equal(elements.get('discovery-dialog').open, true);
+  equal(elements.get('discovery-subnet').childNodes.length, 3);
+  equal(elements.get('discovery-subnet').childNodes[1].textContent.includes('Tailscale'), true);
+  elements.get('discovery-subnet').value = '192.168.5.0/24'; elements.get('discovery-subnet').fire('change');
+  equal(elements.get('discovery-target').value, '192.168.5.0/24');
+  equal(documentStub.activeElement, elements.get('discovery-target'));
+  await ui.startDiscovery({preventDefault() {}});
+  const startRequest = requests.find(request => request.url === '/api/discovery/scans');
+  equal(JSON.parse(startRequest.body), {target: '192.168.5.0/24'});
+  equal(startRequest.headers['X-CSRF-Token'], 'fixture-csrf');
+  equal(startRequest.credentials, 'same-origin');
+  equal(ui.state.discovery.scan.state, 'running');
+  equal(ui.state.discovery.timer, 321);
+  await ui.cancelDiscovery();
+  equal(ui.state.discovery.scan.state, 'cancelled');
+  equal(ui.state.discovery.timer, null);
+  equal(elements.get('discovery-start').disabled, false);
+  equal(requests.some(request => request.url.endsWith('/cancel') && request.method === 'POST'), true);
+  await ui.startDiscovery({preventDefault() {}});
+  await ui.pollDiscovery(ui.state.discovery.revision, ui.state.sessionRevision);
+  equal(ui.state.discovery.scan.state, 'completed');
+  const firstChoice = ui.state.discovery.choices.get('192.168.5.10'); firstChoice.selected = true; firstChoice.name = 'Sân sau';
+  elements.get('discovery-sd-password').value = '';
+  await ui.addDiscoveredCameras();
+  const draftRequest = JSON.parse(requests.find(request => request.url === '/api/cameras' && request.method === 'POST').body);
+  equal(draftRequest.discovery_scan_id, 'fixture-scan');
+  equal(draftRequest.enabled, false); equal(draftRequest.upload_enabled, true);
+  equal(draftRequest.sd_password, undefined); equal(draftRequest.name, 'Sân sau');
+  equal(firstChoice.added, true); equal(firstChoice.selected, false);
+  equal(elements.get('discovery-add-status').textContent.includes('Đang tạm dừng'), true);
+  const secondChoice = ui.state.discovery.choices.get('192.168.5.11'); secondChoice.selected = true;
+  elements.get('discovery-sd-password').value = 'fixture-password';
+  await ui.addDiscoveredCameras();
+  const readyRequest = JSON.parse(requests.filter(request => request.url === '/api/cameras' && request.method === 'POST').at(-1).body);
+  equal(readyRequest.enabled, true); equal(readyRequest.sd_password, 'fixture-password');
+  equal(ui.state.cameras.every(camera => !('sd_password' in camera)), true);
+  equal(elements.get('discovery-sd-password').value, '');
+  equal(elements.get('discovery-add-status').textContent.includes('Đã bật và gửi Start'), true);
+  // A fresh conflict from another dashboard session becomes a known camera.
+  fixtureResults.push({host: '192.168.5.12', ports: [8000, 554], confidence: 'candidate'});
+  ui.renderDiscoveryJob(scanReply('completed').scan);
+  const thirdChoice = ui.state.discovery.choices.get('192.168.5.12'); thirdChoice.selected = true;
+  apiCameras.push({id: 'already-added', name: 'Cửa trước', host: '192.168.5.12', device_port: 8000});
+  addFailure = {status: 409, result: {code: 'camera_already_exists', existing_camera_id: 'already-added', error: 'Camera already exists'}};
+  await ui.addDiscoveredCameras();
+  equal(thirdChoice.result.existing_camera_id, 'already-added');
+  equal(thirdChoice.selected, false); equal(thirdChoice.check.disabled, true);
+  equal(elements.get('discovery-add-status').textContent.includes('1 đã có sẵn'), true);
+  equal(ui.state.cameras.some(camera => camera.id === 'already-added'), true);
+  addFailure = null;
+  // Responses from a closed dialog must not repopulate its cleared state.
+  let resolveLate;
+  context.fetch = () => new Promise(resolve => { resolveLate = resolve; });
+  const latePoll = ui.pollDiscovery(ui.state.discovery.revision, ui.state.sessionRevision);
+  ui.closeDiscovery();
+  resolveLate({ok: true, status: 200, json: async () => scanReply('completed')});
+  await latePoll;
+  equal(ui.state.discovery.scan, null); equal(ui.state.discovery.choices.size, 0);
+  equal(ui.state.discovery.timer, null); equal(elements.get('discovery-dialog').open, false);
+  console.log(`WEB_HELPERS: checks=${checks} passed=${checks} failed=0`);
+})().catch(error => { console.error(error); process.exitCode = 1; });

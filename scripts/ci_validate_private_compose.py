@@ -43,7 +43,20 @@ fixture = {'TELEGRAM_BOT_TOKEN': 'synthetic-not-a-real-token', 'TELEGRAM_OWNER_U
 result, local = render(True, fixture)
 assert result.returncode == 0, 'Production fixture render failed'
 assert local['name'] == 'ezviz-telegram-archive'
-assert set(local['volumes']) == {'archive-state', 'archive-cache', 'bot-api-state', 'bot-api-spool'}
+assert set(local['volumes']) == {'archive-state', 'archive-cache', 'bot-api-state', 'bot-api-spool', 'network-routes'}
+for config in (cloud, local):
+    collector=config['services']['route-discovery']
+    assert collector['network_mode']=='host' and collector['user']=='10001:10001'
+    assert collector['read_only'] is True and set(collector['cap_drop'])=={'ALL'}
+    assert not collector.get('cap_add') and not collector.get('ports')
+    assert not collector.get('environment') and not collector.get('env_file')
+    assert len(collector['volumes'])==1 and collector['volumes'][0]['source']=='network-routes'
+    assert not collector['volumes'][0].get('read_only',False)
+    dashboard=config['services']['dashboard']
+    routes=next(v for v in dashboard['volumes'] if v['target']=='/network')
+    assert routes['source']=='network-routes' and routes['read_only'] is True
+    assert dashboard['depends_on']['route-discovery']['condition']=='service_started'
+    assert dashboard['environment']['DISCOVERY_ROUTES_FILE']=='/network/subnets.json'
 assert 'ports' not in local['services']['telegram-bot-api']
 assert '--temp-dir=/var/lib/telegram-bot-api-spool' in local['services']['telegram-bot-api']['command']
 assert '--temp-dir=/tmp' not in local['services']['telegram-bot-api']['command']
