@@ -50,7 +50,7 @@ class ChannelIndex:
     rebuild(..., dry_run=True) is an offline plan; False only enqueues work.
     """
     LEASE_SECONDS = 600
-    NAVIGATION_VERSION = 2
+    NAVIGATION_VERSION = 3
     MAX_ROOT_YEARS = 12
     MAX_ROOT_MONTHS = 12
     MAX_ROOT_DAYS = 7
@@ -327,13 +327,13 @@ class ChannelIndex:
         lines = []
         if kind == 'root':
             today = datetime.fromtimestamp(time.time(), self.zone).date()
-            lines = [f'📌 KHO VIDEO – {identity}', '', f'📅 HÔM NAY · {today:%d/%m/%Y}']
+            lines = [f'📌 KHO VIDEO – {identity}', '']
             today_link = None
             if self._count(camera, channel, 'day', today.isoformat()):
                 today_link = self._node_link(camera, channel, 'day', today.isoformat(),
-                    f'▶️ Hôm nay · {today:%d/%m/%Y}')
-            lines.append(today_link or 'Chưa có video')
-            lines.extend(('', '📚 XEM THEO NĂM'))
+                    'Hôm nay')
+            lines.append(today_link or 'Hôm nay')
+            lines.extend(('', 'Năm'))
             years = list(self.conn.execute('''SELECT period_key FROM channel_index_messages
                 WHERE camera_id=? AND channel_chat_id=? AND index_type='year' AND state='ready'
                 ORDER BY period_key DESC''', (camera, channel)))
@@ -343,17 +343,15 @@ class ChannelIndex:
                 if link:
                     lines.append(link)
             if len(active) > self.MAX_ROOT_YEARS:
-                lines.append(f'{len(active) - self.MAX_ROOT_YEARS} năm khác: tìm trong bot')
-            lines.extend(('', '📆 XEM THEO THÁNG'))
+                lines.append(f'{len(active) - self.MAX_ROOT_YEARS} năm khác')
+            lines.extend(('', 'Tháng'))
             for month in self._recent_periods(camera, channel, 'month', self.MAX_ROOT_MONTHS):
                 parsed = date.fromisoformat(month + '-01')
                 lines.append(self._node_link(camera, channel, 'month', month, f'📆 {parsed:%m/%Y}'))
-            lines.append('Tháng cũ hơn: chọn năm ở trên')
-            lines.extend(('', '🗓 XEM THEO NGÀY'))
+            lines.extend(('', 'Ngày'))
             for day in self._recent_periods(camera, channel, 'day', self.MAX_ROOT_DAYS):
                 parsed = date.fromisoformat(day)
                 lines.append(self._node_link(camera, channel, 'day', day, f'🗓 {parsed:%d/%m/%Y}'))
-            lines.append('Ngày cũ hơn: chọn tháng ở trên')
             latest = self._records(camera, channel, descending=True, limit=1).fetchone()
             if latest:
                 lines.append('')

@@ -18,19 +18,25 @@ class PinNavigationTests(unittest.TestCase):
     text = fixtures.ChannelIndexTests.text
     sends = fixtures.ChannelIndexTests.sends
 
-    HEADINGS = ('📚 XEM THEO NĂM', '📆 XEM THEO THÁNG', '🗓 XEM THEO NGÀY', '📅 HÔM NAY')
+    HEADINGS = ('Năm', 'Tháng', 'Ngày', 'Hôm nay')
 
     def at(self, stamp):
         self.now = datetime.fromisoformat(stamp).timestamp()
 
     def section(self, text, heading):
-        start = text.index(heading)
-        end = min((text.index(other, start + len(heading)) for other in self.HEADINGS
-                   if other != heading and other in text[start + len(heading):]), default=len(text))
-        for footer in ('🎬 Video mới nhất', '🤖 Bot quản lý'):
-            if footer in text[start:end]:
-                end = min(end, text.rfind('\n', start, text.index(footer, start)) + 1)
-        return text[start:end]
+        # Today may itself be a link; use its complete visible line, not an
+        # occurrence inside a date label or a footer, as the section boundary.
+        lines = text.splitlines()
+        visible = [re.sub(r'<[^>]+>', '', line) for line in lines]
+        start = visible.index(heading)
+        end = next((n for n in range(start + 1, len(lines))
+                    if visible[n] in self.HEADINGS or visible[n] in
+                    ('🎬 Video mới nhất', '🤖 Bot quản lý')), len(lines))
+        return '\n'.join(lines[start:end])
+
+    def today_line(self, text):
+        return next(line for line in text.splitlines()
+                    if re.sub(r'<[^>]+>', '', line) == 'Hôm nay')
 
     def ready(self, kind, period, *, camera='CAM01', channel=None, message=None):
         channel = self.channel if channel is None else channel
@@ -93,6 +99,19 @@ class PinNavigationTests(unittest.TestCase):
             self.assertIn(label, section)
         self.assertIn(self.node('day', '2026-10-10')['tg_message_url'], self.section(root, self.HEADINGS[3]))
 
+    def test_root_navigation_labels_are_short_exact_and_today_is_not_duplicated(self):
+        self.at('2026-10-10T12:00:00+07:00')
+        self.record()
+        self.run_job()
+        root = self.text('root', 'root')
+        visible = [re.sub(r'<[^>]+>', '', line) for line in root.splitlines()]
+        for heading in ('Hôm nay', 'Năm', 'Tháng', 'Ngày'):
+            self.assertEqual(visible.count(heading), 1)
+        self.assertRegex(self.today_line(root), r'^<a href="[^"]+">Hôm nay</a>$')
+        for old in ('XEM THEO', 'HÔM NAY', 'Tháng cũ hơn', 'Ngày cũ hơn',
+                    'tìm trong bot', 'Chưa có video'):
+            self.assertNotIn(old, root)
+
     def test_month_and_day_shortcuts_use_full_unambiguous_date_labels(self):
         for stamp in ('2025-10-10T08:00:00+07:00', '2026-10-10T08:00:00+07:00'):
             self.record(stamp)
@@ -110,20 +129,18 @@ class PinNavigationTests(unittest.TestCase):
         self.at('2026-10-10T18:00:00+00:00')  # 11 October at 01:00 camera-local time.
         self.record('2026-10-11T00:30:00+07:00')
         self.run_job(day='2026-10-11')
-        today = self.section(self.text('root', 'root'), self.HEADINGS[3])
-        self.assertIn('11/10/2026', today)
-        self.assertIn(self.node('day', '2026-10-11')['tg_message_url'], today)
-        self.assertNotIn('10/10/2026', today)
+        today = self.today_line(self.text('root', 'root'))
+        url = re.search(r'href="([^"]+)"', today).group(1)
+        self.assertEqual(url, self.node('day', '2026-10-11')['tg_message_url'])
+        self.assertEqual(re.sub(r'<[^>]+>', '', today), 'Hôm nay')
+        self.assertNotRegex(today, r'\d{2}/\d{2}/\d{4}')
 
     def test_today_empty_does_not_relabel_latest_old_day_as_today(self):
         self.at('2026-10-11T12:00:00+07:00')
         self.record()
         self.run_job()
-        today = self.section(self.text('root', 'root'), self.HEADINGS[3])
-        self.assertIn('11/10/2026', today)
-        self.assertIn('Chưa có video', today)
-        # Restrict the check to the Today line: root may separately link latest video.
-        today_line = next(line for line in today.splitlines() if 'HÔM NAY' in line)
+        today_line = self.today_line(self.text('root', 'root'))
+        self.assertEqual(today_line, 'Hôm nay')
         self.assertNotIn(self.node('day', '2026-10-10')['tg_message_url'], today_line)
         self.assertIsNone(self.node('day', '2026-10-11'))
 
@@ -133,7 +150,8 @@ class PinNavigationTests(unittest.TestCase):
         self.ready('year', '2026')
         self.ready('month', '2026-10')
         text = self.index._render('CAM01', self.channel, 'root', 'root')
-        today_line = next(line for line in text.splitlines() if 'HÔM NAY' in line)
+        today_line = self.today_line(text)
+        self.assertEqual(today_line, 'Hôm nay')
         self.assertNotIn('href=', today_line)
         self.assertIsNone(self.node('day', '2026-10-10'))
 
@@ -147,7 +165,7 @@ class PinNavigationTests(unittest.TestCase):
         self.assertEqual(self.index.process_one(), 'updated')
         root = self.text('root', 'root')
         self.assertNotIn(self.node('day', '2026-10-10')['tg_message_url'], root)
-        self.assertIn('Chưa có video', self.section(root, self.HEADINGS[3]))
+        self.assertEqual(self.today_line(root), 'Hôm nay')
         self.assertEqual(self.node('day', '2026-10-10')['tg_message_id'], day_id)
 
     def test_shortcuts_filter_wrong_bot_channel_kind_status_and_deleted_records(self):
@@ -255,7 +273,7 @@ class PinNavigationTests(unittest.TestCase):
     def test_empty_startup_records_navigation_marker_but_creates_no_job_or_node(self):
         self.at('2026-10-10T12:00:00+07:00')
         self.assertEqual(self.index.refresh_navigation(), 0)
-        self.assertEqual(self.markers()['pin_navigation_version'], 2)
+        self.assertEqual(self.markers()['pin_navigation_version'], 3)
         self.assertEqual(self.markers()['pin_today_ordinal'], datetime(2026, 10, 10).date().toordinal())
         self.assertEqual(self.archive.conn.execute('SELECT COUNT(*) FROM channel_index_jobs').fetchone()[0], 0)
         self.assertEqual(self.archive.conn.execute('SELECT COUNT(*) FROM channel_index_messages').fetchone()[0], 0)
@@ -288,10 +306,9 @@ class PinNavigationTests(unittest.TestCase):
         self.at('2026-10-11T00:01:00+07:00')
         self.assertEqual(self.index.process_one(), 'updated')
         root = self.text('root', 'root')
-        today_line = next(line for line in root.splitlines() if 'HÔM NAY' in line)
-        self.assertIn('11/10/2026', today_line)
+        today_line = self.today_line(root)
+        self.assertEqual(today_line, 'Hôm nay')
         self.assertNotIn(old_day, today_line)
-        self.assertIn('Chưa có video', self.section(root, self.HEADINGS[3]))
         self.assertIsNone(self.node('day', '2026-10-11'))
         self.assertEqual(self.node('root', 'root')['tg_message_id'], root_id)
         self.assertEqual(len(self.sends()), 4)
@@ -301,9 +318,9 @@ class PinNavigationTests(unittest.TestCase):
         self.record()
         self.run_job()
         root_id = self.node('root', 'root')['tg_message_id']
-        self.old_markers()
+        self.old_markers(version=2)
         self.assertEqual(self.index.process_one(), 'updated')
-        self.assertEqual(self.markers()['pin_navigation_version'], 2)
+        self.assertEqual(self.markers()['pin_navigation_version'], 3)
         self.assertEqual(self.node('root', 'root')['tg_message_id'], root_id)
         self.assertEqual(len(self.sends()), 4)
         self.assertIsNone(self.index.process_one())
@@ -372,7 +389,7 @@ class PinNavigationTests(unittest.TestCase):
             self.now += 60
             self.assertEqual(self.index.refresh_navigation(), 1)
             self.assertEqual(enqueue.call_count, 2)
-        self.assertEqual(self.markers()['pin_navigation_version'], 2)
+        self.assertEqual(self.markers()['pin_navigation_version'], 3)
 
 
 if __name__ == '__main__':

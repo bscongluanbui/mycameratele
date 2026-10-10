@@ -58,10 +58,11 @@ Community; chức năng upload/tìm kiếm không phụ thuộc Community.
 ## Mục lục tự động
 
 Mỗi channel có một **📌 KHO VIDEO – Tên camera** ghim, không hiển thị mã camera.
-Pin có các mục **Hôm nay / Năm / Tháng / Ngày**: link Hôm nay theo múi giờ cấu
+Pin dùng nhãn ngắn **Hôm nay / Năm / Tháng / Ngày**, không kèm dòng hướng dẫn
+dài hoặc lặp lại nhãn Hôm nay. Link Hôm nay theo múi giờ cấu
 hình, 12 năm, 12 tháng và 7 ngày có video gần nhất. Các kỳ cũ hơn vẫn truy cập
 qua cây **Năm → Tháng → Ngày** hoặc bot. Mục Hôm nay tự cập nhật khi sang ngày,
-kể cả camera tạm dừng upload; ngày chưa có video hiển thị trạng thái rỗng,
+kể cả camera tạm dừng upload; ngày chưa có video chỉ hiện nhãn Hôm nay,
 không dẫn nhầm đến hôm qua. Khi cập nhật image, pin hiện có được sửa tại chỗ;
 không ghim thêm nhiều bài và không gửi lại video. Mục ngày
 gồm sáu khung bốn giờ, tổng video, video đầu/cuối và đường quay lại. Nút khung
