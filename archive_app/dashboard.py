@@ -17,6 +17,8 @@ from .dashboard_auth import DashboardAuth
 from .discovery import DiscoveryManager
 from .network_routes import load_subnets
 from .sync import SyncQueue
+from .telegram import Telegram
+from .channel_directory import ChannelDirectory
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -166,6 +168,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 camera.update(sync=result['jobs'][0],worker_alive=result['worker_alive'])
         return (201,camera)
 
+    def check_camera_channel(self,archive,slug):
+        """Read-only Telegram permission check; never change upload switches."""
+        if self.read_json():raise ValueError('Channel check does not accept fields')
+        camera=next((item for item in archive.cameras() if item['id']==slug),None)
+        if camera is None:raise KeyError(slug)
+        if not camera.get('channel_chat_id') or camera.get('channel_enabled') is False:
+            return (409,{'error':'Nhập Channel ID và bật channel trước khi kiểm tra',
+                         'code':'camera_channel_unconfigured','camera':camera})
+        try:
+            chat_id,_bot_id=Telegram(self.server.settings).verify_camera_channel(archive,slug,require_index=True)
+        except Exception:
+            # SDK / HTTP errors may include URLs or tokens. Keep raw exceptions
+            # out of both client replies and persisted camera metadata.
+            archive.set_channel_status(slug,'error','camera_channel_check_failed')
+            camera=next(item for item in archive.cameras() if item['id']==slug)
+            return (409,{'error':'Kiểm tra Channel ID và quyền admin đăng, sửa, ghim bài của bot',
+                         'code':'camera_channel_check_failed','camera':camera})
+        archive.set_channel_status(slug,'ready')
+        camera=next(item for item in archive.cameras() if item['id']==slug)
+        return (200,{'camera':camera,'channel_chat_id':chat_id,'ready':True})
+
     def handle_discovery(self,method,path,query):
         """All callers have passed the ordinary login, setup, Origin and CSRF gates."""
         if query:raise ValueError('Discovery filters are not supported')
@@ -277,9 +300,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 elif path=='/api/cameras' and method=='GET':
                     sync=SyncQueue(archive).status()
                     response=(200,{'cameras':[{**camera,'sync':sync['latest'].get(camera['id'])} for camera in archive.cameras()],
-                                   'worker_alive':sync['worker_alive']})
+                                   'worker_alive':sync['worker_alive'],
+                                   'multi_channel_routing':self.server.settings.multi_channel_routing,
+                                   'channel_index_enabled':self.server.settings.channel_index_enabled})
                 elif path=='/api/cameras' and method=='POST':
                     response=self.add_camera(archive,self.read_json(),account['username'])
+                elif path=='/api/telegram/channels' and method=='GET':
+                    if parsed.query:raise ValueError('Channel directory filters are not supported')
+                    response=(200,{'channels':ChannelDirectory(archive).list()})
+                elif path=='/api/telegram/channels/refresh' and method=='POST':
+                    if parsed.query or self.read_json():raise ValueError('Channel refresh does not accept fields')
+                    try:response=(200,{'channels':ChannelDirectory(archive).refresh(Telegram(self.server.settings))})
+                    except Exception:response=(409,{'error':'Kiểm tra kết nối Telegram và quyền admin của bot trong channel','code':'channel_directory_refresh_failed'})
                 elif path=='/api/sync' and method=='POST':
                     data=self.read_json()
                     if set(data)-{'camera_id'}:raise ValueError('Unknown sync field')
@@ -298,6 +330,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         data=self.read_json()
                         with self.server.camera_catalog_lock:response=(200,archive.update_camera(slug,data))
                     elif len(pieces)==2 and pieces[1]=='probe' and method=='POST':response=(200,archive.probe_camera(slug))
+                    elif len(pieces)==2 and pieces[1]=='channel-check' and method=='POST':
+                        if parsed.query:raise ValueError('Channel check filters are not supported')
+                        with self.server.camera_catalog_lock:response=self.check_camera_channel(archive,slug)
                     else:response=(404,{'error':'Not found'})
                 elif path=='/api/calendar' and method=='GET':
                     query=parse_qs(parsed.query);camera=query.get('camera',[''])[0]

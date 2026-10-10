@@ -55,12 +55,28 @@
     },
     cameraPatch(original, edited) {
       const patch = {};
-      for (const key of ["name", "model", "host", "device_port", "rtsp_port", "http_port", "enabled", "upload_enabled", "sd_backend", "sd_username", "sd_channel", "sd_timezone", "sd_lookback_hours"]) {
+      for (const key of ["name", "model", "host", "device_port", "rtsp_port", "http_port", "enabled", "upload_enabled", "channel_chat_id", "channel_enabled", "sd_backend", "sd_username", "sd_channel", "sd_timezone", "sd_lookback_hours"]) {
         if (edited[key] !== undefined && edited[key] !== original[key]) patch[key] = edited[key];
       }
       if (typeof edited.sd_password === "string" && edited.sd_password) patch.sd_password = edited.sd_password;
       if (edited.sd_password_clear === true) patch.sd_password_clear = true;
       return patch;
+    },
+    channelId(value) {
+      const raw = String(value ?? "").trim();
+      if (!raw) return null;
+      if (!/^-100[1-9]\d{0,12}$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("Channel ID cần có dạng -100… (chỉ chữ số), không nhập tên hoặc link channel.");
+      return Number(raw);
+    },
+    channelState(camera) {
+      if (camera?.channel_enabled === false) return ["Channel tạm dừng", "neutral"];
+      if (!camera?.channel_chat_id) return ["Chưa gán channel", "amber"];
+      return {ready: ["Channel sẵn sàng", "green"], error: ["Cần kiểm tra quyền bot", "red"]}[camera.channel_status] || ["Chưa kiểm tra channel", "amber"];
+    },
+    channelIndexUrl(value) {
+      if (typeof value !== "string") return null;
+      try { const url = new URL(value); return url.protocol === "https:" && url.hostname === "t.me" && !url.username && !url.password && !url.port && !url.search && !url.hash && /^\/c\/[1-9]\d{0,12}\/[1-9]\d*$/.test(url.pathname) ? url.href : null; }
+      catch (_) { return null; }
     },
     uploadEnabled(camera) { return camera?.upload_enabled !== false; },
     syncActive(job) { return !!job && ["queued", "running"].includes(job.state); },
@@ -220,6 +236,7 @@
   }
   function formError(form, errorBox, message, field = "") {
     clearFormError(form, errorBox); errorBox.textContent = message; errorBox.hidden = false;
+    if (field === "camera-channel-chat-id") $("camera-channel-manual").open = true;
     if (field && $(field)) { $(field).setAttribute("aria-invalid", "true"); $(field).focus(); } else errorBox.focus();
   }
   function showLogin({ username = state.account?.username || "", message = "" } = {}) {
@@ -229,6 +246,7 @@
     state.account = null; state.accountRequired = false; state.csrf = ""; state.cameras = []; state.status = {}; state.calendar = []; state.probes.clear();
     $("app-shell").hidden = true; $("account-screen").hidden = true; $("boot-loading").hidden = true; $("login-screen").hidden = false;
     if ($("camera-dialog").open) $("camera-dialog").close();
+    state.channelBusy?.clear();
     clearPasswords($("login-form")); clearPasswords($("account-form"));
     clearFormError($("login-form"), $("login-error")); clearFormError($("account-form"), $("account-error"));
     $("login-username").value = username; $("login-status").textContent = message; $("login-status").hidden = !message;
@@ -365,7 +383,7 @@
   }
   function renderCameras() {
     const focused = document.activeElement;
-    const focusKey = focused?.dataset?.cameraStart ? ["cameraStart", focused.dataset.cameraStart] : focused?.dataset?.cameraUpload ? ["cameraUpload", focused.dataset.cameraUpload] : null;
+    const focusKey = focused?.dataset?.cameraStart ? ["cameraStart", focused.dataset.cameraStart] : focused?.dataset?.cameraUpload ? ["cameraUpload", focused.dataset.cameraUpload] : focused?.dataset?.cameraChannel ? ["cameraChannel", focused.dataset.cameraChannel] : null;
     const syncFocus = rememberSyncRows($("camera-grid"));
     const query = $("camera-search").value.toLocaleLowerCase("vi-VN").trim();
     const cameras = state.cameras.filter(camera => [camera.name, camera.id, camera.model, camera.host].some(value => String(value || "").toLocaleLowerCase("vi-VN").includes(query)));
@@ -379,6 +397,10 @@
       info.append(infoRow("Địa chỉ LAN", camera.host || "Chưa khai báo", true), infoRow("Mã camera", camera.id, true), infoRow("Kết nối", chip(...summary)), infoRow("Cấu hình", chip(camera.enabled === false ? "Đã tạm dừng" : "Đang bật", camera.enabled === false ? "neutral" : "green")));
       const total = helpers.cameraCount(camera, "total"), uploaded = helpers.cameraCount(camera, "uploaded");
       info.append(infoRow("Video / Đã lưu", `${displayCount(total)} / ${displayCount(uploaded)}`));
+      info.append(infoRow("Channel riêng", camera.channel_chat_id ? String(camera.channel_chat_id) : "Chưa gán", true), infoRow("Telegram", chip(...helpers.channelState(camera))));
+      if (state.status.multi_channel_routing === true && (!camera.channel_chat_id || camera.channel_enabled === false || camera.channel_status !== "ready")) info.append(node("p", "camera-channel-note", "Upload chờ channel riêng sẵn sàng; không gửi sang channel khác."));
+      const channelIndex = helpers.channelIndexUrl(camera.channel_index_url);
+      if (channelIndex) { const link = node("a", "telegram-link", "Mở mục lục channel"); link.href = channelIndex; link.target = "_blank"; link.rel = "noopener noreferrer"; info.append(link); }
       const job = state.sync.latest?.[camera.id] || camera.sync;
       const syncDetail = syncDisclosure(job, camera, "camera");
       const upload = node("button", "upload-switch"); upload.type = "button"; upload.setAttribute("role", "switch");
@@ -393,6 +415,9 @@
       start.setAttribute("aria-label", `Start sync ${camera.name || camera.id}`); actions.append(start);
       actions.append(button("Thư viện", "primary", () => openCameraArchive(camera.id), "folder"), button("Chỉnh sửa", "ghost", () => openCameraForm(camera), "edit"));
       const probeButton = button("Kiểm tra LAN", "ghost", () => probeCamera(camera, probeButton), "network"); actions.append(probeButton);
+      const channelButton = button(state.channelBusy?.has(camera.id) ? "Đang kiểm tra…" : "Kiểm tra channel", "ghost", () => checkCameraChannel(camera), "external");
+      channelButton.dataset.cameraChannel = camera.id; channelButton.disabled = !camera.channel_chat_id || camera.channel_enabled === false || !!state.channelBusy?.has(camera.id);
+      channelButton.setAttribute("aria-label", `Kiểm tra channel ${camera.name || camera.id}`); actions.append(channelButton);
       card.append(top, info, syncDetail, uploadBox, actions); $("camera-grid").append(card);
     }
     renderStats();
@@ -489,7 +514,9 @@
     const details = [
       ["Phiên bản", status.version || "—"], ["Múi giờ lưu trữ", timezone],
       ["Upload Telegram", status.upload_enabled === true ? "Đã bật" : status.upload_enabled === false ? "Đang tắt" : "Chưa rõ"],
-      ["Nơi lưu video", status.telegram_destination === "channel" ? "Private channel" : ["owner_private", "owner_private_chat"].includes(status.telegram_destination) ? "Chat riêng của owner" : "—"],
+      ["Nơi lưu video", status.telegram_destination === "camera_channels" ? "Private channel riêng cho từng camera" : status.telegram_destination === "channel" ? "Private channel" : ["owner_private", "owner_private_chat"].includes(status.telegram_destination) ? "Chat riêng của owner" : "—"],
+      ["Routing channel", status.multi_channel_routing === true ? "Mỗi camera một channel · không fallback" : "Channel hiện tại (chưa chuyển routing)"],
+      ["Mục lục channel", status.channel_index_enabled === true ? "Năm → Tháng → Ngày → Khung giờ" : "Đang tắt"],
       ["Owner /start", status.owner_started === true ? "Đã kết nối" : "Chờ owner mở bot và /start"],
       ["ID được phép xem", status.allowed_users_count ?? "—"],
       ["Bot API", status.api_mode || status.telegram_api_mode || "—"],
@@ -748,7 +775,43 @@
     if (failed) discoveryError("Một số camera chưa được thêm. Xem kết quả từng camera rồi thử lại.");
     if (added || existing || failed) await refresh();
   }
+  function renderChannelOptions(channels, desired = $("camera-channel-chat-id").value) {
+    const select = $("camera-channel-select");
+    select.replaceChildren(option("", "Chưa gán / nhập ID riêng"));
+    const current = String(desired || "");
+    let matched = false;
+    for (const channel of Array.isArray(channels) ? channels : []) {
+      let id;
+      try { id = helpers.channelId(channel.chat_id); } catch (_) { continue; }
+      if (id === null || channel.private === false) continue;
+      const bound = channel.bound_camera_id && channel.bound_camera_id !== state.editing;
+      const label = `${channel.name || channel.title || id}${bound ? ` · đã gán ${cameraName(channel.bound_camera_id)}` : channel.ready === false ? " · cần kiểm tra" : ""}`;
+      const item = option(id, label); item.disabled = !!bound;
+      select.append(item); if (String(id) === current) matched = true;
+    }
+    if (current && !matched) select.append(option(current, `${current} · channel đang gán (chưa có tên)`));
+    select.value = current;
+  }
+  async function loadCameraChannels(refreshDirectory = false) {
+    const revision = state.channelFormRevision, session = state.sessionRevision;
+    const select = $("camera-channel-select"), refreshButton = $("camera-channel-refresh"), note = $("camera-channel-directory-note");
+    select.disabled = true; refreshButton.disabled = true; note.textContent = "Đang đọc channel…";
+    try {
+      const result = await api(refreshDirectory ? "/api/telegram/channels/refresh" : "/api/telegram/channels", refreshDirectory ? {method: "POST", body: {}} : {});
+      if (revision !== state.channelFormRevision || session !== state.sessionRevision || !state.authenticated || !$("camera-dialog").open) return;
+      state.knownChannels = Array.isArray(result.channels) ? result.channels : [];
+      renderChannelOptions(state.knownChannels);
+      note.textContent = state.knownChannels.length ? "Chọn channel theo tên. Channel của camera khác sẽ bị khóa." : "Chưa có channel. Thêm bot làm admin rồi gửi một bài trong channel, hoặc nhập ID thủ công.";
+    } catch (error) {
+      if (revision === state.channelFormRevision && session === state.sessionRevision && state.authenticated && $("camera-dialog").open) {
+        note.textContent = error.message; renderChannelOptions(state.knownChannels || []);
+      }
+    } finally {
+      if (revision === state.channelFormRevision && session === state.sessionRevision) { select.disabled = false; refreshButton.disabled = false; }
+    }
+  }
   function openCameraForm(camera = null) {
+    state.channelFormRevision = (state.channelFormRevision || 0) + 1;
     state.editing = camera?.id || null; $("camera-form").reset(); $("camera-form-error").hidden = true;
     $("camera-dialog-title").textContent = camera ? "Chỉnh sửa camera" : "Thêm camera";
     $("camera-id").value = camera?.id || ""; $("camera-id").readOnly = !!camera;
@@ -760,11 +823,17 @@
     for (const [name, fallback] of [["device_port", 8000], ["rtsp_port", 554], ["http_port", 80]]) $("camera-" + name.replaceAll("_", "-")).value = camera?.[name] || fallback;
     $("camera-enabled").checked = camera?.enabled !== false;
     $("camera-upload-enabled").checked = helpers.uploadEnabled(camera);
+    $("camera-channel-chat-id").value = camera?.channel_chat_id ?? "";
+    $("camera-channel-enabled").checked = camera?.channel_enabled !== false;
+    $("camera-channel-state").textContent = helpers.channelState(camera)[0];
+    $("camera-channel-routing-note").hidden = state.status.multi_channel_routing !== false;
+    $("camera-channel-manual").open = false;
     $("camera-sd-backend").value = camera?.sd_backend || "auto"; $("camera-sd-username").value = camera?.sd_username || "admin";
     $("camera-sd-channel").value = camera?.sd_channel || 1; $("camera-sd-timezone").value = camera?.sd_timezone || "Asia/Ho_Chi_Minh"; $("camera-sd-lookback").value = camera?.sd_lookback_hours || 168;
     $("camera-sd-password").value = ""; $("camera-sd-password-clear").checked = false; $("camera-sd-clear-control").hidden = !camera?.sd_password_configured;
     $("camera-sd-password-hint").textContent = camera?.sd_password_configured ? "Đã có mật khẩu thiết bị. Để trống sẽ giữ nguyên; mật khẩu hiện có không hiển thị." : "Chưa lưu mật khẩu thiết bị. Nhập mật khẩu / mã xác thực của camera để thử tải SD.";
-    $("camera-dialog").showModal(); (camera ? $("camera-name") : $("camera-id")).focus();
+    renderChannelOptions(state.knownChannels || []);
+    $("camera-dialog").showModal(); (camera ? $("camera-name") : $("camera-id")).focus(); loadCameraChannels();
   }
   async function saveCamera(event) {
     event.preventDefault(); if (!$("camera-form").reportValidity()) return;
@@ -774,7 +843,11 @@
     if ($("camera-sd-password").value) data.sd_password = $("camera-sd-password").value;
     if ($("camera-sd-password-clear").checked) data.sd_password_clear = true;
     for (const name of ["device_port", "rtsp_port", "http_port"]) data[name] = Number(values.get(name));
-    const errorBox = $("camera-form-error"); errorBox.hidden = true;
+    const errorBox = $("camera-form-error"); clearFormError($("camera-form"), errorBox);
+    try { data.channel_chat_id = helpers.channelId($("camera-channel-chat-id").value); }
+    catch (error) { formError($("camera-form"), errorBox, error.message, "camera-channel-chat-id"); return; }
+    data.channel_enabled = $("camera-channel-enabled").checked;
+    if (data.channel_chat_id !== null && state.cameras.some(camera => camera.id !== state.editing && Number(camera.channel_chat_id) === data.channel_chat_id)) { formError($("camera-form"), errorBox, "Channel này đã được gán cho camera khác. Mỗi camera cần một channel riêng.", "camera-channel-chat-id"); return; }
     if (!data.name || !helpers.validHost(data.host)) { errorBox.textContent = !data.name ? "Nhập tên hiển thị cho camera." : "Địa chỉ LAN cần là IPv4 hợp lệ hoặc hostname, không có http://, đường dẫn hay mật khẩu."; errorBox.hidden = false; errorBox.focus(); return; }
     if (data.sd_password && data.sd_password_clear) { errorBox.textContent = "Chọn nhập mật khẩu mới hoặc xóa mật khẩu đã lưu, không chọn cả hai."; errorBox.hidden = false; errorBox.focus(); return; }
     if (data.sd_password && !helpers.validSdPassword(data.sd_password)) { errorBox.textContent = "Mật khẩu thiết bị cần dài tối đa 64 byte UTF-8 và không chứa ký tự NUL."; errorBox.hidden = false; $("camera-sd-password").focus(); return; }
@@ -798,6 +871,26 @@
     try { const result = await api(`/api/cameras/${encodeURIComponent(camera.id)}/probe`, { method: "POST", body: {} }); state.probes.set(camera.id, result); renderCameras(); renderProbes(); const summary = probeSummary(result); toast(`${camera.name || camera.id}: ${summary[0]}. Tải lịch sử SD vẫn cần kiểm chứng riêng.`); }
     catch (error) { toast(error.message, true); }
     finally { control.disabled = false; control.querySelector("span").textContent = oldText; }
+  }
+  async function checkCameraChannel(camera) {
+    state.channelBusy ||= new Set();
+    if (state.channelBusy.has(camera.id)) return;
+    const revision = state.sessionRevision;
+    state.channelBusy.add(camera.id); renderCameras();
+    try {
+      const result = await api(`/api/cameras/${encodeURIComponent(camera.id)}/channel-check`, {method: "POST", body: {}});
+      if (!state.authenticated || revision !== state.sessionRevision) return;
+      if (result.camera) state.cameras = state.cameras.map(item => item.id === camera.id ? result.camera : item);
+      toast(`${camera.name || camera.id}: channel sẵn sàng.`);
+    } catch (error) {
+      if (state.authenticated && revision === state.sessionRevision) {
+        state.cameras = state.cameras.map(item => item.id === camera.id ? {...item, channel_status: "error"} : item);
+        toast(error.message, true);
+      }
+    } finally {
+      state.channelBusy.delete(camera.id);
+      if (state.authenticated && revision === state.sessionRevision) renderCameras();
+    }
   }
   function setOptions(select, placeholder, entries, preserve = "") {
     select.replaceChildren(option("", placeholder)); for (const [value, label] of entries) select.append(option(value, label));
@@ -945,8 +1038,11 @@
   $("discovery-dialog").addEventListener("cancel", event => { event.preventDefault(); if (!state.discovery.adding) closeDiscovery(); });
   $("discovery-dialog").addEventListener("close", () => { if (state.discovery.scan || state.discovery.timer || $("discovery-sd-password").value) closeDiscovery(); });
   for (const id of ["close-camera-dialog", "cancel-camera-dialog"]) $(id).addEventListener("click", () => { $("camera-sd-password").value = ""; $("camera-dialog").close(); });
-  $("camera-dialog").addEventListener("close", () => { $("camera-sd-password").value = ""; });
+  $("camera-dialog").addEventListener("close", () => { $("camera-sd-password").value = ""; state.channelFormRevision = (state.channelFormRevision || 0) + 1; });
   $("camera-form").addEventListener("submit", saveCamera);
+  $("camera-channel-select").addEventListener("change", () => { $("camera-channel-chat-id").value = $("camera-channel-select").value; $("camera-channel-chat-id").removeAttribute("aria-invalid"); });
+  $("camera-channel-chat-id").addEventListener("input", () => { $("camera-channel-chat-id").removeAttribute("aria-invalid"); renderChannelOptions(state.knownChannels || []); });
+  $("camera-channel-refresh").addEventListener("click", () => loadCameraChannels(true));
   $("archive-filters").addEventListener("submit", event => event.preventDefault());
   $("filter-camera").addEventListener("change", async () => { state.offset = 0; try { await loadCalendar(false); await loadArchive(); } catch (error) { globalError(error.message); } });
   $("filter-year").addEventListener("change", () => { $("filter-month").value = ""; $("filter-day").value = ""; updateCalendarOptions(true); state.offset = 0; loadArchive(); });

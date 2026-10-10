@@ -678,3 +678,11 @@ unit test, runtime kiến trúc, upload Telegram thật và downloader SD thật
 - [EZVIZ Studio export recording](https://support.ezviz.com/faq/article/How-to-download-the-recorded-video-clips)
 - [Telegram Bot API](https://core.telegram.org/bots/api)
 - [Docker multi-platform builds](https://docs.docker.com/build/building/multi-platform/)
+# Mỗi camera một channel (bản cập nhật)
+
+Dashboard hỗ trợ **Gắn với channel** theo tên và kiểm tra quyền cùng bot;
+mục lục channel ghim **Năm → Tháng → Ngày → 6 khung giờ**. Video lịch sử
+giữ channel gốc, media chỉ remux stream-copy. Xem [hướng dẫn chuyển đổi,
+nhận diện channel, rebuild và rollback](docs/MULTI_CHANNEL.md).
+`MULTI_CHANNEL_ROUTING=false` mặc định giữ luồng hiện tại cho đến khi gắn
+channel và chủ động bật cutover.

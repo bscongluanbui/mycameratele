@@ -271,7 +271,10 @@ class TelegramBulk:
             return None
         if self.telegram.channel_mode:
             if (row.get('storage_kind') != 'channel' or type(row.get('storage_chat_id')) is not int or
-                    row['storage_chat_id'] != self.telegram.settings.storage_channel_id or
+                    not re.fullmatch(r'-100[1-9][0-9]*',str(row['storage_chat_id'])) or
+                    (not (getattr(self.telegram.settings,'multi_channel_routing',False) or
+                          archive.state('multi_channel_history')=='1') and
+                     row['storage_chat_id'] != self.telegram.settings.storage_channel_id) or
                     type(row.get('storage_message_id')) is not int or row['storage_message_id'] <= 0):
                 return None
         elif row.get('storage_kind') != 'owner_private' or str(chat) != str(self.telegram.owner):

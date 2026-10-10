@@ -24,6 +24,8 @@ class ApiRejected(Exception):
             'bad request: message to copy not found', 'bad request: message not found',
             'bad request: message_id_invalid')
         normalized=description.lower() if isinstance(description,str) else ''
+        self.index_message_missing=code==400 and normalized in (
+            'bad request: message to edit not found','bad request: message not found','bad request: message_id_invalid')
         self.not_modified=code==400 and normalized.startswith('bad request: message is not modified')
         self.menu_uneditable=code==400 and normalized in (
             'bad request: message to edit not found', "bad request: message can't be edited",
@@ -36,6 +38,7 @@ class Telegram:
         self.settings = settings
         self._menu_retry_at = 0
         self._storage_verified = None
+        self._channel_verified = {}
 
     def register_commands(self, archive):
         """Configure the Telegram Menu once per token/schema, with bounded retries."""
@@ -151,7 +154,9 @@ class Telegram:
         """Open the original channel post; the Telegram client fetches media."""
         try:archive._archive_actor(actor)
         except (PermissionError,ValueError,TypeError):raise ValueError('Viewer is not authorized') from None
-        channel=self.settings.storage_channel_id
+        multi=(bool(getattr(self.settings,'multi_channel_routing',False))
+               or archive.state('multi_channel_history')=='1')
+        channel=row.get('storage_chat_id') if multi else self.settings.storage_channel_id
         message=row.get('storage_message_id')
         prefix,separator,_=self.settings.token.partition(':')
         bot=prefix if separator and prefix.isdecimal() else archive.state('telegram_bot_id')
@@ -210,11 +215,22 @@ class Telegram:
         zone = get_zone(self.settings.timezone)
         start = from_epoch_ms(row['start_ms'],zone)
         end = from_epoch_ms(row['end_ms'],zone)
+        if self.settings.multi_channel_routing:
+            seconds=max(1,(row['end_ms']-row['start_ms'])//1000)
+            duration=f'{seconds//60:02d}:{seconds%60:02d}'
+            end_label=end.strftime('%H:%M:%S') if start.date()==end.date() else end.strftime('%d/%m/%Y %H:%M:%S')
+            camera=row['camera'];tag=re.sub(r'[^A-Za-z0-9_]', '_', camera)
+            size=(row.get('file_size') or 0)/1e6
+            return (f'🎥 {camera} | {archive.camera_name(camera)}\n'
+                    f'📅 {start:%d/%m/%Y}\n🕒 {start:%H:%M:%S} → {end_label}\n'
+                    f'⏱ {duration} | 📦 {size:.1f} MB\n'
+                    f'#{tag} #Y{start:%Y} #M{start:%Y%m} #D{start:%Y%m%d}')
         return f"{archive.camera_name(row['camera'])} | {start.isoformat()} → {end.isoformat()}\nArchive: {row['key']}"
 
     @property
     def channel_mode(self):
         return (getattr(self.settings, 'telegram_destination', 'owner_private') == 'channel'
+                or self.settings.multi_channel_routing
                 or getattr(self.settings, 'storage_channel_id', 0) != 0)
 
     def verify_storage(self, archive):
@@ -245,11 +261,55 @@ class Telegram:
         self._storage_verified = (identity, time.time()+60, me['id'])
         return channel, me['id']
 
+    def verify_channel(self, archive, channel, *, require_index=True):
+        """Validate a candidate private channel without binding a camera."""
+        if type(channel) is not int or not re.fullmatch(r'-100[1-9][0-9]*',str(channel)):
+            raise ValueError('A private channel ID (-100...) is required')
+        identity=(self.settings.tenant_id,channel,hashlib.sha256(self.settings.token.encode()).hexdigest(),require_index)
+        cached=self._channel_verified.get(identity)
+        if cached and cached[0]>time.time():return channel,cached[1]
+        me=self.request('getMe',{})
+        if not isinstance(me,dict) or type(me.get('id')) is not int or me['id']<=0 or me.get('is_bot') is not True:
+            raise ValueError('Bot identity was not confirmed')
+        chat=self.request('getChat',{'chat_id':channel})
+        if (not isinstance(chat,dict) or type(chat.get('id')) is not int or chat['id']!=channel or chat.get('type')!='channel'
+                or chat.get('username') or chat.get('active_usernames')):
+            raise ValueError('Private channel identity was not confirmed')
+        member=self.request('getChatMember',{'chat_id':channel,'user_id':me['id']})
+        user=member.get('user',{}) if isinstance(member,dict) else {}
+        if (not isinstance(member,dict) or not isinstance(user,dict) or user.get('is_bot') is not True
+                or type(user.get('id')) is not int or user['id']!=me['id'] or member.get('status')!='administrator'
+                or member.get('can_post_messages') is not True or (require_index and member.get('can_edit_messages') is not True)):
+            raise ValueError('Channel post/edit/pin rights were not confirmed')
+        archive.state('telegram_bot_id',me['id'])
+        from .channel_directory import ChannelDirectory
+        ChannelDirectory(archive).remember(chat,status='ready')
+        # Bound cache to this bot, tenant, permissions and ID; names are not routing keys.
+        if len(self._channel_verified)>100:self._channel_verified.clear()
+        self._channel_verified[identity]=(time.time()+60,me['id'])
+        return channel,me['id']
+
+    def verify_camera_channel(self, archive, camera, *, require_index=True):
+        channel=None
+        previous=archive.conn.execute('SELECT channel_status FROM cameras WHERE id=?',(camera,)).fetchone()
+        try:
+            channel=archive.resolve_camera_channel(camera)
+            result=self.verify_channel(archive,channel,require_index=require_index)
+        except Exception as error:
+            code='channel_rate_limited' if isinstance(error,ApiRejected) and error.code==429 else 'channel_check_failed'
+            archive.set_channel_status(camera,'error',code,expected_channel=channel)
+            raise
+        if not archive.set_channel_status(camera,'ready',expected_channel=channel):
+            raise ValueError('Camera channel changed during verification')
+        if previous and previous[0]!='ready' and archive.channel_index:
+            archive.channel_index.enqueue_camera(camera)
+        return result
+
     def _upload_backoff_key(self):
         token_prefix, separator, _ = self.settings.token.partition(':')
         bot = ('id:'+(token_prefix.lstrip('0') or '0') if separator and token_prefix.isdecimal()
                else 'token:'+hashlib.sha256(self.settings.token.encode()).hexdigest())
-        destination = getattr(self.settings, 'storage_channel_id', 0) if self.channel_mode else self.owner
+        destination = 'camera_channels' if self.settings.multi_channel_routing else (getattr(self.settings, 'storage_channel_id', 0) if self.channel_mode else self.owner)
         scope = [getattr(self.settings, 'tenant_id', 'house01'), bot,
                  'channel' if self.channel_mode else 'owner_private', destination]
         return 'telegram_upload_retry_until:'+hashlib.sha256(json.dumps(scope,separators=(',',':')).encode()).hexdigest()
@@ -353,7 +413,23 @@ class Telegram:
         if self.upload_retry_until(archive) > time.time():
             return 'rate_limited'
         destination, bot_id = self.owner, None
-        if self.channel_mode:
+        row=None
+        if self.settings.multi_channel_routing:
+            # A blocked camera must not starve any other camera or claim its file.
+            pending=archive.pending_upload_cameras(camera)
+            for slug in pending:
+                try:
+                    destination,bot_id=self.verify_camera_channel(archive,slug,require_index=self.settings.channel_index_enabled)
+                except ApiRejected as error:
+                    if error.code==429:
+                        self._pause_uploads(archive,error.retry_after)
+                        return 'rate_limited'
+                    continue
+                except Exception:continue
+                row=archive.claim_upload(slug,channel_chat_id=destination)
+                if row is not None:break
+            if row is None:return 'storage_blocked' if pending else None
+        elif self.channel_mode:
             try:
                 destination, bot_id = self.verify_storage(archive)
             except ApiRejected as error:
@@ -365,7 +441,8 @@ class Telegram:
                 return 'storage_blocked'
         elif not self.owner or archive.state(f'telegram_owner_started:{self.owner}') != '1':
             return None
-        row = archive.claim_upload() if camera is None else archive.claim_upload(camera)
+        if not self.settings.multi_channel_routing:
+            row = archive.claim_upload() if camera is None else archive.claim_upload(camera)
         if row is None:
             return None
         path = Path(row['local_path'])
@@ -412,7 +489,7 @@ class Telegram:
             if bot_id is None:bot_id = int(bot_value) if bot_value and bot_value.isdecimal() and int(bot_value)>0 else None
             placement = ({'storage_kind':'channel','storage_chat_id':destination,
                           'storage_message_id':message['message_id']} if self.channel_mode else {})
-            archive.mark_uploaded(row['key'],destination,message['message_id'],media['file_id'],
+            archive.mark_uploaded(row['key'],message['chat']['id'],message['message_id'],media['file_id'],
                                   file_unique_id=media['file_unique_id'],media_type=field,bot_id=bot_id,**placement)
         except LocalUploadError:
             # request() rechecks the path before constructing/sending JSON.
@@ -615,7 +692,20 @@ class Telegram:
         if (isinstance(chat, dict) and chat.get('type') == 'channel'
                 and type(chat.get('id')) is int and chat['id'] < 0):
             channel = chat['id']
-        if channel is not None:
+        multi=bool(getattr(self.settings,'multi_channel_routing',False))
+        if channel is not None and multi:
+            text=(f'Channel ID: {channel}\n'
+                  'Dashboard → Camera → Chỉnh sửa → Channel ID. '
+                  'Mỗi camera dùng một private channel riêng; cùng bot làm admin có quyền đăng, sửa và ghim. '
+                  'Bot chỉ hiển thị ID; chưa đổi mapping hoặc bật upload.')
+        elif multi:
+            text=('Mỗi camera một private channel:\n'
+                  '1. Tạo channel Private cho camera.\n'
+                  '2. Thêm bot này làm admin có quyền đăng, sửa và ghim.\n'
+                  '3. Forward một tin từ channel vào đây để lấy ID.\n'
+                  '4. Điền Channel ID cho camera trên dashboard.\n'
+                  'Community do bạn gom channel trong Telegram; bot không tự tạo channel.')
+        elif channel is not None:
             text=(f'Channel ID: {channel}\n\nĐiền TELEGRAM_STORAGE_CHANNEL_ID={channel} '
                   'và TELEGRAM_DESTINATION=channel trong cấu hình, sau đó khởi động lại worker. '
                   'Bot chỉ hiển thị ID; cấu hình và upload chưa được thay đổi.')
@@ -626,6 +716,33 @@ class Telegram:
                   'Bot sẽ hiển thị Channel ID để bạn điền TELEGRAM_STORAGE_CHANNEL_ID. '
                   'Bot không tự chọn channel hoặc tự bật upload.')
         return text, [[{'text':'↩ Camera','callback_data':'root'}]]
+
+    def rebuild_index(self, archive, actor, words):
+        """Owner-only explicit queue administration; the default is read-only."""
+        if type(actor) is not int or actor != self.owner or actor <= 0:
+            raise ValueError('Index administration requires the owner')
+        if not getattr(self.settings,'multi_channel_routing',False):
+            raise ValueError('Camera channel routing is not enabled')
+        if not isinstance(words,list) or not 3<=len(words)<=4:
+            raise ValueError('Expected camera and index period')
+        camera,period=words[1:3]
+        if (not isinstance(camera,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',camera)
+                or not any(c['id']==camera for c in archive.cameras())
+                or not isinstance(period,str)
+                or not re.fullmatch(r'[0-9]{4}(?:-[0-9]{2})?(?:-[0-9]{2})?',period)):
+            raise ValueError('Invalid camera or index period')
+        # Parse the actual calendar instead of accepting impossible dates.
+        datetime.fromisoformat(period+'-01-01' if len(period)==4 else
+                               period+'-01' if len(period)==7 else period)
+        flag=words[3] if len(words)==4 else '--dry-run'
+        if flag not in ('--dry-run','--apply'):
+            raise ValueError('Expected --dry-run or --apply')
+        from .channel_index import ChannelIndex
+        result=ChannelIndex(archive,self).rebuild(camera,period,dry_run=flag!='--apply')
+        mode='Xem trước' if result['dry_run'] else 'Đã xếp hàng'
+        text=(f"{mode} · {archive.camera_name(camera)} · {period}\n"
+              f"Video: {result['recordings']} · Ngày: {len(result['dates'])} · Job: {result['jobs']}")
+        return text,[[{'text':'↩ Camera','callback_data':'root'}]]
 
     def recent_menu(self, archive, page=0):
         if page < 0 or page > 100000:
@@ -709,6 +826,10 @@ class Telegram:
         if kind == 'c':
             buttons = [[{'text':str(y['year']), 'callback_data':f"y:{token}:{y['year']}:{order}"}]
                        for y in sorted(years, key=lambda y:y['year'], reverse=backwards)]
+            if getattr(self.settings,'multi_channel_routing',False):
+                url=camera.get('channel_index_url')
+                if isinstance(url,str) and re.fullmatch(r'https://t\.me/c/[1-9][0-9]*/[1-9][0-9]*',url):
+                    buttons.append([{'text':'📌 Mục lục channel','url':url,'style':'success'}])
             buttons.extend(self.sync_camera_buttons(camera))
             self._controls(buttons, f'c:{token}:{{order}}', 'root', order)
             upload='ON' if camera.get('upload_enabled',True) else 'OFF'
@@ -963,6 +1084,13 @@ class Telegram:
             return (isinstance(callback,dict) and isinstance(callback.get('id'),str)
                     and isinstance(callback.get('data'),str) and isinstance(callback.get('from'),dict)
                     and (callback.get('message') is None or isinstance(callback.get('message'),dict)))
+        member=update.get('my_chat_member')
+        post=update.get('channel_post')
+        if member is not None:
+            return (isinstance(member,dict) and isinstance(member.get('chat'),dict)
+                    and isinstance(member.get('new_chat_member'),dict))
+        if post is not None:
+            return isinstance(post,dict) and isinstance(post.get('chat'),dict)
         return isinstance(update.get('message'),dict)
 
     def _adopt_poll_cursor(self,archive,updates,backend,offset):
@@ -1031,10 +1159,18 @@ class Telegram:
             return
         offset=int(archive.state('telegram_offset') or 0)
         backend=self._poll_backend(archive)
-        updates=self.request('getUpdates',{'offset':offset,'timeout':0,'allowed_updates':['message','callback_query']})
+        updates=self.request('getUpdates',{'offset':offset,'timeout':0,
+                                         'allowed_updates':['message','callback_query','my_chat_member','channel_post']})
         if not isinstance(updates,list):raise ValueError('Invalid Telegram update batch')
         self._adopt_poll_cursor(archive,updates,backend,offset)
         for update in updates:
+            if (isinstance(update,dict) and type(update.get('update_id')) is int
+                    and update['update_id']>=int(archive.state('telegram_offset') or 0)
+                    and ('my_chat_member' in update or 'channel_post' in update)):
+                from .channel_directory import ChannelDirectory
+                ChannelDirectory(archive).observe(update)
+                self._advance_poll(archive,update['update_id'],backend)
+                continue
             if not self._valid_update(update):continue
             if update['update_id'] < int(archive.state('telegram_offset') or 0):
                 continue
@@ -1133,9 +1269,17 @@ class Telegram:
                             TimeMenus(self).dismiss_input(archive,actor)
                         else:
                             date_input=TimeMenus(self).accept(archive,actor,raw_text)
-                        if actor == self.owner and (command == '/channel' or
+                        if command == '/rebuild_index':
+                            text,buttons=self.rebuild_index(archive,actor,words)
+                        elif actor == self.owner and (command == '/channel' or
                                 isinstance(message.get('forward_origin'), dict) and message['forward_origin'].get('type') == 'channel' or
                                 isinstance(message.get('forward_from_chat'), dict) and message['forward_from_chat'].get('type') == 'channel'):
+                            origin=message.get('forward_origin')
+                            forwarded=(origin.get('chat') if isinstance(origin,dict) and origin.get('type')=='channel'
+                                       else message.get('forward_from_chat') if origin is None else None)
+                            if isinstance(forwarded,dict):
+                                from .channel_directory import ChannelDirectory
+                                ChannelDirectory(archive).remember(forwarded)
                             text,buttons=self.channel_setup(actor,message)
                         elif is_start:
                             self.start_viewer(archive,actor)

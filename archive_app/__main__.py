@@ -49,6 +49,13 @@ def main():
     reconcile.add_argument('--message-id',type=int,required=True);reconcile.add_argument('--file-id',required=True)
     reconcile.add_argument('--file-unique-id');reconcile.add_argument('--media-type',choices=('video','document'))
     retry=subs.add_parser('retry-oversize');retry.add_argument('--key',required=True)
+    index=subs.add_parser('rebuild-index',help='Preview or enqueue channel navigation rebuild; never copy media.')
+    index.add_argument('--camera',required=True);index.add_argument('--period')
+    index.add_argument('--apply',action='store_true')
+    index_reconcile=subs.add_parser('reconcile-index',help='Confirm a previously uncertain index send with exact Telegram message ID.')
+    index_reconcile.add_argument('--camera',required=True);index_reconcile.add_argument('--chat-id',type=int,required=True)
+    index_reconcile.add_argument('--type',choices=('root','year','month','day'),required=True)
+    index_reconcile.add_argument('--period',required=True);index_reconcile.add_argument('--message-id',type=int,required=True)
     args=parser.parse_args()
     if args.command=='network-routes':
         from .network_routes import collect_subnets, write_snapshot, collect_loop
@@ -84,7 +91,7 @@ def main():
         good=heartbeat.is_file() and time.time()-heartbeat.stat().st_mtime<max(120,settings.interval*4)
         emit('health',healthy=good);return 0 if good else 1
     # All mutation CLI commands share the runner's lock; list remains read-only.
-    lock_scope=mutation_lock(settings) if args.command!='list' else None
+    lock_scope=mutation_lock(settings) if args.command not in ('list','rebuild-index','reconcile-index') else None
     if lock_scope is not None:lock_scope.__enter__()
     archive=Archive(settings)
     try:
@@ -96,6 +103,14 @@ def main():
         if args.command=='backup':
             path=archive.backup_daily()
             emit('backup',result='created' if path else 'already_exists_today',retention_days=7);return 0
+        if args.command=='rebuild-index':
+            from .channel_index import ChannelIndex
+            result=ChannelIndex(archive,Telegram(settings)).rebuild(args.camera,args.period,dry_run=not args.apply)
+            emit('rebuild_index',**result);return 0
+        if args.command=='reconcile-index':
+            from .channel_index import ChannelIndex
+            ChannelIndex(archive,Telegram(settings)).reconcile(args.camera,args.chat_id,args.type,args.period,args.message_id)
+            emit('index_reconciled',camera=args.camera,chat_id=args.chat_id,message_id=args.message_id);return 0
         if args.command=='retry-oversize':
             row=archive.conn.execute('SELECT * FROM recordings WHERE key=?',(args.key,)).fetchone()
             if row is None or row['media_expired_at'] is not None or row['status']!='needs_review' or row['last_error']!='missing_or_oversize_file' or row['file_id']:
@@ -107,12 +122,15 @@ def main():
                 archive.conn.execute("UPDATE recordings SET status='downloaded',last_error=NULL,retry_at=0 WHERE key=?",(args.key,))
             emit('requeued',key=args.key,reason='file_available_within_current_limit');return 0
         if args.command=='reconcile':
-            row=archive.conn.execute('SELECT status FROM recordings WHERE key=?',(args.key,)).fetchone()
-            if row is None or row[0]!='upload_unknown':raise ValueError('Reconcile requires upload_unknown recording and confirmed Message metadata')
-            allowed_destinations={str(value) for value in (settings.effective_owner,settings.storage_channel_id) if value}
+            row=archive.conn.execute('SELECT * FROM recordings WHERE key=?',(args.key,)).fetchone()
+            if row is None or row['status']!='upload_unknown':raise ValueError('Reconcile requires upload_unknown recording and confirmed Message metadata')
+            allowed_destinations=({str(row['upload_target_chat_id'])} if settings.multi_channel_routing and row['upload_target_chat_id']
+                                  else {str(value) for value in (settings.effective_owner,settings.storage_channel_id) if value})
             if str(args.chat_id) not in allowed_destinations:
                 raise ValueError('Confirmed upload must belong to a configured storage destination')
-            archive.mark_uploaded(args.key,args.chat_id,args.message_id,args.file_id,args.file_unique_id,args.media_type)
+            bot_value=archive.state('telegram_bot_id')
+            bot_id=int(bot_value) if bot_value and bot_value.isdecimal() and int(bot_value)>0 else None
+            archive.mark_uploaded(args.key,args.chat_id,args.message_id,args.file_id,args.file_unique_id,args.media_type,bot_id)
             archive.cleanup(args.key)
             emit('reconciled',key=args.key);return 0
         running=True
@@ -177,6 +195,24 @@ def main():
             finally:bulk_archive.close()
         bulk_thread=threading.Thread(target=bulk_downloads,daemon=True)
         bulk_thread.start()
+        # Channel index uses a separate connection/thread. SD SDK/download and
+        # Telegram media HTTP calls never hold up navigation edits or polling.
+        index_thread=None
+        if settings.multi_channel_routing and settings.channel_index_enabled:
+            def channel_indexes():
+                from .channel_index import ChannelIndex
+                index_archive=Archive(settings)
+                try:
+                    worker=ChannelIndex(index_archive,Telegram(settings));worker.recover()
+                    while not heartbeat_stop.is_set():
+                        try:
+                            result=worker.process_one()
+                            if result:emit('channel_index',status=result)
+                        except Exception as exc:emit('channel_index_error',error_type=type(exc).__name__)
+                        heartbeat_stop.wait(2)
+                finally:index_archive.close()
+            index_thread=threading.Thread(target=channel_indexes,daemon=True)
+            index_thread.start()
         emit('started',**archive.status())
         while running:
             if time.monotonic()>=next_sync:
@@ -213,6 +249,7 @@ def main():
                 if archive.conn.execute("SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1").fetchone():break
                 time.sleep(1)
         heartbeat_stop.set();heartbeat_thread.join(timeout=11);poll_thread.join(timeout=36);bulk_thread.join(timeout=36)
+        if index_thread:index_thread.join(timeout=36)
         emit('stopped');return 0
     finally:
         archive.close()

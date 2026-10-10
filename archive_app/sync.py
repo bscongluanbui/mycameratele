@@ -230,6 +230,10 @@ class SyncQueue:
         channel_mode = settings.telegram_destination=='channel' or bool(settings.storage_channel_id)
         if not settings.token:
             return 'telegram_not_configured', 'Chưa cấu hình bot token'
+        if settings.multi_channel_routing:
+            try:self.archive.resolve_camera_channel(slug)
+            except (ValueError,KeyError):return 'camera_channel_not_ready','Camera chưa gắn channel đang bật; queue vẫn được giữ'
+            return None
         if channel_mode:
             if type(settings.storage_channel_id) is not int or settings.storage_channel_id>=0:
                 return 'channel_not_configured', 'House01 cần private storage channel có bot admin quyền đăng bài'
@@ -258,6 +262,14 @@ class SyncQueue:
         if camera is None or not camera['enabled']:
             self._finish(job, statistics, 'blocked', 'camera_disabled', 'Camera đã tắt; không nhập hoặc upload video')
             return
+        if self.archive.settings.multi_channel_routing:
+            try:
+                self.archive.resolve_camera_channel(slug)
+                if self.archive.settings.enable_upload:
+                    telegram.verify_camera_channel(self.archive,slug,require_index=self.archive.settings.channel_index_enabled)
+            except Exception:
+                self._finish(job,statistics,'blocked','camera_channel_not_ready','Gắn private channel và kiểm tra quyền bot của camera trước khi sync')
+                return
         # probe_camera always performs new bounded LAN checks; no cached result
         # is treated as SD access. Offline LAN does not invalidate exported MP4s.
         try:

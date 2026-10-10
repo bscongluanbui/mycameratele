@@ -106,6 +106,10 @@ class Settings:
     error_retention_hours: float = 72.0
     upload_transport: str = 'multipart'
     local_upload_root: str = ''
+    # Opt-in cutover: the legacy destination remains usable until configured.
+    multi_channel_routing: bool = False
+    channel_index_enabled: bool = True
+    channel_index_debounce_seconds: int = 60
 
     @property
     def effective_owner(self):
@@ -122,6 +126,16 @@ class Settings:
 
     @classmethod
     def from_env(cls):
+        def flag(name, default):
+            value = os.environ.get(name, default).strip().lower()
+            if value not in ('true', 'false'):
+                raise ValueError(name + ' must be true or false')
+            return value == 'true'
+        multi_channel = flag('MULTI_CHANNEL_ROUTING', 'false')
+        index_enabled = flag('CHANNEL_INDEX_ENABLED', 'true')
+        index_debounce = int(os.environ.get('CHANNEL_INDEX_DEBOUNCE_SECONDS', '60'))
+        if not 10 <= index_debounce <= 300:
+            raise ValueError('CHANNEL_INDEX_DEBOUNCE_SECONDS must be between 10 and 300')
         mode = os.environ.get('TELEGRAM_API_MODE', 'cloud')
         if mode not in ('cloud', 'local'):
             raise ValueError('TELEGRAM_API_MODE must be cloud or local')
@@ -196,6 +210,9 @@ class Settings:
             bot_api_spool_max_bytes=int(spool_gb * 1e9),
             upload_transport=upload_transport,
             local_upload_root=local_upload_root,
+            multi_channel_routing=multi_channel,
+            channel_index_enabled=index_enabled,
+            channel_index_debounce_seconds=index_debounce,
         )
         get_zone(result.timezone)
         limit = 2000000000 if mode == 'local' else 50000000
@@ -203,7 +220,7 @@ class Settings:
             raise ValueError('TELEGRAM_MAX_BYTES exceeds configured API mode limit')
         if result.cache_max_bytes <= 0 or result.min_free_bytes < 0:
             raise ValueError('Invalid cache budget')
-        if result.enable_upload and (not result.token or (result.telegram_destination=='owner_private' and not result.effective_owner)):
+        if result.enable_upload and (not result.token or (not multi_channel and result.telegram_destination=='owner_private' and not result.effective_owner)):
             raise ValueError('ENABLE_UPLOAD needs bot credentials and a configured destination')
         return result
 
@@ -445,6 +462,16 @@ class Archive:
         self.conn = sqlite3.connect(self._database_path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA journal_mode=WAL')
+        existing_camera_columns = {row[1] for row in self.conn.execute('PRAGMA table_info(cameras)')}
+        if existing_camera_columns and 'channel_chat_id' not in existing_camera_columns:
+            # Consistent pre-migration snapshot; never copy a live WAL DB file.
+            backups = self._state_root / 'migration-backups'
+            if _is_link(backups):raise ValueError('Migration backup directory must not be a link')
+            backups.mkdir(exist_ok=True)
+            target = _confined_path(backups / ('multi-channel-' + uuid.uuid4().hex + '.db'), self._state_root, allow_missing=True)
+            with closing(sqlite3.connect(target)) as destination:
+                self.conn.backup(destination)
+            os.chmod(target, 0o600)
         self.conn.executescript('''
             CREATE TABLE IF NOT EXISTS recordings (
                 key TEXT PRIMARY KEY, camera TEXT NOT NULL, record_id TEXT NOT NULL,
@@ -478,7 +505,8 @@ class Archive:
                                ('media_container', 'TEXT'), ('media_probe_status', 'TEXT'),
                                ('media_extension', 'TEXT'),
                                ('storage_kind', "TEXT NOT NULL DEFAULT 'owner_private'"),
-                               ('storage_chat_id', 'INTEGER'), ('storage_message_id', 'INTEGER')):
+                               ('storage_chat_id', 'INTEGER'), ('storage_message_id', 'INTEGER'),
+                               ('upload_target_chat_id', 'INTEGER')):
                 if name not in columns:
                     self.conn.execute(f'ALTER TABLE recordings ADD COLUMN {name} {kind}')
             camera_columns = {row[1] for row in self.conn.execute('PRAGMA table_info(cameras)')}
@@ -487,7 +515,11 @@ class Archive:
                                ('sd_username',"TEXT NOT NULL DEFAULT 'admin'"),
                                ('sd_channel','INTEGER NOT NULL DEFAULT 1'),
                                ('sd_timezone',"TEXT NOT NULL DEFAULT 'Asia/Ho_Chi_Minh'"),
-                               ('sd_lookback_hours','INTEGER NOT NULL DEFAULT 168')):
+                               ('sd_lookback_hours','INTEGER NOT NULL DEFAULT 168'),
+                               ('channel_chat_id','INTEGER'),
+                               ('channel_enabled','INTEGER NOT NULL DEFAULT 1'),
+                               ('channel_status',"TEXT NOT NULL DEFAULT 'unconfigured'"),
+                               ('channel_error','TEXT')):
                 if name not in camera_columns:
                     self.conn.execute(f'ALTER TABLE cameras ADD COLUMN {name} {kind}')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS recording_audit (
@@ -502,6 +534,10 @@ class Archive:
                 ON recordings(camera,status,deleted_at,retry_at,media_expired_at)''')
             self.conn.execute('''CREATE INDEX IF NOT EXISTS by_error_expiry
                 ON recordings(status,media_expired_at,error_started_at)''')
+            self.conn.execute('''CREATE UNIQUE INDEX IF NOT EXISTS unique_camera_channel
+                ON cameras(channel_chat_id) WHERE channel_chat_id IS NOT NULL''')
+            self.conn.execute('''CREATE INDEX IF NOT EXISTS by_channel_recording
+                ON recordings(camera,storage_chat_id,status,deleted_at,start_ms,end_ms)''')
             # Historical errors have no reliable first-failure timestamp.
             # Give them the full retention window from this upgrade, once.
             self.conn.execute("""UPDATE recordings SET error_started_at=?
@@ -519,6 +555,8 @@ class Archive:
             # clock at the first migration rather than deleting them early.
             self.conn.execute("INSERT OR IGNORE INTO state(name,value) VALUES('cleanup_legacy_hold_since',?)", (str(time.time()),))
             self.conn.execute("INSERT OR IGNORE INTO state(name,value) VALUES('archive_tenant_id',?)", (settings.tenant_id,))
+            if settings.multi_channel_routing:
+                self.conn.execute("INSERT OR REPLACE INTO state(name,value) VALUES('multi_channel_history','1')")
             if self.conn.execute("SELECT value FROM state WHERE name='archive_tenant_id'").fetchone()[0] != settings.tenant_id:
                 raise ValueError('Archive database belongs to a different tenant')
             self.conn.execute('''INSERT OR IGNORE INTO cameras(id,name,created_at)
@@ -528,6 +566,10 @@ class Archive:
             self.conn.rollback()
             self.conn.close()
             raise
+        self.channel_index = None
+        if settings.multi_channel_routing and settings.channel_index_enabled:
+            from .channel_index import ChannelIndex
+            self.channel_index = ChannelIndex(self, None)  # Schema only; no requests.
 
     def close(self):
         self.conn.close()
@@ -535,7 +577,8 @@ class Archive:
     @staticmethod
     def _camera_fields(data, partial=False):
         allowed={'id','name','model','host','device_port','rtsp_port','http_port','enabled','upload_enabled',
-                 'sd_backend','sd_username','sd_channel','sd_timezone','sd_lookback_hours','sd_password','sd_password_clear'}
+                 'sd_backend','sd_username','sd_channel','sd_timezone','sd_lookback_hours','sd_password','sd_password_clear',
+                 'channel_chat_id','channel_enabled'}
         if not isinstance(data,dict) or set(data)-allowed:
             raise ValueError('Unknown camera fields')
         values=dict(data)
@@ -543,7 +586,15 @@ class Archive:
             values={'name':data.get('id',''),'model':'','host':'','device_port':8000,
                     'rtsp_port':554,'http_port':80,'enabled':True,'upload_enabled':True,
                     'sd_backend':'auto','sd_username':'admin','sd_channel':1,
-                    'sd_timezone':'Asia/Ho_Chi_Minh','sd_lookback_hours':168,**values}
+                    'sd_timezone':'Asia/Ho_Chi_Minh','sd_lookback_hours':168,
+                    'channel_chat_id':None,'channel_enabled':True,**values}
+        if 'channel_chat_id' in values:
+            value=values['channel_chat_id']
+            if value in (None, ''):value=None
+            elif isinstance(value,str) and re.fullmatch(r'-100[1-9][0-9]{0,12}',value.strip()):value=int(value.strip())
+            if value is not None and (type(value) is not int or not re.fullmatch(r'-100[1-9][0-9]{0,12}',str(value)) or abs(value)>2**52):
+                raise ValueError('Channel ID must be a private channel numeric ID (-100...)')
+            values['channel_chat_id']=value
         if 'id' in values and (not isinstance(values['id'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',values['id'])):
             raise ValueError('Camera ID must be a stable ASCII slug')
         for field,maximum in (('name',100),('model',100),('host',253),('sd_username',64)):
@@ -588,7 +639,7 @@ class Archive:
             if field in values:
                 port=values[field]
                 if type(port) is not int or not 1<=port<=65535:raise ValueError('Invalid camera port')
-        for field in ('enabled','upload_enabled'):
+        for field in ('enabled','upload_enabled','channel_enabled'):
             if field in values:
                 if type(values[field]) is not bool:raise ValueError(field+' must be boolean')
                 values[field]=int(values[field])
@@ -602,6 +653,11 @@ class Archive:
         results=[]
         for row in rows:
             item=dict(row);item['enabled']=bool(item['enabled']);item['upload_enabled']=bool(item['upload_enabled'])
+            item['channel_enabled']=bool(item['channel_enabled'])
+            item['channel_index_url']=None
+            if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='channel_index_messages'").fetchone():
+                index=self.conn.execute("SELECT tg_message_url FROM channel_index_messages WHERE camera_id=? AND channel_chat_id=? AND index_type='root' AND state='ready'",(item['id'],item['channel_chat_id'])).fetchone()
+                if index:item['channel_index_url']=index[0]
             item['probe']=json.loads(item.pop('probe_json')) if item['probe_json'] else None
             item.pop('probe_json',None)
             path=self._camera_password_path(item['id'])
@@ -660,7 +716,7 @@ class Archive:
                 self.conn.execute('INSERT INTO cameras('+','.join(values)+') VALUES('+','.join('?' for _ in values)+')',tuple(values.values()))
                 self._write_camera_password(values['id'],password,clear)
         except sqlite3.IntegrityError:
-            raise ValueError('Camera ID already exists') from None
+            raise ValueError('Camera ID or channel is already assigned') from None
         return next(c for c in self.cameras() if c['id']==values['id'])
 
     def update_camera(self,slug,data):
@@ -669,16 +725,56 @@ class Archive:
         if not values:raise ValueError('No changes provided')
         password=values.pop('sd_password',None);clear=values.pop('sd_password_clear',False)
         if set(values)&{'host','device_port','rtsp_port','http_port'}:values['probe_json']=None
+        if set(values)&{'channel_chat_id','channel_enabled'}:
+            values['channel_status']='unconfigured';values['channel_error']=None
         with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            if 'channel_chat_id' in values and self.conn.execute("SELECT 1 FROM recordings WHERE camera=? AND status='uploading' LIMIT 1",(slug,)).fetchone():
+                raise ValueError('Camera has an in-flight upload; wait before changing its channel')
             if values:
-                changed=self.conn.execute('UPDATE cameras SET '+','.join(k+'=?' for k in values)+' WHERE id=?',(*values.values(),slug)).rowcount
+                try:
+                    changed=self.conn.execute('UPDATE cameras SET '+','.join(k+'=?' for k in values)+' WHERE id=?',(*values.values(),slug)).rowcount
+                except sqlite3.IntegrityError:raise ValueError('Channel is already assigned to another camera') from None
             else:
-                self.conn.execute('BEGIN IMMEDIATE')
                 changed=self.conn.execute('SELECT 1 FROM cameras WHERE id=?',(slug,)).fetchone() is not None
             if not changed:raise KeyError('Unknown camera')
             self._write_camera_password(slug,password,clear)
+            if set(data)&{'name','channel_chat_id','channel_enabled'} and self.channel_index:
+                self.channel_index.enqueue_camera(slug,commit=False)
         if not changed:raise KeyError('Unknown camera')
         return next(c for c in self.cameras() if c['id']==slug)
+
+    def set_channel_status(self, slug, state, error_code=None, *, expected_channel=None):
+        if state not in ('ready','error','unconfigured','disabled'):
+            raise ValueError('Invalid channel state')
+        if error_code is not None and (not isinstance(error_code,str) or not re.fullmatch(r'[A-Za-z0-9_]{1,80}',error_code)):
+            raise ValueError('Invalid channel error code')
+        with self.conn:
+            sql='UPDATE cameras SET channel_status=?,channel_error=? WHERE id=?'
+            parameters=[state,error_code,slug]
+            if expected_channel is not None:sql+=' AND channel_chat_id=?';parameters.append(expected_channel)
+            changed=self.conn.execute(sql,parameters).rowcount
+            if not changed and expected_channel is None:
+                raise KeyError('Unknown camera')
+            return bool(changed)
+
+    def resolve_camera_channel(self, slug):
+        camera=self.conn.execute('SELECT * FROM cameras WHERE id=?',(slug,)).fetchone()
+        if camera is None:raise KeyError('Unknown camera')
+        channel=camera['channel_chat_id']
+        if not camera['enabled'] or not camera['channel_enabled'] or type(channel) is not int or not re.fullmatch(r'-100[1-9][0-9]*',str(channel)):
+            raise ValueError('Camera channel is not configured or enabled')
+        return channel
+
+    def pending_upload_cameras(self, camera=None):
+        if camera is not None and (not isinstance(camera,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',camera)):
+            raise ValueError('Invalid camera filter')
+        sql="""SELECT r.camera,MIN(r.start_ms) first_start FROM recordings r JOIN cameras c ON c.id=r.camera
+            WHERE r.status='downloaded' AND r.deleted_at IS NULL AND r.media_expired_at IS NULL
+            AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"""
+        parameters=[time.time()]
+        if camera is not None:sql+=' AND r.camera=?';parameters.append(camera)
+        return [r['camera'] for r in self.conn.execute(sql+' GROUP BY r.camera ORDER BY first_start,r.camera',parameters)]
 
     def probe_camera(self,slug):
         camera=next((c for c in self.cameras() if c['id']==slug),None)
@@ -833,6 +929,7 @@ class Archive:
                     self.conn.execute('UPDATE recordings SET deleted_at=?,deleted_by=? WHERE key=?', (now, actor, key))
                 self.conn.execute('INSERT INTO recording_audit(recording_key,actor,action,created_at) VALUES(?,?,?,?)',
                                   (key, actor, 'restore' if restore else 'delete', now))
+                if self.channel_index:self.channel_index.enqueue_recording(key,commit=False)
             self.conn.commit()
             return changed
         except Exception:
@@ -996,7 +1093,7 @@ class Archive:
         direction='ASC' if order=='asc' else 'DESC'
         return [dict(row) for row in self.conn.execute(sql + ' ORDER BY start_ms '+direction+',key '+direction, values)]
 
-    def claim_upload(self,camera=None):
+    def claim_upload(self,camera=None, *, channel_chat_id=None):
         if camera is not None and (not isinstance(camera,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',camera)):
             raise ValueError('Invalid camera filter')
         self.conn.execute('BEGIN IMMEDIATE')
@@ -1004,12 +1101,14 @@ class Archive:
             sql="SELECT r.* FROM recordings r JOIN cameras c ON c.id=r.camera WHERE r.status='downloaded' AND r.media_expired_at IS NULL AND r.deleted_at IS NULL AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"
             params=[time.time()]
             if camera is not None:sql+=' AND r.camera=?';params.append(camera)
+            if channel_chat_id is not None:
+                sql+=' AND c.channel_chat_id=? AND c.channel_enabled=1';params.append(channel_chat_id)
             row = self.conn.execute(sql+' ORDER BY r.start_ms,r.key LIMIT 1',params).fetchone()
             if row is None:
                 self.conn.commit()
                 return None
             attempt = hashlib.sha256(os.urandom(32)).hexdigest()
-            self.conn.execute("UPDATE recordings SET status='uploading',attempt_id=? WHERE key=?", (attempt,row['key']))
+            self.conn.execute("UPDATE recordings SET status='uploading',attempt_id=?,upload_target_chat_id=? WHERE key=?", (attempt,channel_chat_id,row['key']))
             self.conn.commit()
             return dict(self.conn.execute('SELECT * FROM recordings WHERE key=?', (row['key'],)).fetchone())
         except Exception:
@@ -1046,6 +1145,10 @@ class Archive:
                 storage_kind=?,storage_chat_id=?,storage_message_id=? WHERE key=?""",
                 (str(chat_id),int(message_id),file_id,file_unique_id,media_type,bot_id,time.time(),
                  placement,source_chat,source_message,key)).rowcount
+            if changed and self.channel_index and placement=='channel':
+                # Durable outbox and placement commit together. A crashed index
+                # worker cannot force this media upload to be sent again.
+                self.channel_index.enqueue_recording(key,commit=False)
         if not changed:
             raise ValueError('Unknown record key')
 
@@ -1368,8 +1471,10 @@ class Archive:
                 'sd_adapter':'hcnetsdk-or-isapi+exported-file-ingest', 'sd_auto_download':'per_camera_configured',
                 'sd_sources':camera_sources,
                 'upload_enabled':self.settings.enable_upload, 'timezone':self.settings.timezone,
+                'multi_channel_routing':self.settings.multi_channel_routing,
+                'channel_index_enabled':self.settings.channel_index_enabled,
                 'tenant_id':self.settings.tenant_id,
-                'telegram_destination':'channel' if self.settings.telegram_destination=='channel' or self.settings.storage_channel_id else 'owner_private_chat',
+                'telegram_destination':'camera_channels' if self.settings.multi_channel_routing else ('channel' if self.settings.telegram_destination=='channel' or self.settings.storage_channel_id else 'owner_private_chat'),
                 'storage_channel_configured':bool(self.settings.storage_channel_id),
                 'media_mode':self.settings.media_mode,
                 'owner_configured':bool(self.settings.effective_owner),

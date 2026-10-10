@@ -21,6 +21,8 @@ for service in ('archive', 'dashboard'):
     assert settings['MEDIA_MODE']=='remux_copy' and settings['CACHE_RETENTION_HOURS']=='0'
     assert settings['ERROR_RETENTION_HOURS']=='72'
     assert settings['SD_SYNC_INTERVAL_SECONDS']=='900'
+    assert settings['MULTI_CHANNEL_ROUTING']=='false' and settings['CHANNEL_INDEX_ENABLED']=='true'
+    assert settings['CHANNEL_INDEX_DEBOUNCE_SECONDS']=='60'
     assert settings['TELEGRAM_API_MODE'] == 'cloud'
     assert settings['TELEGRAM_UPLOAD_TRANSPORT'] == 'multipart'
     assert settings['TELEGRAM_LOCAL_UPLOAD_ROOT'] == ''
@@ -31,6 +33,10 @@ assert cloud['services']['dashboard']['environment']['DASHBOARD_COOKIE_SECURE']=
 _,custom=render(values={'DASHBOARD_BIND_IP':'127.0.0.1','DASHBOARD_PORT':'8090'})
 assert custom['services']['dashboard']['ports'][0]['host_ip']=='127.0.0.1'
 assert custom['services']['dashboard']['ports'][0]['published']=='8090'
+_,multi=render(values={'MULTI_CHANNEL_ROUTING':'true','CHANNEL_INDEX_DEBOUNCE_SECONDS':'90'})
+for service in ('archive','dashboard'):
+    assert multi['services'][service]['environment']['MULTI_CHANNEL_ROUTING']=='true'
+    assert multi['services'][service]['environment']['CHANNEL_INDEX_DEBOUNCE_SECONDS']=='90'
 assert render(local=True)[0].returncode != 0, 'Production must require explicit credentials'
 # Base/cloud Compose must not expose the archive cache to the Bot API, even
 # when its dormant local-api service is explicitly included for rendering.
