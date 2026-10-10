@@ -517,6 +517,7 @@ class Archive:
                                ('sd_timezone',"TEXT NOT NULL DEFAULT 'Asia/Ho_Chi_Minh'"),
                                ('sd_lookback_hours','INTEGER NOT NULL DEFAULT 168'),
                                ('channel_chat_id','INTEGER'),
+                               ('channel_name',"TEXT NOT NULL DEFAULT ''"),
                                ('channel_enabled','INTEGER NOT NULL DEFAULT 1'),
                                ('channel_status',"TEXT NOT NULL DEFAULT 'unconfigured'"),
                                ('channel_error','TEXT')):
@@ -578,7 +579,7 @@ class Archive:
     def _camera_fields(data, partial=False):
         allowed={'id','name','model','host','device_port','rtsp_port','http_port','enabled','upload_enabled',
                  'sd_backend','sd_username','sd_channel','sd_timezone','sd_lookback_hours','sd_password','sd_password_clear',
-                 'channel_chat_id','channel_enabled'}
+                 'channel_chat_id','channel_name','channel_enabled'}
         if not isinstance(data,dict) or set(data)-allowed:
             raise ValueError('Unknown camera fields')
         values=dict(data)
@@ -587,7 +588,7 @@ class Archive:
                     'rtsp_port':554,'http_port':80,'enabled':True,'upload_enabled':True,
                     'sd_backend':'auto','sd_username':'admin','sd_channel':1,
                     'sd_timezone':'Asia/Ho_Chi_Minh','sd_lookback_hours':168,
-                    'channel_chat_id':None,'channel_enabled':True,**values}
+                    'channel_chat_id':None,'channel_name':'','channel_enabled':True,**values}
         if 'channel_chat_id' in values:
             value=values['channel_chat_id']
             if value in (None, ''):value=None
@@ -595,6 +596,13 @@ class Archive:
             if value is not None and (type(value) is not int or not re.fullmatch(r'-100[1-9][0-9]{0,12}',str(value)) or abs(value)>2**52):
                 raise ValueError('Channel ID must be a private channel numeric ID (-100...)')
             values['channel_chat_id']=value
+        if 'channel_name' in values:
+            value=values['channel_name']
+            if not isinstance(value,str) or any(ord(c)<32 or 127<=ord(c)<=159 or 0xd800<=ord(c)<=0xdfff for c in value):
+                raise ValueError('Invalid channel display name')
+            value=value.strip()
+            if len(value)>128:raise ValueError('Channel display name exceeds 128 characters')
+            values['channel_name']=value
         if 'id' in values and (not isinstance(values['id'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',values['id'])):
             raise ValueError('Camera ID must be a stable ASCII slug')
         for field,maximum in (('name',100),('model',100),('host',253),('sd_username',64)):
@@ -709,6 +717,8 @@ class Archive:
     def add_camera(self,data):
         values=self._camera_fields(data)
         if not values.get('id'):raise ValueError('Camera ID is required')
+        if values['channel_name'] and values['channel_chat_id'] is None:
+            raise ValueError('Channel display name requires a channel ID')
         values['created_at']=time.time()
         password=values.pop('sd_password',None);clear=values.pop('sd_password_clear',False)
         try:
@@ -729,6 +739,14 @@ class Archive:
             values['channel_status']='unconfigured';values['channel_error']=None
         with self.conn:
             self.conn.execute('BEGIN IMMEDIATE')
+            current=self.conn.execute('SELECT channel_chat_id FROM cameras WHERE id=?',(slug,)).fetchone()
+            if current is None:raise KeyError('Unknown camera')
+            channel=values.get('channel_chat_id',current['channel_chat_id'])
+            # A local label belongs to this binding, never to its next target.
+            if channel!=current['channel_chat_id'] and 'channel_name' not in values:
+                values['channel_name']=''
+            if values.get('channel_name') and channel is None:
+                raise ValueError('Channel display name requires a channel ID')
             if 'channel_chat_id' in values and self.conn.execute("SELECT 1 FROM recordings WHERE camera=? AND status='uploading' LIMIT 1",(slug,)).fetchone():
                 raise ValueError('Camera has an in-flight upload; wait before changing its channel')
             if values:

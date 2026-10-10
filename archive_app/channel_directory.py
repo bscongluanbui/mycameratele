@@ -67,11 +67,15 @@ class ChannelDirectory:
         return False
 
     def list(self):
-        bound={r['channel_chat_id']:r['id'] for r in self.conn.execute('SELECT id,channel_chat_id FROM cameras WHERE channel_chat_id IS NOT NULL')}
-        return [dict(chat_id=r['chat_id'],name=r['title'],title=r['title'],private=bool(r['private']),
+        bound={r['channel_chat_id']:r for r in self.conn.execute('SELECT id,channel_chat_id,channel_name FROM cameras WHERE channel_chat_id IS NOT NULL')}
+        channels=[]
+        for r in self.conn.execute('SELECT * FROM telegram_channels WHERE bot_key=?',(self.bot_key,)):
+            camera=bound.get(r['chat_id'])
+            alias=camera['channel_name'] if camera is not None else ''
+            channels.append(dict(chat_id=r['chat_id'],name=alias or r['title'],title=r['title'],channel_name=alias,private=bool(r['private']),
                      ready=r['status']=='ready',status=r['status'],error=r['error'],
-                     bound_camera_id=bound.get(r['chat_id']),checked_at=r['checked_at'])
-                for r in self.conn.execute('SELECT * FROM telegram_channels WHERE bot_key=? ORDER BY title COLLATE NOCASE,chat_id LIMIT 500',(self.bot_key,))]
+                     bound_camera_id=camera['id'] if camera is not None else None,checked_at=r['checked_at']))
+        return sorted(channels,key=lambda channel:(channel['name'].casefold(),channel['chat_id']))[:500]
 
     def refresh(self, telegram):
         from .telegram import ApiRejected

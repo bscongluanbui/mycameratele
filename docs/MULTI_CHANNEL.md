@@ -12,8 +12,22 @@ lập mục lục. Cache thành công xóa sau khi lưu xác nhận; file lỗi 
 2. Trong **Camera → Thêm camera / Chỉnh sửa → Gắn với channel**, chọn tên channel.
    Bấm **Làm mới channel** để cập nhật tên và quyền. Channel đã gắn với camera
    khác được đánh dấu và khóa chọn. Tên chỉ để hiển thị; chương trình lưu ID.
+   Nếu nhập ID thủ công, mở **Nhập Channel ID thủ công**, điền ID dạng `-100…`.
+   Ô **Tên channel hiển thị (tùy chọn)** cho phép đặt/sửa tên riêng, ví dụ
+   `Bama · Phòng ngủ`. Bấm **Lưu** để ghi tên; tên xuất hiện trên thẻ camera và
+   trong danh sách chọn channel, vẫn giữ sau khi làm mới hoặc khởi động lại.
+   Để trống tên sẽ dùng tên Telegram trong danh sách (hoặc ID nếu chưa biết tên).
+   Đây là tên trên dashboard, không đổi tên thật của channel trên Telegram và
+   không đổi ID/đích upload. Khi đổi hoặc bỏ ID, tên cũ được xóa trừ khi bạn
+   đồng thời nhập tên mới cho ID mới. Mỗi camera lưu một ID riêng trên dashboard;
+   `TELEGRAM_STORAGE_CHANNEL_ID` trong `.env` chỉ nhận một ID kho chung cũ,
+   không nhận danh sách ID cách nhau bằng dấu phẩy.
 3. Bấm **Kiểm tra channel** trên thẻ camera. Chỉ ID đúng, channel private và bot
    có quyền mới có trạng thái sẵn sàng. Vẫn giữ chế độ thêm camera thủ công/quét LAN.
+   Camera tạm dừng hoặc tắt upload vẫn kiểm tra quyền channel được; kiểm tra
+   không tự bật camera/upload hoặc gửi video. Dashboard phân biệt sai ID,
+   channel public, bot chưa là admin, thiếu quyền đăng/sửa, giới hạn Telegram
+   và lỗi kết nối; không gom mọi lỗi thành thiếu quyền admin.
 4. Sau khi các camera đã được gắn channel, đặt trong `.env`:
 
    ```dotenv
@@ -88,7 +102,7 @@ không liên tục tạo bài mới. Bảng Telegram và kho video có trạng t
 ## Migration và rollback
 
 - Migration **chỉ thêm** các cột camera `channel_chat_id`, `channel_enabled`,
-  `channel_status`, `channel_error` và recording `upload_target_chat_id`; tái sử
+  `channel_status`, `channel_error`, `channel_name` và recording `upload_target_chat_id`; tái sử
   dụng `storage_chat_id/storage_message_id`, `bot_id`, stable key và timestamps.
 - Thêm catalog `telegram_channels`, bảng `channel_index_messages` và outbox mục
   lục. Unique channel binding ngăn hai camera dùng cùng channel trong một DB.

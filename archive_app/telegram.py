@@ -33,6 +33,18 @@ class ApiRejected(Exception):
         super().__init__('Telegram API rejected request')
 
 
+class ChannelCheckError(ValueError):
+    """A fixed diagnostic code, never Telegram response text or credentials."""
+    CODES=frozenset({'channel_invalid_id','channel_bot_identity_invalid',
+        'channel_identity_mismatch','channel_not_private','channel_bot_not_admin',
+        'channel_post_permission_missing','channel_edit_permission_missing',
+        'channel_disabled','channel_changed','channel_check_failed'})
+
+    def __init__(self, code):
+        self.code=code if isinstance(code,str) and code in self.CODES else 'channel_check_failed'
+        super().__init__(self.code)
+
+
 class Telegram:
     def __init__(self, settings):
         self.settings = settings
@@ -263,24 +275,31 @@ class Telegram:
 
     def verify_channel(self, archive, channel, *, require_index=True):
         """Validate a candidate private channel without binding a camera."""
-        if type(channel) is not int or not re.fullmatch(r'-100[1-9][0-9]*',str(channel)):
-            raise ValueError('A private channel ID (-100...) is required')
+        if (type(channel) is not int or not re.fullmatch(r'-100[1-9][0-9]{0,12}',str(channel))
+                or abs(channel)>2**52):
+            raise ChannelCheckError('channel_invalid_id')
         identity=(self.settings.tenant_id,channel,hashlib.sha256(self.settings.token.encode()).hexdigest(),require_index)
         cached=self._channel_verified.get(identity)
         if cached and cached[0]>time.time():return channel,cached[1]
         me=self.request('getMe',{})
         if not isinstance(me,dict) or type(me.get('id')) is not int or me['id']<=0 or me.get('is_bot') is not True:
-            raise ValueError('Bot identity was not confirmed')
+            raise ChannelCheckError('channel_bot_identity_invalid')
         chat=self.request('getChat',{'chat_id':channel})
-        if (not isinstance(chat,dict) or type(chat.get('id')) is not int or chat['id']!=channel or chat.get('type')!='channel'
-                or chat.get('username') or chat.get('active_usernames')):
-            raise ValueError('Private channel identity was not confirmed')
+        if not isinstance(chat,dict) or type(chat.get('id')) is not int or chat['id']!=channel or chat.get('type')!='channel':
+            raise ChannelCheckError('channel_identity_mismatch')
+        if chat.get('username') or chat.get('active_usernames'):
+            raise ChannelCheckError('channel_not_private')
         member=self.request('getChatMember',{'chat_id':channel,'user_id':me['id']})
         user=member.get('user',{}) if isinstance(member,dict) else {}
         if (not isinstance(member,dict) or not isinstance(user,dict) or user.get('is_bot') is not True
-                or type(user.get('id')) is not int or user['id']!=me['id'] or member.get('status')!='administrator'
-                or member.get('can_post_messages') is not True or (require_index and member.get('can_edit_messages') is not True)):
-            raise ValueError('Channel post/edit/pin rights were not confirmed')
+                or type(user.get('id')) is not int or user['id']!=me['id']):
+            raise ChannelCheckError('channel_bot_identity_invalid')
+        if member.get('status')!='administrator':
+            raise ChannelCheckError('channel_bot_not_admin')
+        if member.get('can_post_messages') is not True:
+            raise ChannelCheckError('channel_post_permission_missing')
+        if require_index and member.get('can_edit_messages') is not True:
+            raise ChannelCheckError('channel_edit_permission_missing')
         archive.state('telegram_bot_id',me['id'])
         from .channel_directory import ChannelDirectory
         ChannelDirectory(archive).remember(chat,status='ready')
@@ -290,17 +309,21 @@ class Telegram:
         return channel,me['id']
 
     def verify_camera_channel(self, archive, camera, *, require_index=True):
-        channel=None
-        previous=archive.conn.execute('SELECT channel_status FROM cameras WHERE id=?',(camera,)).fetchone()
+        # Permission verification is independent of camera sync/upload switches.
+        # Upload admission still uses resolve_camera_channel/pending/claim checks.
+        previous=archive.conn.execute('SELECT channel_status,channel_chat_id,channel_enabled FROM cameras WHERE id=?',(camera,)).fetchone()
+        if previous is None:raise KeyError('Unknown camera')
+        channel=previous['channel_chat_id']
         try:
-            channel=archive.resolve_camera_channel(camera)
+            if not previous['channel_enabled']:raise ChannelCheckError('channel_disabled')
             result=self.verify_channel(archive,channel,require_index=require_index)
         except Exception as error:
-            code='channel_rate_limited' if isinstance(error,ApiRejected) and error.code==429 else 'channel_check_failed'
+            code=('channel_rate_limited' if isinstance(error,ApiRejected) and error.code==429
+                  else error.code if isinstance(error,ChannelCheckError) else 'channel_check_failed')
             archive.set_channel_status(camera,'error',code,expected_channel=channel)
             raise
         if not archive.set_channel_status(camera,'ready',expected_channel=channel):
-            raise ValueError('Camera channel changed during verification')
+            raise ChannelCheckError('channel_changed')
         if previous and previous[0]!='ready' and archive.channel_index:
             archive.channel_index.enqueue_camera(camera)
         return result

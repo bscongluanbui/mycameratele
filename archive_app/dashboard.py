@@ -17,7 +17,7 @@ from .dashboard_auth import DashboardAuth
 from .discovery import DiscoveryManager
 from .network_routes import load_subnets
 from .sync import SyncQueue
-from .telegram import Telegram
+from .telegram import Telegram,ApiRejected,ChannelCheckError
 from .channel_directory import ChannelDirectory
 
 
@@ -178,14 +178,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
                          'code':'camera_channel_unconfigured','camera':camera})
         try:
             chat_id,_bot_id=Telegram(self.server.settings).verify_camera_channel(archive,slug,require_index=True)
-        except Exception:
+        except Exception as error:
             # SDK / HTTP errors may include URLs or tokens. Keep raw exceptions
             # out of both client replies and persisted camera metadata.
-            archive.set_channel_status(slug,'error','camera_channel_check_failed')
+            messages={
+                'channel_invalid_id':'Channel ID cần có dạng -100…',
+                'channel_bot_identity_invalid':'Kiểm tra token của bot đang cấu hình',
+                'channel_identity_mismatch':'Channel trả về không khớp ID đã gắn; kiểm tra lại Channel ID',
+                'channel_not_private':'Channel đang public; hãy dùng private channel để lưu video',
+                'channel_bot_not_admin':'Bot đang cấu hình chưa là admin của channel này',
+                'channel_post_permission_missing':'Bot thiếu quyền Post Messages (đăng bài)',
+                'channel_edit_permission_missing':'Bot thiếu quyền Edit Messages (sửa và ghim mục lục)',
+                'channel_disabled':'Bật channel riêng trước khi kiểm tra',
+                'channel_changed':'Channel đã thay đổi trong lúc kiểm tra; bấm kiểm tra lại',
+                'channel_check_failed':'Kiểm tra kết nối Telegram và Channel ID',
+                'channel_rate_limited':'Telegram yêu cầu chờ; thử kiểm tra lại sau',
+                'channel_bot_token_invalid':'Token bot không hợp lệ; kiểm tra cấu hình bot',
+                'channel_access_denied':'Bot chưa truy cập được channel; kiểm tra Channel ID và đúng bot admin',
+                'camera_channel_check_failed':'Kiểm tra kết nối Telegram, Channel ID và quyền đăng/sửa bài của bot',
+            }
+            code='camera_channel_check_failed'
+            if isinstance(error,ChannelCheckError) and error.code in messages:code=error.code
+            elif isinstance(error,ApiRejected):
+                code={429:'channel_rate_limited',401:'channel_bot_token_invalid',400:'channel_access_denied',403:'channel_access_denied'}.get(error.code,code)
+            if not archive.set_channel_status(slug,'error',code,expected_channel=camera['channel_chat_id']):code='channel_changed'
             camera=next(item for item in archive.cameras() if item['id']==slug)
-            return (409,{'error':'Kiểm tra Channel ID và quyền admin đăng, sửa, ghim bài của bot',
-                         'code':'camera_channel_check_failed','camera':camera})
-        archive.set_channel_status(slug,'ready')
+            return (409,{'error':messages[code],'code':code,'camera':camera})
+        if not archive.set_channel_status(slug,'ready',expected_channel=camera['channel_chat_id']):
+            camera=next(item for item in archive.cameras() if item['id']==slug)
+            return (409,{'error':'Channel đã thay đổi trong lúc kiểm tra; bấm kiểm tra lại','code':'channel_changed','camera':camera})
         camera=next(item for item in archive.cameras() if item['id']==slug)
         return (200,{'camera':camera,'channel_chat_id':chat_id,'ready':True})
 

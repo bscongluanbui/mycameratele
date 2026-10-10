@@ -93,6 +93,34 @@ class CameraChannelDashboardTests(unittest.TestCase):
         camera=self.camera();self.assertEqual(camera['channel_status'],'ready')
         self.assertTrue(camera['enabled']);self.assertTrue(camera['upload_enabled'])
 
+    def test_real_channel_check_succeeds_for_paused_camera_without_starting_upload(self):
+        from archive_app.telegram import Telegram
+        self.login();telegram=Telegram(self.settings)
+        telegram.request=Mock(side_effect=lambda method,data: {
+            'getMe':{'id':991,'is_bot':True},
+            'getChat':{'id':-1001234567890,'type':'channel','title':'Phòng ngủ'},
+            'getChatMember':{'user':{'id':991,'is_bot':True},'status':'administrator',
+                             'can_post_messages':True,'can_edit_messages':True},
+        }[method])
+        with patch('archive_app.dashboard.Telegram',return_value=telegram):
+            for upload_enabled in (False,True):
+                with self.subTest(upload_enabled=upload_enabled):
+                    self.archive.update_camera('pn',{'enabled':False,'upload_enabled':upload_enabled,
+                                                     'channel_name':'PN · Nhà ba má'})
+                    telegram._channel_verified.clear();telegram.request.reset_mock()
+                    code,payload,_=self.request('POST','/api/cameras/pn/channel-check',{})
+                    self.assertEqual(code,200);self.assertTrue(payload['ready'])
+                    self.assertEqual(payload['channel_chat_id'],-1001234567890)
+                    camera=payload['camera'];self.assertFalse(camera['enabled'])
+                    self.assertEqual(camera['upload_enabled'],upload_enabled)
+                    self.assertEqual(camera['channel_status'],'ready');self.assertIsNone(camera['channel_error'])
+                    self.assertEqual(camera['channel_name'],'PN · Nhà ba má')
+                    self.assertEqual(camera['channel_chat_id'],-1001234567890)
+                    self.assertEqual([call.args[0] for call in telegram.request.call_args_list],
+                                     ['getMe','getChat','getChatMember'])
+                    self.assertFalse(self.camera()['enabled'])
+                    self.assertEqual(self.camera()['upload_enabled'],upload_enabled)
+
     def test_failed_verify_is_sanitized_and_persists_error_without_global_fallback(self):
         self.login();self.telegram.verify_camera_channel.side_effect=RuntimeError('synthetic-token /internal/secret')
         code,payload,_=self.request('POST','/api/cameras/pn/channel-check',{})
@@ -101,6 +129,79 @@ class CameraChannelDashboardTests(unittest.TestCase):
         camera=self.camera();self.assertEqual(camera['channel_status'],'error')
         self.assertEqual(camera['channel_error'],'camera_channel_check_failed')
         self.assertEqual(camera['channel_chat_id'],-1001234567890);self.assertTrue(camera['upload_enabled'])
+
+    def test_typed_channel_check_failure_returns_specific_safe_code_without_changing_switches(self):
+        from archive_app.telegram import ChannelCheckError
+        self.login();self.archive.update_camera('pn',{'enabled':False,'upload_enabled':False,
+                                                     'channel_name':'Phòng ngủ'})
+        known=('channel_invalid_id','channel_bot_identity_invalid','channel_identity_mismatch',
+               'channel_not_private','channel_bot_not_admin','channel_post_permission_missing',
+               'channel_edit_permission_missing','channel_disabled','channel_changed','channel_check_failed')
+        for expected in known:
+            with self.subTest(code=expected):
+                error=ChannelCheckError(expected)
+                error.args=('synthetic-private-token /internal/secret',)
+                self.telegram.verify_camera_channel.side_effect=error
+                code,payload,_=self.request('POST','/api/cameras/pn/channel-check',{})
+                self.assertEqual(code,409);self.assertEqual(payload['code'],expected)
+                self.assertTrue(payload['error'])
+                self.assertNotIn('synthetic-private-token',json.dumps(payload))
+                self.assertNotIn('/internal/secret',json.dumps(payload))
+                camera=self.camera();self.assertEqual(camera['channel_status'],'error')
+                self.assertEqual(camera['channel_error'],expected)
+                self.assertEqual(camera['channel_chat_id'],-1001234567890)
+                self.assertEqual(camera['channel_name'],'Phòng ngủ')
+                self.assertFalse(camera['enabled']);self.assertFalse(camera['upload_enabled'])
+
+    def test_forged_channel_check_code_is_not_exposed_or_persisted(self):
+        from archive_app.telegram import ChannelCheckError
+        self.login();error=ChannelCheckError('channel_check_failed')
+        error.code='synthetic-private-token /internal/secret'
+        self.telegram.verify_camera_channel.side_effect=error
+        code,payload,_=self.request('POST','/api/cameras/pn/channel-check',{})
+        self.assertEqual(code,409);self.assertEqual(payload['code'],'camera_channel_check_failed')
+        self.assertNotIn('synthetic-private-token',json.dumps(payload))
+        self.assertNotIn('/internal/secret',json.dumps(payload))
+        self.assertEqual(self.camera()['channel_error'],'camera_channel_check_failed')
+
+    def test_channel_api_rejections_return_specific_sanitized_diagnostics(self):
+        from archive_app.telegram import ApiRejected
+        self.login()
+        for api_code,expected in ((429,'channel_rate_limited'),(401,'channel_bot_token_invalid'),
+                                  (400,'channel_access_denied'),(403,'channel_access_denied'),
+                                  (500,'camera_channel_check_failed')):
+            with self.subTest(api_code=api_code):
+                self.telegram.verify_camera_channel.side_effect=ApiRejected(
+                    api_code,60,'synthetic-private-token /internal/secret')
+                code,payload,_=self.request('POST','/api/cameras/pn/channel-check',{})
+                self.assertEqual(code,409);self.assertEqual(payload['code'],expected)
+                self.assertNotIn('synthetic-private-token',json.dumps(payload))
+                self.assertNotIn('/internal/secret',json.dumps(payload))
+                self.assertEqual(self.camera()['channel_error'],expected)
+                self.assertTrue(self.camera()['enabled']);self.assertTrue(self.camera()['upload_enabled'])
+
+    def test_channel_check_failure_does_not_overwrite_concurrently_changed_binding(self):
+        from archive_app.telegram import ChannelCheckError
+        self.login()
+        def changed(archive,camera,**kwargs):
+            archive.update_camera(camera,{'channel_chat_id':-1002234567890})
+            raise ChannelCheckError('channel_changed')
+        self.telegram.verify_camera_channel.side_effect=changed
+        code,payload,_=self.request('POST','/api/cameras/pn/channel-check',{})
+        self.assertEqual(code,409);self.assertEqual(payload['code'],'channel_changed')
+        camera=self.camera();self.assertEqual(camera['channel_chat_id'],-1002234567890)
+        self.assertEqual(camera['channel_status'],'unconfigured');self.assertIsNone(camera['channel_error'])
+
+    def test_channel_check_success_does_not_mark_concurrently_changed_binding_ready(self):
+        self.login()
+        def changed(archive,camera,**kwargs):
+            archive.update_camera(camera,{'channel_chat_id':-1002234567890})
+            return -1001234567890,991
+        self.telegram.verify_camera_channel.side_effect=changed
+        code,payload,_=self.request('POST','/api/cameras/pn/channel-check',{})
+        self.assertEqual(code,409);self.assertEqual(payload['code'],'channel_changed')
+        camera=self.camera();self.assertEqual(camera['channel_chat_id'],-1002234567890)
+        self.assertEqual(camera['channel_status'],'unconfigured');self.assertIsNone(camera['channel_error'])
 
     def test_missing_mapping_or_disabled_channel_does_not_call_telegram(self):
         self.login()
@@ -133,6 +234,122 @@ class CameraChannelDashboardTests(unittest.TestCase):
         self.assertFalse(payload['channel_enabled'])
         for field in ('id','name','host','upload_enabled','enabled','sd_password_configured','sd_backend'):
             self.assertEqual(payload[field],before[field])
+
+    def test_add_camera_accepts_trimmed_unicode_channel_display_name(self):
+        self.login();code,payload,_=self.request('POST','/api/cameras',{
+            'id':'door','name':'Cửa','host':'192.168.55.3','enabled':False,
+            'channel_chat_id':'-1002234567890','channel_name':'  Nhà ba má · Cửa trước 🎥  '})
+        self.assertEqual(code,201);self.assertEqual(payload['channel_name'],'Nhà ba má · Cửa trước 🎥')
+        self.assertEqual(payload['channel_chat_id'],-1002234567890)
+        self.assertEqual(payload['channel_status'],'unconfigured');self.assertFalse(payload['enabled'])
+        self.assertTrue(payload['upload_enabled']);self.telegram.verify_camera_channel.assert_not_called()
+        code,payload,_=self.request('GET','/api/cameras')
+        self.assertEqual(code,200)
+        self.assertEqual(next(item for item in payload['cameras'] if item['id']=='door')['channel_name'],
+                         'Nhà ba má · Cửa trước 🎥')
+
+    def test_alias_only_edit_preserves_ready_mapping_upload_and_device_settings(self):
+        self.login();self.archive.update_camera('pn',{'upload_enabled':False})
+        self.archive.set_channel_status('pn','ready');before=self.camera()
+        code,payload,_=self.request('PATCH','/api/cameras/pn',{'channel_name':'  Phòng ngủ · bama  '})
+        self.assertEqual(code,200);self.assertEqual(payload['channel_name'],'Phòng ngủ · bama')
+        for field in ('id','name','host','device_port','http_port','rtsp_port','enabled','upload_enabled',
+                      'sd_backend','sd_username','sd_channel','sd_timezone','sd_lookback_hours',
+                      'sd_password_configured','channel_chat_id','channel_enabled','channel_status','channel_error'):
+            self.assertEqual(payload[field],before[field],field)
+        self.assertEqual(self.camera()['channel_name'],'Phòng ngủ · bama')
+        self.assertEqual(self.telegram.method_calls,[])
+        self.directory.refresh.assert_not_called()
+
+    def test_channel_display_name_empty_or_unicode_spaces_clear_alias(self):
+        self.login();self.archive.set_channel_status('pn','ready')
+        for empty in ('','  ','\u2003\u00a0'):
+            with self.subTest(empty=repr(empty)):
+                self.archive.update_camera('pn',{'channel_name':'Tên hiển thị'})
+                code,payload,_=self.request('PATCH','/api/cameras/pn',{'channel_name':empty})
+                self.assertEqual(code,200);self.assertEqual(payload['channel_name'],'')
+                self.assertEqual(payload['channel_status'],'ready')
+                self.assertEqual(payload['channel_chat_id'],-1001234567890)
+        self.assertEqual(self.telegram.method_calls,[])
+
+    def test_channel_display_name_accepts_128_unicode_characters_after_trimming(self):
+        self.login();alias='🎥'*128
+        code,payload,_=self.request('PATCH','/api/cameras/pn',{'channel_name':'  '+alias+'  '})
+        self.assertEqual(code,200);self.assertEqual(payload['channel_name'],alias)
+        self.assertEqual(self.camera()['channel_name'],alias)
+
+    def test_invalid_channel_display_names_rejected_without_changing_camera(self):
+        self.login();self.archive.update_camera('pn',{'channel_name':'Tên đang dùng'})
+        self.archive.set_channel_status('pn','ready');before=self.camera()
+        invalid=(None,123,True,[],{},'x'*129,'Nhà\nPN','Nhà\rPN','Nhà\tPN','Nhà\x00PN',
+                 'Nhà\x7fPN','Nhà\x85PN')
+        for alias in invalid:
+            with self.subTest(alias=repr(alias)):
+                self.assertEqual(self.request('PATCH','/api/cameras/pn',{'channel_name':alias})[0],400)
+                self.assertEqual(self.request('POST','/api/cameras',{
+                    'id':'invalid_alias','host':'192.168.55.4','channel_chat_id':-1003234567890,
+                    'channel_name':alias})[0],400)
+                after=self.camera()
+                for field in ('channel_name','channel_chat_id','channel_status','channel_enabled','upload_enabled'):
+                    self.assertEqual(after[field],before[field],field)
+        self.assertFalse(any(camera['id']=='invalid_alias' for camera in self.archive.cameras()))
+        self.assertEqual(self.telegram.method_calls,[])
+
+    def test_channel_display_name_requires_mapping_on_create_and_edit(self):
+        self.login()
+        self.assertEqual(self.request('POST','/api/cameras',{
+            'id':'door','host':'192.168.55.3','channel_name':'Cửa trước'})[0],400)
+        self.assertFalse(any(camera['id']=='door' for camera in self.archive.cameras()))
+        self.archive.update_camera('pn',{'channel_chat_id':None})
+        self.assertEqual(self.request('PATCH','/api/cameras/pn',{'channel_name':'Phòng ngủ'})[0],400)
+        self.assertEqual(self.camera()['channel_name'],'');self.assertIsNone(self.camera()['channel_chat_id'])
+        self.assertEqual(self.request('PATCH','/api/cameras/pn',{'channel_name':''})[0],200)
+        self.assertEqual(self.telegram.method_calls,[])
+
+    def test_channel_display_name_edit_requires_login_and_password_change(self):
+        data={'channel_name':'Phòng ngủ'}
+        self.assertEqual(self.request('PATCH','/api/cameras/pn',data)[0],401)
+        self.login(False)
+        self.assertEqual(self.request('PATCH','/api/cameras/pn',data)[0],409)
+        self.assertEqual(self.camera()['channel_name'],'');self.assertEqual(self.telegram.method_calls,[])
+
+    def test_channel_display_name_edit_enforces_csrf_and_origin(self):
+        self.login();data={'channel_name':'Phòng ngủ'}
+        self.assertEqual(self.request('PATCH','/api/cameras/pn',data,{'X-CSRF-Token':'wrong'})[0],403)
+        self.assertEqual(self.request('PATCH','/api/cameras/pn',data,{'Origin':'https://unrelated.invalid'})[0],403)
+        self.assertEqual(self.camera()['channel_name'],'');self.assertEqual(self.telegram.method_calls,[])
+        self.assertEqual(self.request('PATCH','/api/cameras/pn',data)[0],200)
+
+    def test_real_channel_catalog_keeps_local_name_when_telegram_title_changes(self):
+        from archive_app.channel_directory import ChannelDirectory
+        self.patch_directory.stop();self.login()
+        directory=ChannelDirectory(self.archive)
+        directory.remember({'id':-1001234567890,'type':'channel','title':'Tên trên Telegram'},status='ready')
+        self.assertEqual(self.request('PATCH','/api/cameras/pn',{'channel_name':'PN · Nhà ba má'})[0],200)
+        code,payload,_=self.request('GET','/api/telegram/channels')
+        self.assertEqual(code,200);channel=payload['channels'][0]
+        self.assertEqual(channel['name'],'PN · Nhà ba má');self.assertEqual(channel['channel_name'],'PN · Nhà ba má')
+        self.assertEqual(channel['title'],'Tên trên Telegram');self.assertTrue(channel['ready'])
+        directory.remember({'id':-1001234567890,'type':'channel','title':'Tên Telegram cập nhật'})
+        code,payload,_=self.request('GET','/api/telegram/channels')
+        self.assertEqual(code,200);channel=payload['channels'][0]
+        self.assertEqual(channel['name'],'PN · Nhà ba má');self.assertEqual(channel['title'],'Tên Telegram cập nhật')
+        self.assertEqual(channel['bound_camera_id'],'pn');self.assertTrue(channel['ready'])
+        self.assertEqual(self.request('PATCH','/api/cameras/pn',{'channel_name':''})[0],200)
+        code,payload,_=self.request('GET','/api/telegram/channels')
+        self.assertEqual(code,200);channel=payload['channels'][0]
+        self.assertEqual(channel['name'],'Tên Telegram cập nhật');self.assertEqual(channel['channel_name'],'')
+        self.assertEqual(self.telegram.method_calls,[])
+
+    def test_manual_channel_alias_visible_before_telegram_discovery(self):
+        self.patch_directory.stop();self.login()
+        self.assertEqual(self.request('PATCH','/api/cameras/pn',{'channel_name':'Channel gán thủ công'})[0],200)
+        code,payload,_=self.request('GET','/api/telegram/channels')
+        self.assertEqual(code,200);channel=payload['channels'][0]
+        self.assertEqual(channel['name'],'Channel gán thủ công')
+        self.assertEqual(channel['title'],'-1001234567890')
+        self.assertEqual(channel['chat_id'],-1001234567890);self.assertEqual(channel['bound_camera_id'],'pn')
+        self.assertEqual(self.telegram.method_calls,[])
 
     def test_unique_channel_mapping_rejected_on_add_and_edit(self):
         self.login();self.archive.add_camera({'id':'door','host':'192.168.55.3'})

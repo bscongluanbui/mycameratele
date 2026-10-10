@@ -11,13 +11,20 @@ equal(helpers.channelId(-1001234567890), -1001234567890);
 for (const value of ['@channel', 'https://t.me/c/1234567890/1', '-1234', '-1000', '-100123.4', '-1001e10', '-100123456789012345', {}, true]) { checks++; assert.throws(() => helpers.channelId(value)); }
 equal(helpers.channelState(null), ['Chưa gán channel', 'amber']);
 equal(helpers.channelState({channel_chat_id: -100123, channel_status: 'ready'}), ['Channel sẵn sàng', 'green']);
-equal(helpers.channelState({channel_chat_id: -100123, channel_status: 'error'}), ['Cần kiểm tra quyền bot', 'red']);
+equal(helpers.channelState({channel_chat_id: -100123, channel_status: 'error'}), ['Cần kiểm tra channel', 'red']);
+equal(helpers.channelState({channel_chat_id: -100123, channel_status: 'error', channel_error: 'channel_post_permission_missing'}), ['Thiếu quyền đăng bài', 'red']);
+equal(helpers.channelState({channel_chat_id: -100123, channel_status: 'error', channel_error: 'channel_edit_permission_missing'}), ['Thiếu quyền sửa bài', 'red']);
+equal(helpers.channelState({channel_chat_id: -100123, channel_status: 'error', channel_error: 'channel_rate_limited'}), ['Telegram yêu cầu chờ', 'red']);
+equal(helpers.channelState({channel_chat_id: -100123, channel_status: 'error', channel_error: 'channel_check_failed'}), ['Kiểm tra kết nối Telegram', 'red']);
 equal(helpers.channelState({channel_chat_id: -100123}), ['Chưa kiểm tra channel', 'amber']);
 equal(helpers.channelState({channel_chat_id: -100123, channel_enabled: false, channel_status: 'ready'}), ['Channel tạm dừng', 'neutral']);
 equal(helpers.channelIndexUrl('https://t.me/c/1234567890/34'), 'https://t.me/c/1234567890/34');
 for (const url of ['http://t.me/c/123/4', 'https://t.me.evil/c/123/4', 'https://x@t.me/c/123/4', 'https://t.me:8080/c/123/4', 'https://t.me/c/123/4?a=b', 'https://t.me/c/123/4#fragment', 'javascript:alert(1)', 'https://t.me/c/0/4', null]) equal(helpers.channelIndexUrl(url), null);
 equal(helpers.cameraPatch({channel_chat_id: null, channel_enabled: true}, {channel_chat_id: -1001234567890, channel_enabled: false}), {channel_chat_id: -1001234567890, channel_enabled: false});
 equal(helpers.cameraPatch({channel_chat_id: -1001234567890}, {channel_chat_id: null}), {channel_chat_id: null});
+equal(helpers.cameraPatch({channel_name: 'PN', channel_chat_id: -1001234567890}, {channel_name: 'Phòng ngủ', channel_chat_id: -1001234567890}), {channel_name: 'Phòng ngủ'});
+equal(helpers.cameraPatch({channel_name: 'PN'}, {channel_name: ''}), {channel_name: ''});
+equal(helpers.cameraPatch({channel_name: 'PN'}, {channel_name: 'PN'}), {});
 equal(helpers.formatBytes(null), "—");
 equal(helpers.formatBytes(undefined), "—");
 equal(helpers.formatBytes("n/a"), "—");
@@ -177,6 +184,9 @@ equal(source.includes('const {sd_password, ...metadata} = payload'), true);
 equal(markup.includes('id="camera-channel-select"'), true);
 equal(markup.includes('Gắn với channel'), true);
 equal(markup.includes('id="camera-channel-chat-id" name="channel_chat_id" type="text"'), true);
+equal(markup.includes('for="camera-channel-name"'), true);
+equal(markup.includes('id="camera-channel-name" name="channel_name" type="text" maxlength="128"'), true);
+equal(markup.includes('không đổi tên channel trên Telegram'), true);
 equal(markup.includes('id="camera-channel-directory-note" class="field-hint" role="status" aria-live="polite"'), true);
 equal(stylesheet.includes('.channel-manual>summary:focus-visible'), true);
 
@@ -201,6 +211,7 @@ class Element {
   showModal() { this.open = true; }
   close() { this.open = false; this.fire('close'); }
   reset() { this.resetCount = (this.resetCount || 0) + 1; }
+  reportValidity() { return true; }
   querySelectorAll(selector) {
     const matches = element => selector === 'details[data-sync-key]' ? element.tagName === 'DETAILS' && element.dataset.syncKey : selector === 'summary' ? element.tagName === 'SUMMARY' : selector === 'button' ? element.tagName === 'BUTTON' : false;
     return this.childNodes.flatMap(child => child instanceof Element ? [...(matches(child) ? [child] : []), ...child.querySelectorAll(selector)] : []);
@@ -219,7 +230,7 @@ const context = {document: documentStub, Node: Element, module: {exports: {}}, w
 vm.createContext(context);
 const bootLine = 'switchView(location.hash.slice(1), false); boot();';
 equal(source.includes(bootLine), true);
-vm.runInContext(source.replace(bootLine, 'globalThis.testUi = {state, renderCameras, renderSync, renderLogs, switchView, syncDisclosure, renderDiscoveryJob, renderDiscoveryResults, discoveryControls, closeDiscovery, resetDiscovery, openDiscovery, startDiscovery, pollDiscovery, cancelDiscovery, addDiscoveredCameras, renderChannelOptions, loadCameraChannels, checkCameraChannel};'), context);
+vm.runInContext(source.replace(bootLine, 'globalThis.testUi = {state, renderCameras, renderSync, renderLogs, switchView, syncDisclosure, renderDiscoveryJob, renderDiscoveryResults, discoveryControls, closeDiscovery, resetDiscovery, openDiscovery, startDiscovery, pollDiscovery, cancelDiscovery, addDiscoveredCameras, renderChannelOptions, loadCameraChannels, checkCameraChannel, openCameraForm, saveCamera, changeChannelSelection};'), context);
 const ui = context.testUi;
 ui.state.cameras = [{id: 'pn', name: 'PN', enabled: true, host: '192.168.1.2'}, {id: 'door', name: 'Cửa trước', enabled: true}];
 const job = {id: 'job-1', camera_id: 'pn', camera_name: 'PN', state: 'running', phase: 'uploading', message: '<img src=x onerror=alert(1)>', code: 'fixture_code', source: 'dashboard', created_at: 100, started_at: 101, updated_at: 102, finished_at: null, statistics: {sd_searched: 27, sd_downloaded: 27, uploaded: 16, failed: 0, remuxed: 20, sd_error_code: 'fixture_error'}};
@@ -294,6 +305,16 @@ equal(elements.get('camera-channel-select').value, '');
 equal(elements.get('camera-channel-select').childNodes[0].value, '');
 elements.get('camera-channel-select').value = '-1003234567890'; elements.get('camera-channel-select').fire('change');
 equal(elements.get('camera-channel-chat-id').value, '-1003234567890');
+// Manual names are text, preview in the picker, and never follow a changed ID.
+elements.get('camera-channel-name').value = '<img src=x onerror=alert(1)>'; elements.get('camera-channel-name').fire('input');
+equal(elements.get('camera-channel-select').childNodes[1].textContent, '<img src=x onerror=alert(1)>');
+equal(elements.get('camera-channel-select').childNodes[1].rawHtml, undefined);
+elements.get('camera-channel-chat-id').value = '-1005234567890'; elements.get('camera-channel-chat-id').fire('input');
+equal(elements.get('camera-channel-name').value, '');
+elements.get('camera-channel-name').value = 'Camera phòng khách'; elements.get('camera-channel-name').fire('input');
+equal(elements.get('camera-channel-select').childNodes[1].textContent, 'Camera phòng khách');
+elements.get('camera-channel-chat-id').value = ''; elements.get('camera-channel-chat-id').fire('input');
+equal(elements.get('camera-channel-name').value, '');
 ui.state.status.multi_channel_routing = true;
 ui.state.cameras = [{id: 'pn', name: 'PN', host: '192.168.1.2', channel_chat_id: -1001234567890, channel_status: 'ready', channel_index_url: 'https://t.me/c/1234567890/20'}, {id: 'door', name: 'Cửa trước', channel_enabled: true}];
 ui.renderCameras();
@@ -301,6 +322,9 @@ equal(elements.get('camera-grid').childNodes[0].textContent.includes('Channel s�
 equal(elements.get('camera-grid').childNodes[0].textContent.includes('Mở mục lục channel'), true);
 equal(elements.get('camera-grid').childNodes[1].textContent.includes('không gửi sang channel khác'), true);
 equal(elements.get('camera-grid').childNodes[1].querySelectorAll('button').find(control => control.dataset.cameraChannel === 'door').disabled, true);
+ui.state.cameras[0].channel_name = '<b>PN riêng</b>'; ui.renderCameras();
+equal(elements.get('camera-grid').childNodes[0].textContent.includes('<b>PN riêng</b>'), true);
+equal(elements.get('camera-grid').childNodes[0].textContent.includes('-1001234567890'), true);
 // Render scan results with untrusted labels as text and keep edits through polling.
 elements.get('discovery-dialog').open = true;
 ui.renderDiscoveryJob({id: 'scan-1', target: '192.168.31.0/24', state: 'running', total: 254, scanned: 80, results: [discoveryCamera, {host: '192.168.31.137', model: '<img src=x onerror=alert(1)>', vendor: 'fixture', confidence: 'identified', ports: [8000, 554]}]});
@@ -432,11 +456,15 @@ equal(ui.state.discovery.revision, discoveryRevision + 1);
   ui.state.authenticated = true; ui.state.csrf = 'fixture-csrf';
   ui.state.channelFormRevision = 1; elements.get('camera-dialog').open = true;
   elements.get('camera-channel-chat-id').value = '-1001234567890';
+  elements.get('camera-channel-name').value = 'Tên đang sửa chưa lưu';
   context.fetch = async (url, options) => { requests.push({url, ...options}); return {ok: true, status: 200, json: async () => ({channels: directory})}; };
   await ui.loadCameraChannels();
   equal(elements.get('camera-channel-select').value, '-1001234567890');
+  equal(elements.get('camera-channel-name').value, 'Tên đang sửa chưa lưu');
+  equal(elements.get('camera-channel-select').childNodes[1].textContent, 'Tên đang sửa chưa lưu');
   equal(elements.get('camera-channel-refresh').disabled, false);
   await ui.loadCameraChannels(true);
+  equal(elements.get('camera-channel-name').value, 'Tên đang sửa chưa lưu');
   const directoryRequest = requests.find(request => request.url === '/api/telegram/channels/refresh');
   equal(directoryRequest.method, 'POST'); equal(JSON.parse(directoryRequest.body), {}); equal(directoryRequest.headers['X-CSRF-Token'], 'fixture-csrf');
   const mappedCamera = {id: 'pn', name: 'PN', channel_chat_id: -1001234567890, channel_status: 'unconfigured', upload_enabled: true};
@@ -453,5 +481,49 @@ equal(ui.state.discovery.revision, discoveryRevision + 1);
   elements.get('camera-dialog').close();
   resolveLate({ok: true, status: 200, json: async () => ({channels: []})}); await lateDirectory;
   equal(ui.state.knownChannels, oldDirectory);
+  // Reopen/save round-trip: a name-only edit sends no destination/toggle changes.
+  const namedCamera = {id: 'pn', name: 'PN', model: 'CS-C6N', host: '192.168.5.10', enabled: false, upload_enabled: true,
+    device_port: 8000, rtsp_port: 554, http_port: 80, sd_backend: 'auto', sd_username: 'admin', sd_channel: 1,
+    sd_timezone: 'Asia/Ho_Chi_Minh', sd_lookback_hours: 168, channel_chat_id: -1001234567890, channel_name: 'Tên cũ', channel_enabled: true, channel_status: 'ready'};
+  ui.state.cameras = [namedCamera]; ui.state.view = 'cameras'; ui.state.accountRequired = false;
+  context.FormData = class { get(name) { return elements.get('camera-' + name.replaceAll('_', '-'))?.value || ''; } };
+  context.fetch = async (url, options) => {
+    requests.push({url, ...options}); let result;
+    if (url === '/api/telegram/channels') result = {channels: [{...directory[0], title: 'Tên Telegram', channel_name: namedCamera.channel_name, name: namedCamera.channel_name}]};
+    else if (url === '/api/cameras/pn' && options.method === 'PATCH') { Object.assign(namedCamera, JSON.parse(options.body)); result = namedCamera; }
+    else if (url === '/api/cameras') result = {cameras: [namedCamera]};
+    else if (url === '/api/status') result = {csrf_token: 'fixture-csrf', counts: {}, multi_channel_routing: true};
+    else if (url === '/api/sync?limit=100') result = {jobs: [], latest: {}, worker_alive: true};
+    else throw new Error('Unexpected alias fixture request: ' + url);
+    return {ok: true, status: 200, json: async () => result};
+  };
+  ui.openCameraForm(namedCamera); await ui.loadCameraChannels();
+  equal(elements.get('camera-channel-name').value, 'Tên cũ');
+  elements.get('camera-channel-name').value = '  Bama · Phòng ngủ  ';
+  await ui.saveCamera({preventDefault() {}});
+  const renameRequest = requests.filter(request => request.url === '/api/cameras/pn' && request.method === 'PATCH').at(-1);
+  equal(JSON.parse(renameRequest.body), {channel_name: 'Bama · Phòng ngủ'});
+  equal(renameRequest.headers['X-CSRF-Token'], 'fixture-csrf');
+  equal(namedCamera.channel_chat_id, -1001234567890); equal(namedCamera.channel_status, 'ready');
+  equal(elements.get('camera-dialog').open, false);
+  ui.openCameraForm(namedCamera); await ui.loadCameraChannels();
+  equal(elements.get('camera-channel-name').value, 'Bama · Phòng ngủ');
+  elements.get('camera-channel-name').value = ''; elements.get('camera-channel-name').fire('input');
+  equal(elements.get('camera-channel-select').childNodes[1].textContent, 'Tên Telegram');
+  await ui.saveCamera({preventDefault() {}});
+  equal(JSON.parse(requests.filter(request => request.url === '/api/cameras/pn' && request.method === 'PATCH').at(-1).body), {channel_name: ''});
+  ui.openCameraForm(namedCamera); await ui.loadCameraChannels();
+  const beforeInvalid = requests.length;
+  elements.get('camera-channel-name').value = 'bad\nname';
+  await ui.saveCamera({preventDefault() {}});
+  equal(requests.length, beforeInvalid); equal(elements.get('camera-channel-name').getAttribute('aria-invalid'), 'true');
+  elements.get('camera-channel-name').value = '📷'.repeat(129);
+  await ui.saveCamera({preventDefault() {}});
+  equal(requests.length, beforeInvalid);
+  elements.get('camera-channel-name').value = 'Tên cần ID'; elements.get('camera-channel-chat-id').value = '';
+  await ui.saveCamera({preventDefault() {}});
+  equal(requests.length, beforeInvalid); equal(elements.get('camera-channel-manual').open, true);
+  equal(documentStub.activeElement, elements.get('camera-channel-chat-id'));
+  elements.get('camera-dialog').close();
   console.log(`WEB_HELPERS: checks=${checks} passed=${checks} failed=0`);
 })().catch(error => { console.error(error); process.exitCode = 1; });
