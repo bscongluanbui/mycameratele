@@ -50,7 +50,10 @@ class ChannelIndex:
     rebuild(..., dry_run=True) is an offline plan; False only enqueues work.
     """
     LEASE_SECONDS = 600
-    MAX_ROOT_YEARS = 40
+    NAVIGATION_VERSION = 2
+    MAX_ROOT_YEARS = 12
+    MAX_ROOT_MONTHS = 12
+    MAX_ROOT_DAYS = 7
 
     def __init__(self, archive, telegram):
         self.archive, self.telegram = archive, telegram
@@ -58,6 +61,7 @@ class ChannelIndex:
         self.zone = get_zone(self.settings.timezone)
         self.owner = secrets.token_hex(16)
         self._job = None
+        self._next_navigation_check = 0
         # Additive tables only; old media references and old channel indexes
         # survive cutover. One active node per camera/target/type/period.
         statements = (
@@ -261,29 +265,98 @@ class ChannelIndex:
             return self._link('🤖 Bot quản lý', f'https://t.me/{username}')
         return None
 
+    def _recent_periods(self, camera, channel, kind, limit):
+        """Ready, nonempty periods only; the full history stays in the tree."""
+        rows = self.conn.execute('''SELECT period_key FROM channel_index_messages
+            WHERE camera_id=? AND channel_chat_id=? AND index_type=? AND state='ready'
+            AND tg_message_id BETWEEN 1 AND 2147483647 ORDER BY period_key DESC''',
+            (camera, channel, kind))
+        result = []
+        for row in rows:
+            if self._count(camera, channel, kind, row[0]):
+                result.append(row[0])
+                if len(result) == limit:
+                    break
+        return result
+
+    def refresh_navigation(self):
+        """Queue existing indexes once per upgrade/local day, including paused cameras.
+
+        This does not create empty days, send media, or turn upload on. Persisted
+        markers and the same transaction as enqueue prevent duplicate schedulers.
+        """
+        if not self.enabled:
+            return 0
+        now = time.time()
+        if now < self._next_navigation_check:
+            return 0
+        today = datetime.fromtimestamp(now, self.zone).date().toordinal()
+        self.conn.execute('BEGIN IMMEDIATE')
+        try:
+            markers = dict(self.conn.execute('''SELECT name,value FROM channel_index_runtime
+                WHERE name IN ('pin_navigation_version','pin_today_ordinal')'''))
+            queued = 0
+            if (markers.get('pin_navigation_version') != self.NAVIGATION_VERSION
+                    or markers.get('pin_today_ordinal') != today):
+                roots = self.conn.execute('''SELECT root.camera_id,root.channel_chat_id,
+                    MAX(day.period_key) AS recorded_date FROM channel_index_messages root
+                    JOIN cameras c ON c.id=root.camera_id AND c.channel_chat_id=root.channel_chat_id
+                    JOIN channel_index_messages day ON day.camera_id=root.camera_id
+                        AND day.channel_chat_id=root.channel_chat_id AND day.index_type='day'
+                        AND day.state='ready' AND day.tg_message_id BETWEEN 1 AND 2147483647
+                    WHERE root.index_type='root' AND root.state='ready' AND c.channel_enabled=1
+                        AND root.tg_message_id BETWEEN 1 AND 2147483647
+                    GROUP BY root.camera_id,root.channel_chat_id''').fetchall()
+                for row in roots:
+                    self._enqueue(row['camera_id'], row['channel_chat_id'], row['recorded_date'], immediate=True)
+                    queued += 1
+                for name, value in (('pin_navigation_version', self.NAVIGATION_VERSION), ('pin_today_ordinal', today)):
+                    self.conn.execute('''INSERT INTO channel_index_runtime(name,value) VALUES(?,?)
+                        ON CONFLICT(name) DO UPDATE SET value=excluded.value''', (name, value))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        self._next_navigation_check = now + 60
+        return queued
+
     def _render(self, camera, channel, kind, period):
         info = self._camera(camera)
         name = html.escape(str(info['name'])[:80])
-        identity = f'{html.escape(camera)} | {name}'
+        identity = name
         lines = []
         if kind == 'root':
-            lines = [f'📌 KHO VIDEO – {identity}', '', '📚 XEM THEO NĂM']
+            today = datetime.fromtimestamp(time.time(), self.zone).date()
+            lines = [f'📌 KHO VIDEO – {identity}', '', f'📅 HÔM NAY · {today:%d/%m/%Y}']
+            today_link = None
+            if self._count(camera, channel, 'day', today.isoformat()):
+                today_link = self._node_link(camera, channel, 'day', today.isoformat(),
+                    f'▶️ Hôm nay · {today:%d/%m/%Y}')
+            lines.append(today_link or 'Chưa có video')
+            lines.extend(('', '📚 XEM THEO NĂM'))
             years = list(self.conn.execute('''SELECT period_key FROM channel_index_messages
                 WHERE camera_id=? AND channel_chat_id=? AND index_type='year' AND state='ready'
                 ORDER BY period_key DESC''', (camera, channel)))
             active = [row[0] for row in years if self._count(camera, channel, 'year', row[0])]
-            for year in reversed(active[:self.MAX_ROOT_YEARS]):
+            for year in active[:self.MAX_ROOT_YEARS]:
                 link = self._node_link(camera, channel, 'year', year, f'📁 {year}')
                 if link:
                     lines.append(link)
             if len(active) > self.MAX_ROOT_YEARS:
                 lines.append(f'{len(active) - self.MAX_ROOT_YEARS} năm khác: tìm trong bot')
+            lines.extend(('', '📆 XEM THEO THÁNG'))
+            for month in self._recent_periods(camera, channel, 'month', self.MAX_ROOT_MONTHS):
+                parsed = date.fromisoformat(month + '-01')
+                lines.append(self._node_link(camera, channel, 'month', month, f'📆 {parsed:%m/%Y}'))
+            lines.append('Tháng cũ hơn: chọn năm ở trên')
+            lines.extend(('', '🗓 XEM THEO NGÀY'))
+            for day in self._recent_periods(camera, channel, 'day', self.MAX_ROOT_DAYS):
+                parsed = date.fromisoformat(day)
+                lines.append(self._node_link(camera, channel, 'day', day, f'🗓 {parsed:%d/%m/%Y}'))
+            lines.append('Ngày cũ hơn: chọn tháng ở trên')
             latest = self._records(camera, channel, descending=True, limit=1).fetchone()
             if latest:
-                day = from_epoch_ms(latest['start_ms'], self.zone).date()
-                link = self._node_link(camera, channel, 'day', day.isoformat(), f'📅 {day:%d/%m/%Y}')
-                if link:
-                    lines.extend(('', link))
+                lines.append('')
                 lines.append(self._link('🎬 Video mới nhất', channel_message_url(
                     latest['storage_chat_id'], latest['storage_message_id'])))
             else:
@@ -342,7 +415,8 @@ class ChannelIndex:
                 lines.append(link)
         result = '\n'.join(lines)
         # Telegram's limit counts UTF-16 code units. Do not truncate HTML or
-        # links: bounded identities, 40 years, 12 months, 31 days, 6 buckets.
+        # links: bounded identities, 12 root years/months, 7 root days,
+        # 12 year months, 31 month days, 6 day buckets.
         if len(result.encode('utf-16-le')) // 2 > 4096:
             raise _Blocked('render_limit')
         return result
@@ -535,6 +609,7 @@ class ChannelIndex:
         retry = self.conn.execute("SELECT value FROM channel_index_runtime WHERE name='retry_at'").fetchone()
         if retry and retry[0] > time.time():
             return 'rate_limited'
+        self.refresh_navigation()
         self.recover()
         job = self._claim()
         if not job:

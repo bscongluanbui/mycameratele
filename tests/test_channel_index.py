@@ -535,7 +535,7 @@ class ChannelIndexTests(unittest.TestCase):
                     VALUES(?,?,'year',?,?,'ready',?)''', ('CAM01', self.channel, str(year), year, self.now))
         text = self.index._render('CAM01', self.channel, 'root', 'root')
         self.assertLessEqual(len(text.encode('utf-16-le')) // 2, 4096)
-        self.assertIn('27 năm khác', text)
+        self.assertIn('55 năm khác', text)
         self.assertIn('&amp;', text)
 
     def test_timezone_is_recorded_local_date_and_no_upload_time_used(self):
