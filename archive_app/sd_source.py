@@ -856,6 +856,17 @@ class SDSource:
             raise SDSourceError('sd_cache_budget', 'Cache budget is too small for SD staging.')
         common = (address, username, password, channel, zone, max_bytes)
         if backend in ('auto', 'hcnetsdk'):
+            collector = getattr(self.archive.settings, 'sd_collector_url', '')
+            if collector:
+                from .sd_collector_client import SDCollectorSource
+                camera = {'id': self.camera_id, 'host': address,
+                          'device_port': config.get('device_port', 8000),
+                          'sd_username': username, 'sd_password': password,
+                          'sd_channel': channel,
+                          'sd_timezone': config.get('sd_timezone', config.get('timezone', self.archive.settings.timezone))}
+                return SDCollectorSource(collector, getattr(self.archive.settings, 'sd_collector_token', ''),
+                    camera, max_bytes, cache_dir=self.archive.settings.cache_dir,
+                    download_speed_kbps=getattr(self.archive.settings, 'sd_download_speed_kbps', 0))
             try:
                 return HCNetSDKSource(address, config.get('device_port', 8000), *common[1:],
                                      cache_dir=self.archive.settings.cache_dir,

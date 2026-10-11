@@ -84,6 +84,9 @@ def main():
     subs=parser.add_subparsers(dest='command',required=True)
     doctor=subs.add_parser('doctor');doctor.add_argument('--network',action='store_true')
     dashboard=subs.add_parser('dashboard');dashboard.add_argument('--host',default=os.environ.get('DASHBOARD_HOST','0.0.0.0'));dashboard.add_argument('--port',type=int,default=int(os.environ.get('DASHBOARD_PORT','8080')))
+    collector=subs.add_parser('collector',help='LAN-only SD transport; no catalog, remux or Telegram credentials.')
+    collector.add_argument('--host',default=os.environ.get('COLLECTOR_HOST','0.0.0.0'))
+    collector.add_argument('--port',type=int,default=int(os.environ.get('COLLECTOR_PORT','8787')))
     ingest=subs.add_parser('ingest');ingest.add_argument('--manifest',required=True);ingest.add_argument('--dry-run',action='store_true')
     subs.add_parser('run');subs.add_parser('health');subs.add_parser('backup')
     routes=subs.add_parser('network-routes',help='Publish host LAN/Tailscale subnet routes; no camera scan or credentials.')
@@ -103,6 +106,10 @@ def main():
     index_reconcile.add_argument('--type',choices=('root','years','year','month','day','hour'),required=True)
     index_reconcile.add_argument('--period',required=True);index_reconcile.add_argument('--message-id',type=int,required=True)
     args=parser.parse_args()
+    if args.command=='collector':
+        from .sd_collector import serve
+        serve(args.host,args.port)
+        return 0
     if args.command=='network-routes':
         from .network_routes import collect_subnets, write_snapshot, collect_loop
         if not 5<=args.interval<=3600:raise ValueError('Route refresh interval must be between 5 and 3600 seconds')

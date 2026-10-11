@@ -1,0 +1,15 @@
+# VPS-only override. Keep compose.sdk.yaml for an explicit native rollback.
+# The collector's random shared token is a read-only file, never a bot token.
+services:
+  archive:
+    environment:
+      # Use a different host interpolation key: .env is also dashboard's env_file.
+      SD_COLLECTOR_URL: ${REMOTE_SD_COLLECTOR_URL:?Set REMOTE_SD_COLLECTOR_URL to the LAN collector Tailscale URL}
+      SD_COLLECTOR_TOKEN_FILE: /run/secrets/sd-collector-token
+    volumes:
+      - type: bind
+        source: ${SD_COLLECTOR_TOKEN_HOST_FILE:?Set SD_COLLECTOR_TOKEN_HOST_FILE to the shared collector token file}
+        target: /run/secrets/sd-collector-token
+        read_only: true
+        bind:
+          create_host_path: false

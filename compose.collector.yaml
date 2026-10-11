@@ -1,0 +1,58 @@
+# Standalone LAN appliance: never combine with the VPS compose.yaml/.env.
+# Run on the 64-bit LAN router; publish only its Tailscale interface.
+name: mycameratele-bama-collector
+
+services:
+  collector:
+    image: ${COLLECTOR_IMAGE:?Set COLLECTOR_IMAGE to the released immutable image digest}
+    pull_policy: missing
+    command: [collector, --host, 0.0.0.0, --port, "8787"]
+    user: "10001:10001"
+    init: true
+    restart: unless-stopped
+    environment:
+      HCNETSDK_DIR: /opt/hcnetsdk
+      SD_COLLECTOR_TOKEN_FILE: /run/secrets/sd-collector-token
+      COLLECTOR_CACHE_DIR: /cache
+      COLLECTOR_ALLOWED_CIDRS: ${COLLECTOR_ALLOWED_CIDRS:-192.168.2.0/24}
+      COLLECTOR_MAX_SESSIONS: ${COLLECTOR_MAX_SESSIONS:-10}
+      COLLECTOR_PER_CAMERA_SESSIONS: ${COLLECTOR_PER_CAMERA_SESSIONS:-2}
+      COLLECTOR_IDLE_TIMEOUT_SECONDS: ${COLLECTOR_IDLE_TIMEOUT_SECONDS:-900}
+      COLLECTOR_CACHE_MAX_GB: ${COLLECTOR_CACHE_MAX_GB:-2}
+      COLLECTOR_MIN_FREE_GB: ${COLLECTOR_MIN_FREE_GB:-2}
+    ports:
+      - "${COLLECTOR_BIND_IP:-100.92.56.98}:8787:8787"
+    volumes:
+      - collector-cache:/cache
+      - type: bind
+        source: ${HCNETSDK_HOST_DIR:?Set HCNETSDK_HOST_DIR to the official ARM64 SDK lib directory}
+        target: /opt/hcnetsdk
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${COLLECTOR_TOKEN_HOST_FILE:?Set COLLECTOR_TOKEN_HOST_FILE to a private token file readable by UID 10001}
+        target: /run/secrets/sd-collector-token
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 65m
+    healthcheck:
+      test: [CMD, python, -c, "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8787/health',timeout=5); assert r.status==200 and json.load(r).get('ok') is True"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  collector-cache:

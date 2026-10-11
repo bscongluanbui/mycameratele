@@ -32,6 +32,7 @@ jobs:
       - run: python scripts/ci_validate_manifest.py --self-test
       - run: docker compose config --quiet
       - run: python scripts/ci_validate_private_compose.py
+      - run: python scripts/ci_validate_collector_compose.py
 
   publish:
     needs: validate

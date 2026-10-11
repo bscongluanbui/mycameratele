@@ -14,6 +14,7 @@ import subprocess
 import socket
 import time
 import uuid
+from urllib.parse import urlsplit
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -67,6 +68,26 @@ def secret(name):
     return Path(filename).read_text().strip() if filename else os.environ.get(name, '').strip()
 
 
+def validate_sd_collector_url(value):
+    """A collector is an explicit LAN/tailnet peer, never a public proxy."""
+    if not value:
+        return ''
+    try:
+        url = urlsplit(value)
+        address = ipaddress.ip_address(url.hostname or '')
+        port = url.port
+        networks = ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16',
+                    '100.64.0.0/10', '127.0.0.0/8', 'fc00::/7', '::1/128')
+        allowed = any(address in ipaddress.ip_network(network) for network in networks)
+        if (url.scheme not in ('http', 'https') or not allowed or not port or
+                url.username is not None or url.password is not None or
+                url.path not in ('', '/') or url.query or url.fragment or '%' in value):
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ValueError('SD_COLLECTOR_URL needs an explicit private/tailnet IP and port, without credentials or path') from None
+    return value.rstrip('/')
+
+
 @dataclass
 class Settings:
     state_dir: Path
@@ -116,6 +137,8 @@ class Settings:
     sd_download_speed_kbps: int = 0
     sd_download_workers: int = 1
     sd_download_threads: int = 1
+    sd_collector_url: str = ''
+    sd_collector_token: str = ''
 
     @property
     def effective_owner(self):
@@ -149,6 +172,11 @@ class Settings:
         sd_speed = bounded_int('SD_DOWNLOAD_SPEED_KBPS', 0, 256, 32768, allow_zero=True)
         sd_workers = bounded_int('SD_DOWNLOAD_WORKERS', 1, 1, 5)
         sd_threads = bounded_int('SD_DOWNLOAD_THREADS', 1, 1, 2)
+        collector_url = validate_sd_collector_url(os.environ.get('SD_COLLECTOR_URL', '').strip())
+        collector_token = secret('SD_COLLECTOR_TOKEN')
+        if collector_url and (not 32 <= len(collector_token) <= 512 or
+                              any(not 33 <= ord(character) <= 126 for character in collector_token)):
+            raise ValueError('SD_COLLECTOR_TOKEN needs 32–512 printable non-whitespace characters')
         multi_channel = flag('MULTI_CHANNEL_ROUTING', 'false')
         index_enabled = flag('CHANNEL_INDEX_ENABLED', 'true')
         index_debounce = int(os.environ.get('CHANNEL_INDEX_DEBOUNCE_SECONDS', '60'))
@@ -225,6 +253,7 @@ class Settings:
             sd_max_files_per_job=sd_batch, sd_download_speed_kbps=sd_speed,
             sd_download_workers=sd_workers,
             sd_download_threads=sd_threads,
+            sd_collector_url=collector_url, sd_collector_token=collector_token,
             player_public_url=os.environ.get('TELEGRAM_PLAYER_PUBLIC_URL', '').strip().rstrip('/'),
             bot_api_file_root=Path(os.environ.get('TELEGRAM_BOT_API_FILE_ROOT', '/var/lib/telegram-bot-api')),
             bot_api_spool_root=Path(spool_path) if spool_path else None,
