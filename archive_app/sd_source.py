@@ -30,7 +30,7 @@ from urllib.request import (HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRea
 import uuid
 import xml.etree.ElementTree as ET
 
-from .core import get_zone, parse_time, record_key
+from .core import MediaRemuxError, get_zone, parse_time, record_key
 
 
 MAX_XML = 2_000_000
@@ -45,6 +45,9 @@ SDK_LOCK = threading.RLock()
 NS = 'http://www.hikvision.com/ver20/XMLSchema'
 STAGING_NAME = re.compile(r'[a-f0-9]{64}\.[a-f0-9]{32}\.(?:part|source)')
 DOWNLOAD_PROGRESS_INTERVAL = 2.0
+QUARANTINABLE_MEDIA_ERRORS = frozenset((
+    'sd_remux_input_unsupported', 'sd_remux_parameters_missing',
+    'sd_remux_codec_unsupported', 'sd_remux_timestamps_invalid'))
 _CAMERA_LEASE_LOCK = threading.Lock()
 _CAMERA_LEASES = set()
 
@@ -90,6 +93,19 @@ class SDSourceError(Exception):
     def __init__(self, code, message):
         self.code = code
         super().__init__(message)
+
+
+def _quarantine_media_error(archive, key, error, statistics):
+    # Storage/tool/timeout/unknown errors still stop the job. Only a positively
+    # identified bad media file with its durable original retained may yield
+    # to healthy neighboring recordings. No Telegram claim exists for it.
+    if (not isinstance(error, MediaRemuxError) or error.code not in QUARANTINABLE_MEDIA_ERRORS
+            or not archive.retained_remux_failure(key)):
+        return False
+    statistics['media_failed'] += 1
+    statistics['media_failed_keys'] = [*statistics['media_failed_keys'], key]
+    statistics['media_error_code'] = error.code
+    return True
 
 
 def recover_staging(archive):
@@ -1027,6 +1043,7 @@ class SDSource:
         provider = self._provider()
         statistics = {'backend': provider.backend, 'searched': 0, 'downloaded': 0,
                       'imported': 0, 'already_known': 0, 'deferred': 0, 'backlog': 0,
+                      'media_failed': 0, 'media_failed_keys': [], 'media_error_code': None,
                       'connect_seconds': 0.0, 'search_seconds': 0.0,
                       'download_seconds': 0.0, 'ingest_seconds': 0.0, 'download_bytes': 0,
                       'current_file_bytes': 0, 'current_file_total_bytes': 0,
@@ -1157,6 +1174,10 @@ class SDSource:
                         notify('sd_download')
                     except SDSourceError:
                         raise
+                    except MediaRemuxError as error:
+                        if not _quarantine_media_error(self.archive, key, error, statistics):
+                            raise SDSourceError(error.code, str(error)) from None
+                        notify('sd_download')
                     except Exception:
                         raise SDSourceError('sd_media_validation_failed', 'Downloaded SD recording could not be copied intact into the managed cache; no Telegram upload was attempted.') from None
                     finally:
@@ -1182,6 +1203,7 @@ class SDSource:
         provider = self._provider()
         statistics = {'backend': provider.backend, 'searched': 0, 'downloaded': 0,
                       'imported': 0, 'already_known': 0, 'deferred': 0, 'backlog': 0,
+                      'media_failed': 0, 'media_failed_keys': [], 'media_error_code': None,
                       'connect_seconds': 0.0, 'search_seconds': 0.0,
                       'download_seconds': 0.0, 'ingest_seconds': 0.0, 'download_bytes': 0,
                       'current_file_bytes': 0, 'current_file_total_bytes': 0,
@@ -1419,8 +1441,19 @@ class SDSource:
                                 raise cleanup_error
                             notify('sd_download')
                         except Exception as exc:
+                            try:
+                                quarantined = _quarantine_media_error(self.archive, item[2], exc, statistics)
+                            except Exception:
+                                quarantined = False
+                            if quarantined:
+                                try:
+                                    notify('sd_download')
+                                except Exception:
+                                    failure = failure or SDSourceError('sd_progress_failed', 'SD progress reporting failed; admitted downloads were drained.')
+                                continue
                             failure = failure or (exc if isinstance(exc, SDSourceError) else SDSourceError(
-                                'sd_media_validation_failed', 'Downloaded SD recording could not be copied intact into the managed cache; no Telegram upload was attempted.'))
+                                exc.code if isinstance(exc, MediaRemuxError) else 'sd_media_validation_failed',
+                                str(exc) if isinstance(exc, MediaRemuxError) else 'Downloaded SD recording could not be copied intact into the managed cache; no Telegram upload was attempted.'))
                         finally:
                             cleanup_error = clean_complete(complete)
                             failure = failure or cleanup_error

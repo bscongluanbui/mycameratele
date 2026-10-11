@@ -431,7 +431,27 @@ class Telegram:
             raise ApiRejected(result.get('error_code',0),result.get('parameters',{}).get('retry_after',0),result.get('description',''))
         return result['result']
 
-    def upload_one(self, archive, camera=None):
+    @staticmethod
+    def _upload_progress(progress, snapshot):
+        # Telemetry must never change an upload's delivery/ambiguity semantics.
+        # The callback runs on the upload owner thread, not a SQLite-unsafe timer.
+        if progress is not None:
+            try:progress(snapshot)
+            except Exception:pass
+
+    def upload_one_with_progress(self, archive, camera=None, *, progress=None):
+        """Optional telemetry protocol; legacy upload_one adapters stay valid."""
+        try:
+            result=self.upload_one(archive,camera=camera,progress=progress)
+        except Exception:
+            self._upload_progress(progress,{'upload_state':'error','upload_current_file_started_at':0})
+            raise
+        if result!='uploaded':
+            self._upload_progress(progress,{'upload_state':'error' if result else 'idle',
+                                            'upload_current_file_started_at':0})
+        return result
+
+    def upload_one(self, archive, camera=None, *, progress=None):
         if not self.settings.enable_upload or not self.settings.token:
             return None
         if self.upload_retry_until(archive) > time.time():
@@ -506,7 +526,17 @@ class Telegram:
         try:
             kwargs = {'file_path': path, 'file_field': field}
             if direct:kwargs['local_file'] = True
+            upload_bytes=path.stat().st_size
+            # Local Bot API exposes a receipt, not cloud byte-progress. Publish
+            # the known size/start once; the UI derives elapsed waiting time.
+            self._upload_progress(progress,{'upload_state':'sending',
+                'upload_transport':'local_file' if direct else 'multipart',
+                'upload_current_file_total_bytes':upload_bytes,
+                'upload_current_file_started_at':time.time(),
+                'upload_current_file_elapsed_seconds':0.0})
+            request_started=time.monotonic()
             message = self.request(method,fields,**kwargs)
+            request_seconds=max(0.0,time.monotonic()-request_started)
             media = self.validate_media_message(message, field, destination,
                                                 chat_type='channel' if self.channel_mode else 'private')
             bot_value = archive.state('telegram_bot_id')
@@ -537,6 +567,13 @@ class Telegram:
             with archive.conn:
                 archive.conn.execute("UPDATE recordings SET status='upload_unknown',last_error=? WHERE key=?", ('ambiguous_'+error_type,row['key']))
             return 'upload_unknown'
+        # Count bytes only after media identity + durable receipt validation.
+        # This is effective confirmed throughput, never instantaneous wire rate.
+        self._upload_progress(progress,{'upload_state':'confirmed',
+            'upload_current_file_elapsed_seconds':request_seconds,
+            'upload_last_file_confirmed_at':time.time(),
+            'upload_last_file_bytes':upload_bytes,'upload_last_file_seconds':request_seconds,
+            'upload_last_file_bytes_per_second':upload_bytes/request_seconds if request_seconds>0 else 0.0})
         archive.cleanup(row['key'])
         return 'uploaded'
 

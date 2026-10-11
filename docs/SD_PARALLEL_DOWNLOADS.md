@@ -32,7 +32,11 @@ Remux luôn stream-copy (`-c copy`), không transcode. Local Bot API đọc file
 
 ## Tiến trình dashboard
 
-Trong lúc tải, mỗi khoảng 2 giây worker cập nhật byte đang tải, tổng byte nếu biết, thời gian và tốc độ trung bình của file. Dashboard poll khoảng 2,5 giây khi có job active. Dòng tiến trình hiển thị `12.5 MB / 50.0 MB · 1.25 MB/s`; Detail có số liệu từng khâu và trạng thái SDK (`off`, `applied`, `unsupported`, `rejected`). Số file hoàn tất không tăng cho đến khi tải và kiểm tra đầy đủ. Tổng byte đã hoàn tất tách riêng khỏi byte của file hiện tại để không cộng trùng. Khi chạy song song, `upload_seconds` bao gồm cả thời gian đợi lượt uploader chung, không nên coi riêng số này là băng thông Telegram.
+Dashboard poll khoảng 2,5 giây khi có job active. Dòng tiến trình ưu tiên `TB VPS→Telegram … MB/s`: tổng byte của các file đã được Telegram xác nhận chia cho thời gian yêu cầu gửi thành công, không gồm chờ khóa uploader, kiểm tra channel hay remux. Đây là tốc độ hiệu dụng trung bình, không phải tốc độ mạng tức thời. Khi chuyển sang batch tiếp theo, `Upload gần nhất … MB/s` giữ số đo của file đã xác nhận gần nhất; Detail có thời điểm xác nhận.
+
+Local Bot API đọc MP4 trực tiếp không cung cấp tiến trình byte lên Telegram. Trong lúc gửi, dashboard hiển thị dung lượng file, số giây chờ và `chờ xác nhận`, không dựng phần trăm hoặc tốc độ 0 giả. `TB Camera→VPS` là tổng byte SD đã tải xong chia cho tổng thời gian download; với collector, thời gian này gồm cả Camera→Armbian và Armbian→VPS, chưa tách riêng từng chặng. Với hai download song song, đó là trung bình trên thời gian các lượt tải, không phải tổng băng thông theo thời gian thực. `upload_seconds` vẫn là thời gian xử lý gồm chờ lượt và không dùng tính tốc độ Telegram. Detail giữ số liệu từng khâu và trạng thái SDK (`off`, `applied`, `unsupported`, `rejected`).
+
+File SD có lỗi định dạng/thông số media xác định được được cách ly chỉ sau khi đã lưu bản nguồn nguyên vẹn và xác minh chưa có lượt gửi Telegram. Các file tốt phía sau tiếp tục chạy; `Cách ly` và mã lỗi nằm trong Detail. Bản lỗi giữ theo `ERROR_RETENTION_HOURS` (mặc định 72 giờ), không tự gửi lại, không transcode hoặc bỏ audio. Lỗi công cụ, timeout, cache, database và lượt gửi mơ hồ vẫn dừng để kiểm tra.
 
 ## Tăng tốc SDK
 

@@ -39,6 +39,27 @@ class SerializedUploads:
                 return None
             return self._telegram.upload_one(*args, **kwargs)
 
+    def upload_one_with_progress(self, *args, progress=None, **kwargs):
+        if self._stopping():return None
+        if progress is not None:
+            try:progress({'upload_state':'waiting','upload_current_file_started_at':0,
+                          'upload_current_file_total_bytes':0,'upload_current_file_elapsed_seconds':0.0})
+            except Exception:pass
+        with self._lock:
+            if self._stopping():
+                if progress is not None:
+                    try:progress({'upload_state':'idle','upload_current_file_started_at':0})
+                    except Exception:pass
+                return None
+            method=getattr(self._telegram,'upload_one_with_progress',None)
+            if callable(method):return method(*args,progress=progress,**kwargs)
+            # Third-party/test adapters need not accept a new keyword argument.
+            try:return self._telegram.upload_one(*args,**kwargs)
+            finally:
+                if progress is not None:
+                    try:progress({'upload_state':'idle','upload_current_file_started_at':0})
+                    except Exception:pass
+
     def __getattr__(self, name):
         return getattr(self._telegram, name)
 

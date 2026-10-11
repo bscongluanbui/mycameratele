@@ -4,6 +4,7 @@ LAN checks report reachability only; SD providers must confirm search/download.
 The queue never rewrites recording identities or trash state.
 """
 import json
+import math
 import re
 import time
 import uuid
@@ -24,9 +25,18 @@ def _statistics():
             'failed_records': 0, 'expired': 0, 'spool_blocked': 0, 'probe_tcp_open': 0, 'probe_error_type': None,
             'sd_backend': None, 'sd_searched': 0, 'sd_downloaded': 0, 'sd_imported': 0, 'sd_deferred': 0,
             'sd_backlog': 0, 'sd_error_code': None, 'sd_requeued': False, 'sd_quarantined_reviews': 0,
+            'sd_media_failed': 0, 'sd_media_failed_keys': [], 'sd_media_error_code': None,
             'sd_connect_seconds': 0.0, 'sd_search_seconds': 0.0,
             'sd_download_seconds': 0.0, 'sd_ingest_seconds': 0.0,
             'sd_download_bytes': 0, 'upload_seconds': 0.0,
+            'upload_state': 'idle', 'upload_transport': None,
+            'upload_current_file_total_bytes': 0, 'upload_current_file_started_at': 0,
+            'upload_current_file_elapsed_seconds': 0.0,
+            'upload_last_file_bytes': 0, 'upload_last_file_seconds': 0.0,
+            'upload_last_file_confirmed_at': 0,
+            'upload_last_file_bytes_per_second': 0.0,
+            'upload_confirmed_bytes': 0, 'upload_request_seconds': 0.0,
+            'upload_bytes_per_second': 0.0,
             'sd_current_file_bytes': 0, 'sd_current_file_total_bytes': 0,
             'sd_current_file_elapsed_seconds': 0.0,
             'sd_current_file_bytes_per_second': 0.0,
@@ -86,6 +96,28 @@ class SyncQueue:
         except OSError:
             return False
 
+    def _job_statistics(self, camera):
+        """Keep the last confirmed rate visible across bounded backlog jobs."""
+        statistics=_statistics()
+        try:
+            raw=self.archive.state('upload_telemetry_v1:'+camera)
+            saved=json.loads(raw) if isinstance(raw,str) and len(raw)<=1024 else {}
+            values=[saved.get(field) for field in ('upload_last_file_bytes','upload_last_file_seconds',
+                                                    'upload_last_file_confirmed_at')]
+            if (not isinstance(saved,dict) or any(type(value) not in (int,float)
+                    or not math.isfinite(value) or value<=0 for value in values)):
+                return statistics
+            rate=values[0]/values[1]
+            if not math.isfinite(rate):return statistics
+            for field,value in zip(('upload_last_file_bytes','upload_last_file_seconds','upload_last_file_confirmed_at'),values):
+                statistics[field]=value
+            statistics['upload_last_file_bytes_per_second']=rate
+        except Exception:
+            # Metrics are optional. Corrupt/missing telemetry never changes the
+            # durable recording queue or turns a known delivery into a retry.
+            pass
+        return statistics
+
     def _public(self, row):
         fields = ('id', 'camera_id', 'state', 'phase', 'code', 'message', 'source', 'actor',
                   'created_at', 'updated_at', 'started_at', 'finished_at')
@@ -130,7 +162,7 @@ class SyncQueue:
                     self.conn.execute('''INSERT INTO sync_jobs
                         (id,camera_id,state,phase,code,message,statistics_json,source,actor,created_at,updated_at)
                         VALUES (?,?,'queued','queued','','Đang chờ worker xử lý',?,?,?,?,?)''',
-                        (job_id, slug, json.dumps(_statistics()), source, actor, now, now))
+                        (job_id, slug, json.dumps(self._job_statistics(slug)), source, actor, now, now))
                     row = self.conn.execute('SELECT * FROM sync_jobs WHERE id=?', (job_id,)).fetchone()
                 result.append(row)
             self.conn.commit()
@@ -187,7 +219,7 @@ class SyncQueue:
             now = time.time()
             self.conn.execute('''UPDATE sync_jobs SET state='running',phase='probing',code='',
                 message='Đang kiểm tra LAN camera',updated_at=?,started_at=?,statistics_json=? WHERE id=?''',
-                (now, now, json.dumps(_statistics()), row['id']))
+                (now, now, json.dumps(self._job_statistics(row['camera_id'])), row['id']))
             claimed = self.conn.execute('SELECT * FROM sync_jobs WHERE id=?', (row['id'],)).fetchone()
             self.conn.commit()
             return dict(claimed)
@@ -220,29 +252,63 @@ class SyncQueue:
             self.conn.execute("UPDATE sync_jobs SET phase=?,message=?,statistics_json=?,updated_at=? WHERE id=? AND state='running'",
                               (phase, message, json.dumps(statistics), time.time(), job['id']))
 
+    def _all_bad_media_batch(self, statistics):
+        """An entirely quarantined bounded prefix can yield to later clips.
+
+        No healthy upload exists to prove progress in this special case. Require
+        every downloaded file to be one of this source's exact retained failures,
+        and keep unknown sends, generic failures and upload backpressure blocking.
+        """
+        count = statistics.get('sd_downloaded')
+        keys = statistics.get('sd_media_failed_keys')
+        return (type(count) is int and 0 < count <= 100
+                and type(statistics.get('sd_media_failed')) is int
+                and statistics['sd_media_failed'] == count
+                and isinstance(keys, list) and len(keys) == count
+                and all(isinstance(key, str) and re.fullmatch(r'[a-f0-9]{64}', key) for key in keys)
+                and len(set(keys)) == count
+                and statistics.get('sd_imported') == 0 and statistics.get('uploaded') == 0
+                and statistics.get('pending') == statistics.get('needs_review')
+                and not any(statistics.get(field) for field in (
+                    'ready', 'upload_unknown', 'failed_records', 'failed', 'remux_failed',
+                    'remux_budget_blocked', 'spool_blocked', 'sd_error_code'))
+                and all(self.archive.retained_remux_failure(key) for key in keys))
+
     def _quarantined_reviews(self, job, statistics):
-        """A pre-existing unposted remux failure need not stall healthy history.
+        """Retained unposted media failures need not stall healthy history.
 
         This is not an automatic retry or reconciliation. Every uncertain send,
-        new error, generic review and incomplete recording still blocks the
+        unclassified new error, generic review and incomplete recording still blocks the
         continuation. The failed row and its retained media remain untouched.
         """
         started = job.get('started_at')
         if (not started or not statistics['sd_backlog'] or not statistics['sd_downloaded']
-                or not statistics.get('sd_imported') or not statistics['uploaded']
                 or not statistics['needs_review']
                 or statistics['pending'] != statistics['needs_review']):
             return 0
-        count = self.conn.execute('''SELECT count(*) FROM recordings
+        keys = statistics.get('sd_media_failed_keys', [])
+        if (not isinstance(keys, list) or len(keys) > 100
+                or any(not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{64}', key) for key in keys)
+                or len(keys) != statistics.get('sd_media_failed', 0) or len(keys) != len(set(keys))):
+            return 0
+        if (not (statistics.get('sd_imported') and statistics['uploaded'])
+                and not self._all_bad_media_batch(statistics)):
+            return 0
+        rows = self.conn.execute('''SELECT key,created_at,error_started_at FROM recordings
             WHERE camera=? AND status='needs_review' AND deleted_at IS NULL
                 AND media_expired_at IS NULL AND last_error='failed_remux'
-                AND created_at<? AND error_started_at<?
                 AND coalesce(chat_id,'')='' AND message_id IS NULL
                 AND coalesce(file_id,'')='' AND coalesce(file_unique_id,'')=''
                 AND storage_chat_id IS NULL AND storage_message_id IS NULL
                 AND upload_target_chat_id IS NULL AND bot_id IS NULL
                 AND coalesce(attempt_id,'')='' AND uploaded_at IS NULL''',
-            (job['camera_id'], started, started)).fetchone()[0]
+            (job['camera_id'],)).fetchall()
+        # Old failures keep their legacy quarantine behavior. New failures
+        # must additionally be the exact source-verified keys from this job;
+        # recheck durable media and all no-send guards atomically at finish.
+        count = sum(1 for row in rows if (
+            row['created_at'] < started and row['error_started_at'] is not None and row['error_started_at'] < started
+            or row['key'] in keys and self.archive.retained_remux_failure(row['key'])))
         return count if count == statistics['needs_review'] else 0
 
     def _finish(self, job, statistics, state, code, message, *, requeue_backlog=False, telegram=None):
@@ -267,7 +333,8 @@ class SyncQueue:
             retry_until = telegram.upload_retry_until(self.archive) if requeue_backlog and telegram is not None else 0
             if (changed and requeue_backlog and state in ('completed', 'blocked') and code == 'sd_batch_limit' and clean and not delayed
                     and statistics['sd_backlog'] > 0 and statistics['sd_downloaded'] > 0
-                    and statistics.get('sd_imported', 0) > 0
+                    and (statistics.get('sd_imported', 0) > 0
+                         or (quarantined and self._all_bad_media_batch(statistics)))
                     and not self._stopping() and not self._gate(job['camera_id'])
                     and retry_until <= time.time()
                     and self.conn.execute("SELECT count(*) FROM sync_jobs WHERE state IN ('queued','running')").fetchone()[0] < MAX_ACTIVE_JOBS
@@ -278,7 +345,7 @@ class SyncQueue:
                 self.conn.execute('''INSERT INTO sync_jobs
                     (id,camera_id,state,phase,code,message,statistics_json,source,actor,created_at,updated_at)
                     VALUES (?,?,'queued','queued','','Đang chờ lượt tiếp theo để xử lý SD',?,'backlog',?,?,?)''',
-                    (uuid.uuid4().hex, job['camera_id'], json.dumps(_statistics()), job.get('actor'), tail, tail))
+                    (uuid.uuid4().hex, job['camera_id'], json.dumps(self._job_statistics(job['camera_id'])), job.get('actor'), tail, tail))
                 statistics['sd_requeued'] = True
                 self.conn.execute("UPDATE sync_jobs SET state='completed',statistics_json=? WHERE id=?", (json.dumps(statistics), job['id']))
             self._prune()
@@ -322,7 +389,7 @@ class SyncQueue:
         job = self._claim()
         if job is None:
             return False
-        statistics = _statistics()
+        statistics = self._job_statistics(job['camera_id'])
         try:
             self._run(job, statistics, telegram)
         except Exception as error:
@@ -357,6 +424,27 @@ class SyncQueue:
         sd_interrupted=False
         upload_paused=False
         upload_error_type=None
+        def upload_progress(snapshot):
+            # Called synchronously by the upload owner: this connection never
+            # crosses threads, even while another camera holds the upload lock.
+            for field in ('upload_state','upload_transport','upload_current_file_total_bytes',
+                          'upload_current_file_started_at','upload_current_file_elapsed_seconds',
+                          'upload_last_file_bytes','upload_last_file_seconds','upload_last_file_bytes_per_second',
+                          'upload_last_file_confirmed_at'):
+                if field in snapshot:statistics[field]=snapshot[field]
+            if snapshot.get('upload_state')=='confirmed':
+                statistics['upload_confirmed_bytes']+=snapshot['upload_last_file_bytes']
+                statistics['upload_request_seconds']+=snapshot['upload_last_file_seconds']
+                elapsed=statistics['upload_request_seconds']
+                statistics['upload_bytes_per_second']=statistics['upload_confirmed_bytes']/elapsed if elapsed>0 else 0.0
+            self._progress(job,statistics,'uploading','Đang chờ lượt upload' if snapshot.get('upload_state')=='waiting'
+                           else 'Đang upload Telegram; chờ xác nhận' if snapshot.get('upload_state')=='sending'
+                           else 'Đã cập nhật trạng thái upload Telegram')
+            if snapshot.get('upload_state')=='confirmed':
+                try:
+                    self.archive.state('upload_telemetry_v1:'+slug,json.dumps({field:statistics[field]
+                        for field in ('upload_last_file_bytes','upload_last_file_seconds','upload_last_file_confirmed_at')}))
+                except Exception:pass
         def upload_ready():
             nonlocal upload_paused,upload_error_type
             if (self._stopping() or upload_paused
@@ -364,7 +452,9 @@ class SyncQueue:
                 return None
             try:
                 started=time.monotonic()
-                result=telegram.upload_one(self.archive,camera=slug)
+                method=getattr(telegram,'upload_one_with_progress',None)
+                result=(method(self.archive,camera=slug,progress=upload_progress) if callable(method)
+                        else telegram.upload_one(self.archive,camera=slug))
             except Exception as error:
                 upload_paused=True
                 upload_error_type=self._error_type(error)
@@ -421,6 +511,9 @@ class SyncQueue:
                 statistics['sd_peak_downloads']=snapshot.get('peak_downloads',0)
                 statistics['sd_download_speed_status']=snapshot.get('download_speed_status','not_requested')
                 statistics['sd_download_speed_error_code']=snapshot.get('download_speed_error_code')
+                statistics['sd_media_failed']=snapshot.get('media_failed',0)
+                statistics['sd_media_failed_keys']=snapshot.get('media_failed_keys',[])
+                statistics['sd_media_error_code']=snapshot.get('media_error_code')
                 phase=snapshot.get('phase','sd_download')
                 if phase not in ('sd_search','sd_download','sd_complete'):phase='sd_download'
                 self._progress(job,statistics,phase,'Đang xử lý recording SD')

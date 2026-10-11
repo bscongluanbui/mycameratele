@@ -122,26 +122,53 @@
       if (!job) return "Bấm Start sync để bắt đầu";
       const statistics = job.statistics || {}, parts = [helpers.syncPhase(job)];
       const transfer = helpers.syncTransfer(job);
-      if (transfer) parts.push(transfer);
+      // Keep the measured rate visible before the phase/counts are ellipsized.
+      if (transfer) parts.unshift(transfer);
       for (const [key, label] of [["sd_searched", "SD"], ["sd_downloaded", "Tải"], ["uploaded", "Upload"], ["failed", "Lỗi"]]) {
         const value = statistics[key];
         if (typeof value === "number" && Number.isFinite(value) && value >= 0) parts.push(`${label} ${value}`);
       }
+      if (typeof statistics.sd_media_failed === "number" && Number.isFinite(statistics.sd_media_failed) && statistics.sd_media_failed > 0) parts.push(`Cách ly ${statistics.sd_media_failed}`);
       return parts.join(" · ");
     },
-    syncTransfer(job) {
-      if (job?.state !== "running" || job?.phase !== "sd_download") return "";
-      const s = job.statistics || {}, valid = value => typeof value === "number" && Number.isFinite(value) && value >= 0;
-      if (!valid(s.sd_current_file_bytes) || !valid(s.sd_current_file_elapsed_seconds) || s.sd_current_file_elapsed_seconds <= 0) return "";
-      let value = `${(s.sd_current_file_bytes / 1e6).toFixed(1)} MB`;
-      if (valid(s.sd_current_file_total_bytes) && s.sd_current_file_total_bytes > 0) value += ` / ${(s.sd_current_file_total_bytes / 1e6).toFixed(1)} MB`;
-      if (valid(s.sd_current_file_bytes_per_second)) value += ` · ${(s.sd_current_file_bytes_per_second / 1e6).toFixed(2)} MB/s`;
-      return value;
+    syncTransfer(job, now = Date.now()) {
+      const s = job?.statistics || {}, parts = [], valid = value => typeof value === "number" && Number.isFinite(value) && value >= 0;
+      const average = (bytes, seconds) => valid(bytes) && bytes > 0 && valid(seconds) && seconds > 0 && Number.isFinite(bytes / seconds) ? bytes / seconds : null;
+      const rate = value => value < 10000 ? "< 0.01 MB/s" : `${(value / 1e6).toFixed(2)} MB/s`;
+      // These are effective, completed-file averages. Local Bot API reports no
+      // Telegram wire-byte progress, and upload_seconds also includes queue work.
+      const uploadRate = average(s.upload_confirmed_bytes, s.upload_request_seconds);
+      const sdRate = average(s.sd_download_bytes, s.sd_download_seconds);
+      if (uploadRate !== null) parts.push(`TB VPS→Telegram ${rate(uploadRate)}`);
+      else if (valid(s.upload_last_file_confirmed_at) && s.upload_last_file_confirmed_at > 0) {
+        const lastRate = average(s.upload_last_file_bytes, s.upload_last_file_seconds);
+        if (lastRate !== null) parts.push(`Upload gần nhất ${rate(lastRate)}`);
+      }
+      if (sdRate !== null) parts.push(`TB Camera→VPS ${rate(sdRate)}`);
+      if (job?.state === "running" && s.upload_state === "waiting") parts.push("Chờ lượt upload");
+      if (job?.state === "running" && s.upload_state === "sending") {
+        let value = "Telegram";
+        if (valid(s.upload_current_file_total_bytes) && s.upload_current_file_total_bytes > 0) value += ` ${(s.upload_current_file_total_bytes / 1e6).toFixed(1)} MB`;
+        if (valid(s.upload_current_file_started_at) && s.upload_current_file_started_at > 0 && Number.isFinite(now)) value += ` · ${Math.max(0, Math.floor(now / 1000 - s.upload_current_file_started_at))} giây`;
+        parts.push(`${value} · chờ xác nhận`);
+      }
+      if (job?.state === "running" && job?.phase === "sd_download" && valid(s.sd_current_file_bytes) && valid(s.sd_current_file_elapsed_seconds) && s.sd_current_file_elapsed_seconds > 0) {
+        let value = `Tải SD ${(s.sd_current_file_bytes / 1e6).toFixed(1)} MB`;
+        if (valid(s.sd_current_file_total_bytes) && s.sd_current_file_total_bytes > 0) value += ` / ${(s.sd_current_file_total_bytes / 1e6).toFixed(1)} MB`;
+        // With a remote collector, this combines staging and delivery to VPS.
+        // Zero received bytes means waiting, not a measured 0 MB/s transfer.
+        if (sdRate === null && s.sd_current_file_bytes > 0 && valid(s.sd_current_file_bytes_per_second) && s.sd_current_file_bytes_per_second > 0) value += ` · TB file ${rate(s.sd_current_file_bytes_per_second)}`;
+        else value += ` · ${Math.floor(s.sd_current_file_elapsed_seconds)} giây`;
+        parts.push(value);
+      }
+      return parts.join(" · ");
     },
-    syncDetailFields(job) {
-      const labels = { manifests: "Manifest", matched: "Khớp nguồn", imported: "Đã nhập", already_known: "Đã có", uploaded: "Đã upload", failed: "Lỗi", ready: "Sẵn sàng", pending: "Chờ upload", remuxed: "Đã remux", remux_failed: "Lỗi remux", remux_budget_blocked: "Chờ dung lượng cache", needs_review: "Cần kiểm tra", upload_unknown: "Upload chưa xác nhận", deleted: "Đã xóa", failed_records: "Bản ghi lỗi", probe_tcp_open: "Cổng TCP mở", probe_error_type: "Lỗi kết nối", sd_backend: "Bộ tải SD", sd_searched: "Tìm thấy SD", sd_downloaded: "Đã tải SD", sd_imported: "Đã nhập SD", sd_deferred: "SD chờ tải", sd_backlog: "SD tồn đọng", sd_error_code: "Mã lỗi SD" };
-      Object.assign(labels, {sd_current_file_bytes: "File đang tải (byte)", sd_current_file_total_bytes: "Dung lượng file (byte)", sd_current_file_elapsed_seconds: "Thời gian file (giây)", sd_current_file_bytes_per_second: "Tốc độ tải (byte/s)", sd_download_bytes: "Tổng byte đã tải xong", sd_download_seconds: "Thời gian tải SD (giây)", sd_ingest_seconds: "Thời gian remux/ingest (giây)", upload_seconds: "Thời gian upload (giây)", sd_download_speed_requested_kbps: "Tốc độ SDK yêu cầu (kbps)", sd_download_speed_status: "Trạng thái tăng tốc SDK", sd_download_speed_error_code: "Mã SDK tốc độ", sd_interrupted: "Dừng sau file hiện tại"});
-      return Object.entries(job?.statistics || {}).filter(([key, value]) => Object.prototype.hasOwnProperty.call(labels, key) && (value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value) && value >= 0))).map(([key, value]) => [labels[key], value === null || value === "" ? "—" : String(value)]);
+    syncDetailFields(job, now = Date.now()) {
+      const labels = { manifests: "Manifest", matched: "Khớp nguồn", imported: "Đã nhập", already_known: "Đã có", uploaded: "Đã upload", failed: "Lỗi", ready: "Sẵn sàng", pending: "Chờ upload", remuxed: "Đã remux", remux_failed: "Lỗi remux", remux_budget_blocked: "Chờ dung lượng cache", needs_review: "Cần kiểm tra", upload_unknown: "Upload chưa xác nhận", deleted: "Đã xóa", failed_records: "Bản ghi lỗi", probe_tcp_open: "Cổng TCP mở", probe_error_type: "Lỗi kết nối", sd_backend: "Bộ tải SD", sd_searched: "Tìm thấy SD", sd_downloaded: "Đã tải SD", sd_imported: "Đã nhập SD", sd_deferred: "SD chờ tải", sd_backlog: "SD tồn đọng", sd_error_code: "Mã lỗi SD", sd_media_failed: "File lỗi đã cách ly", sd_media_error_code: "Mã lỗi media" };
+      Object.assign(labels, {sd_current_file_bytes: "File đang tải (byte)", sd_current_file_total_bytes: "Dung lượng file (byte)", sd_current_file_elapsed_seconds: "Thời gian file (giây)", sd_current_file_bytes_per_second: "Tốc độ TB file Camera→VPS (byte/s)", sd_download_bytes: "Tổng byte đã tải xong", sd_download_seconds: "Thời gian tải SD (giây)", sd_ingest_seconds: "Thời gian remux/ingest (giây)", upload_seconds: "Thời gian xử lý upload, gồm chờ lượt (giây)", upload_state: "Trạng thái upload", upload_transport: "Cách gửi đến Bot API", upload_current_file_total_bytes: "File upload hiện tại (byte)", upload_current_file_elapsed_seconds: "Thời gian yêu cầu upload (giây)", upload_last_file_bytes: "File đã xác nhận gần nhất (byte)", upload_last_file_seconds: "Thời gian yêu cầu gần nhất (giây)", upload_last_file_bytes_per_second: "Tốc độ TB file upload gần nhất (byte/s)", upload_last_file_confirmed_at: "Upload gần nhất được xác nhận lúc", upload_confirmed_bytes: "Tổng byte upload đã xác nhận", upload_request_seconds: "Thời gian yêu cầu upload thành công, không gồm chờ lượt (giây)", upload_bytes_per_second: "Tốc độ TB VPS→Telegram đã xác nhận (byte/s)", sd_download_speed_requested_kbps: "Tốc độ SDK yêu cầu (kbps)", sd_download_speed_status: "Trạng thái tăng tốc SDK", sd_download_speed_error_code: "Mã SDK tốc độ", sd_interrupted: "Dừng sau file hiện tại"});
+      const values = {...(job?.statistics || {})}, start = values.upload_current_file_started_at;
+      if (job?.state === "running" && values.upload_state === "sending" && typeof start === "number" && Number.isFinite(start) && start > 0 && Number.isFinite(now)) values.upload_current_file_elapsed_seconds = Math.max(0, Math.floor(now / 1000 - start));
+      return Object.entries(values).filter(([key, value]) => Object.prototype.hasOwnProperty.call(labels, key) && (value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value) && value >= 0))).map(([key, value]) => [labels[key], value === null || value === "" ? "—" : key === "upload_last_file_confirmed_at" ? (value > 0 ? helpers.syncTimestamp(value) : "—") : String(value)]);
     },
     syncTimestamp(value, compact = false) {
       const milliseconds = helpers.checkedMillis(value);
@@ -381,11 +408,15 @@
       time.title = helpers.syncTimestamp(job.created_at);
       summary.append(time, node("strong", "sync-log-camera", name));
     }
-    summary.append(chip(...helpers.syncState(job)), node("span", "sync-row-line", helpers.syncLine(job)), node("span", "sync-detail-label", "Detail"));
-    summary.setAttribute("aria-label", `Chi tiết đồng bộ ${name}${scope === "logs" ? ` · ${helpers.syncTimestamp(job.created_at)}` : ""} · ${helpers.syncState(job)[0]} · ${helpers.syncLine(job)}`);
+    const line = helpers.syncLine(job), lineNode = node("span", "sync-row-line", line);
+    lineNode.title = line;
+    summary.append(chip(...helpers.syncState(job)), lineNode, node("span", "sync-detail-label", "Detail"));
+    summary.setAttribute("aria-label", `Chi tiết đồng bộ ${name}${scope === "logs" ? ` · ${helpers.syncTimestamp(job.created_at)}` : ""} · ${helpers.syncState(job)[0]} · ${line}`);
     const body = node("div", "sync-row-detail");
     if (!job) body.append(node("p", "small muted", "Chưa có công việc sync. Bấm Start sync để bắt đầu."));
     else {
+      const transfer = helpers.syncTransfer(job);
+      if (transfer) body.append(node("p", "sync-detail-transfer", transfer));
       body.append(node("p", "sync-detail-message", job.message || "Chưa có thông báo"));
       const fields = node("dl", "sync-detail-fields");
       const metadata = [["Camera", name], ["Trạng thái", helpers.syncState(job)[0]], ["Giai đoạn", helpers.syncPhase(job)], ["Nguồn", job.source || "—"], ["Tạo lúc", helpers.syncTimestamp(job.created_at)], ["Bắt đầu", helpers.syncTimestamp(job.started_at)], ["Cập nhật", helpers.syncTimestamp(job.updated_at)], ["Kết thúc", helpers.syncTimestamp(job.finished_at)]];

@@ -385,6 +385,45 @@ def _copy_original(source, dest, settings, *, force_extension=None, probe_metada
             _confined_path(partial, dest.parent.resolve()).unlink()
 
 
+class MediaRemuxError(ValueError):
+    """Fixed, non-secret media failures; never a cache/DB/cleanup failure."""
+    _messages = {
+        'sd_remux_input_unsupported': 'Stream-copy MP4 input must be an existing MP4 or camera PS/TS file; source was retained',
+        'sd_remux_tool_unavailable': 'Stream-copy MP4 remux did not complete; source was retained',
+        'sd_remux_timeout': 'Stream-copy MP4 remux did not complete before its deadline; source was retained',
+        'sd_remux_failed': 'Stream-copy MP4 remux failed; source was retained',
+        'sd_remux_parameters_missing': 'Stream-copy MP4 remux failed because source stream parameters are incomplete; source was retained',
+        'sd_remux_codec_unsupported': 'Stream-copy MP4 remux failed because a source codec is unsupported in MP4; source was retained',
+        'sd_remux_timestamps_invalid': 'Stream-copy MP4 remux failed because source timestamps are invalid; source was retained',
+        'sd_remux_source_changed': 'Source changed during stream-copy remux; source was retained',
+        'sd_remux_output_invalid': 'Stream-copy remux did not produce an MP4 container; source was retained',
+    }
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(self._messages[code])
+
+
+def _remux_failure_code(stderr):
+    # Do not persist FFmpeg output: it can contain source names and paths.
+    # Only fixed reason codes may leave this process.
+    text = stderr[-65536:].decode('utf-8', errors='replace').lower() if isinstance(stderr, bytes) else ''
+    # A warning about media can precede a storage/tool failure. Never classify
+    # those operational failures as a skippable bad recording.
+    if any(item in text for item in ('no space left on device', 'disk quota exceeded',
+                                    'permission denied', 'read-only file system',
+                                    'input/output error', 'too many open files',
+                                    'cannot allocate memory', 'error opening output')):
+        return 'sd_remux_failed'
+    if any(item in text for item in ('sample rate not set', 'dimensions not set', 'could not find codec parameters')):
+        return 'sd_remux_parameters_missing'
+    if any(item in text for item in ('not supported in container', 'codec not currently supported in container', 'could not find tag for codec')):
+        return 'sd_remux_codec_unsupported'
+    if any(item in text for item in ('non monotonically increasing dts', 'invalid dts', 'pts has no value')):
+        return 'sd_remux_timestamps_invalid'
+    return 'sd_remux_failed'
+
+
 def _remux_copy(source, dest, settings):
     """MP4 output without any encoder, audio conversion or decode validation.
 
@@ -402,7 +441,7 @@ def _remux_copy(source, dest, settings):
         info = _copy_original(source, dest, settings, force_extension='.mp4', probe_metadata=False)
         return dict(info, processing_method='remux_copy', container='mov,mp4', probe_status='disabled')
     if container not in ('mpeg', 'mpegts'):
-        raise ValueError('Stream-copy MP4 input must be an existing MP4 or camera PS/TS file; source was retained')
+        raise MediaRemuxError('sd_remux_input_unsupported')
     partial = dest.with_suffix('.part.mp4')
     root = dest.parent.resolve()
     _confined_path(dest, root, allow_missing=True)
@@ -422,14 +461,16 @@ def _remux_copy(source, dest, settings):
                    '-movflags', '+faststart', str(partial)]
         try:
             result = subprocess.run(command, capture_output=True, timeout=300, env=environment)
+        except subprocess.TimeoutExpired:
+            raise MediaRemuxError('sd_remux_timeout') from None
         except (OSError, subprocess.SubprocessError):
-            raise ValueError('Stream-copy MP4 remux did not complete; source was retained') from None
+            raise MediaRemuxError('sd_remux_tool_unavailable') from None
         if result.returncode:
-            raise ValueError('Stream-copy MP4 remux failed; source was retained')
+            raise MediaRemuxError(_remux_failure_code(result.stderr))
         current = source.stat()
         if (current.st_size != before.st_size or current.st_mtime_ns != before.st_mtime_ns
                 or (current.st_ino, current.st_dev) != (before.st_ino, before.st_dev)):
-            raise ValueError('Source changed during stream-copy remux; source was retained')
+            raise MediaRemuxError('sd_remux_source_changed')
         output = _confined_path(partial, root)
         output_size = output.stat().st_size
         with output.open('rb') as handle:
@@ -437,7 +478,7 @@ def _remux_copy(source, dest, settings):
             handle.seek(0)
             digest = hashlib.file_digest(handle, 'sha256').hexdigest()
         if output_size <= 0 or output_extension != '.mp4' or output_size > before.st_size * 2:
-            raise ValueError('Stream-copy remux did not produce an MP4 container; source was retained')
+            raise MediaRemuxError('sd_remux_output_invalid')
         _confined_path(dest, root, allow_missing=True)
         output.replace(dest)
         return {'duration': None, 'codec_video': None, 'codec_audio': None,
@@ -1193,6 +1234,30 @@ class Archive:
         dest = _confined_path(self._cache_root/(key+'.mp4'), self._cache_root, allow_missing=True)
         info = _copy_original(source, dest, self.settings, probe_metadata=False)
         return self._store_media(key, info, dest, duration, status='needs_review', error='failed_remux')
+
+    def retained_remux_failure(self, key):
+        """Confirm a durable, unposted original before skipping a bad SD clip."""
+        if not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{64}', key):
+            return False
+        row = self.conn.execute('''SELECT * FROM recordings WHERE key=?
+            AND status='needs_review' AND last_error='failed_remux'
+            AND deleted_at IS NULL AND media_expired_at IS NULL
+            AND processing_method='passthrough'
+            AND coalesce(chat_id,'')='' AND message_id IS NULL
+            AND coalesce(file_id,'')='' AND coalesce(file_unique_id,'')=''
+            AND storage_chat_id IS NULL AND storage_message_id IS NULL
+            AND upload_target_chat_id IS NULL AND bot_id IS NULL
+            AND coalesce(attempt_id,'')='' AND uploaded_at IS NULL''', (key,)).fetchone()
+        if (row is None or not row['local_path'] or not row['file_size']
+                or not re.fullmatch(r'[a-f0-9]{64}', row['sha256'] or '')):
+            return False
+        try:
+            path = _confined_path(row['local_path'], self._cache_root)
+            return (path.parent == self._cache_root
+                    and re.fullmatch(re.escape(key) + r'\.[a-z0-9]{1,10}', path.name) is not None
+                    and path.stat().st_size == row['file_size'])
+        except (OSError, TypeError, ValueError):
+            return False
 
     def ingest_manifest(self, path, dry_run=False, continue_on_error=False, camera=None):
         if camera is not None and (not isinstance(camera,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',camera)):

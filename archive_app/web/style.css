@@ -21,6 +21,7 @@
 details[open]>.sync-row-summary .sync-detail-label:after{transform:rotate(90deg)}
 .sync-row-detail{padding:12px;border-top:1px solid #e3eaf5;color:#465874;background:white;border-radius:0 0 8px 8px;overflow-wrap:anywhere}
 .sync-detail-message{font-size:12px;line-height:1.75;white-space:pre-wrap;margin:0 0 13px}
+.sync-detail-transfer{font-size:12px;line-height:1.7;font-weight:600;font-variant-numeric:tabular-nums;color:#31579b;margin:0 0 10px;overflow-wrap:anywhere}
 .sync-detail-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 18px;margin:0;font-size:11px}
 .sync-detail-fields>div{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid #edf0f5;min-width:0}
 .sync-detail-fields dt{color:#6d7d93;flex:1;min-width:0}
