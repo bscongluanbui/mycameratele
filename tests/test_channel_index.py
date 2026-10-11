@@ -114,11 +114,12 @@ class ChannelIndexTests(unittest.TestCase):
     def test_first_record_creates_root_year_month_day_with_real_links(self):
         self.record()
         self.assertEqual(self.run_job(), 'updated')
-        self.assertEqual(len(self.sends()), 4)
+        self.assertEqual(len(self.sends()), 5)
         root, year, month, day = [self.node(kind, period) for kind, period in
             (('root', 'root'), ('year', '2026'), ('month', '2026-10'), ('day', '2026-10-10'))]
         self.assertEqual(self.telegram.pins, [(self.channel, root['tg_message_id'])])
-        self.assertIn(year['tg_message_url'], self.text('root', 'root'))
+        self.assertIn(self.node('years', 'years')['tg_message_url'], self.text('root', 'root'))
+        self.assertIn(year['tg_message_url'], self.text('years', 'years'))
         self.assertIn(root['tg_message_url'], self.text('year', '2026'))
         self.assertIn(month['tg_message_url'], self.text('year', '2026'))
         self.assertIn(day['tg_message_url'], self.text('month', '2026-10'))
@@ -137,15 +138,15 @@ class ChannelIndexTests(unittest.TestCase):
         self.assertEqual({method for method, _ in self.telegram.calls}, {'sendMessage', 'editMessageText', 'pinChatMessage'})
         self.assertTrue(next(fields for method, fields in self.telegram.calls if method == 'pinChatMessage')['disable_notification'])
 
-    def test_six_four_hour_buckets_use_first_recorded_not_first_uploaded(self):
+    def test_twenty_four_hours_use_first_recorded_not_first_uploaded(self):
         for hour in range(24):
             self.record(f'2026-10-10T{hour:02d}:00:00+07:00', message=200 + hour)
         self.run_job()
         text = self.text('day', '2026-10-10')
-        for bucket in range(6):
-            self.assertIn(f'{bucket * 4:02d}:00–{bucket * 4 + 3:02d}:59 · 4 video', text)
-            self.assertIn(f'/c/1111111111/{200 + bucket * 4}', text)
-        self.assertIn('Tổng: 24 video', text)
+        for hour in range(24):
+            self.assertIn(f'{hour:02d}:00', text)
+            self.assertIn(f'/c/1111111111/{200 + hour}', text)
+        self.assertNotIn('Tổng:', text)
         self.assertIn('/c/1111111111/223', text)
 
     def test_unchanged_jobs_keep_stable_message_ids_and_do_not_edit(self):
@@ -163,9 +164,9 @@ class ChannelIndexTests(unittest.TestCase):
         day = self.node('day', '2026-10-10')['tg_message_id']
         self.record('2026-10-10T09:00:00+07:00', message=78)
         self.run_job()
-        self.assertEqual(len(self.sends()), 4)
+        self.assertEqual(len(self.sends()), 5)
         self.assertEqual(day, self.node('day', '2026-10-10')['tg_message_id'])
-        self.assertIn('Tổng: 2 video', self.text('day', '2026-10-10'))
+        self.assertIn('09:00', self.text('day', '2026-10-10'))
 
     def test_late_record_creates_its_old_date_not_upload_date(self):
         self.record()
@@ -179,7 +180,7 @@ class ChannelIndexTests(unittest.TestCase):
         self.assertIn('01/01/2025', self.text('day', '2025-01-01'))
         self.assertIn('10/10/2026', self.text('root', 'root'))
         self.assertIn('https://t.me/c/1111111111/77', latest)
-        self.assertEqual(len(self.sends()), 7)
+        self.assertEqual(len(self.sends()), 8)
 
     def test_midnight_overlap_is_uploaded_once_and_indexed_by_start(self):
         key = self.record('2026-10-10T23:59:30+07:00', end='2026-10-11T00:00:30+07:00')
@@ -200,7 +201,7 @@ class ChannelIndexTests(unittest.TestCase):
         self.now += 61
         self.assertEqual(self.index.process_one(), 'updated')
         self.assertEqual(self.index.process_one(), 'updated')
-        self.assertEqual(len(self.sends()), 8)
+        self.assertEqual(len(self.sends()), 10)
         self.assertIn('/c/2222222222/77', self.text('day', '2026-10-10', 'CAM02', other))
         self.assertNotIn('/c/1111111111/77', self.text('day', '2026-10-10', 'CAM02', other))
 
@@ -241,19 +242,43 @@ class ChannelIndexTests(unittest.TestCase):
         self.assertTrue(self.archive.soft_delete(key, 23))
         self.now += 61
         self.index.process_one()
-        self.assertIn('Tổng: 0 video', self.text('day', '2026-10-10'))
+        self.assertIn('— Chưa có dữ liệu', self.text('day', '2026-10-10'))
         self.assertNotIn('/c/1111111111/77', self.text('day', '2026-10-10'))
         self.assertIn('Chưa có video', self.text('root', 'root'))
         self.assertTrue(self.archive.restore_recording(key, 23))
         self.now += 61
         self.index.process_one()
-        self.assertIn('Tổng: 1 video', self.text('day', '2026-10-10'))
-        self.assertEqual(len(self.sends()), 4)
+        self.assertIn('/c/1111111111/77', self.text('day', '2026-10-10'))
+        self.assertEqual(len(self.sends()), 5)
         self.assertEqual(self.archive.conn.execute('SELECT status FROM recordings WHERE key=?', (key,)).fetchone()[0], 'uploaded')
 
     def test_empty_date_does_not_create_empty_years_or_nodes(self):
         self.assertEqual(self.run_job(day='2025-01-01'), 'updated')
         self.assertEqual(self.sends(), [])
+
+    def test_shutdown_does_not_start_a_new_navigation_send(self):
+        import threading
+        event=threading.Event();event.set()
+        self.index=ChannelIndex(self.archive,self.telegram,stop_event=event)
+        self.record()
+        self.assertEqual(self.run_job(),'retry')
+        self.assertEqual(self.sends(),[])
+        self.assertIsNone(self.node('root','root'))
+
+    def test_shutdown_after_confirmed_send_preserves_id_and_resumes_without_duplicate(self):
+        import threading
+        event=threading.Event()
+        self.index=ChannelIndex(self.archive,self.telegram,stop_event=event)
+        self.record()
+        self.telegram.hook=lambda method,fields:event.set()
+        self.assertEqual(self.run_job(),'retry')
+        root=self.node('root','root')
+        self.assertEqual(root['state'],'ready')
+        self.assertEqual(len(self.sends()),1)
+        event.clear();self.now+=2
+        self.assertEqual(self.index.process_one(),'updated')
+        self.assertEqual(self.node('root','root')['tg_message_id'],root['tg_message_id'])
+        self.assertEqual(len(self.sends()),5)
 
     def test_current_channel_only_legacy_remains_untouched(self):
         self.record(channel=-1003333333333, message=99)
@@ -279,7 +304,7 @@ class ChannelIndexTests(unittest.TestCase):
         self.assertFalse(self.index.enqueue_recording(key))
         self.record(channel=new, message=100)
         self.run_job()
-        self.assertEqual(len(self.sends()), 8)
+        self.assertEqual(len(self.sends()), 10)
         self.assertEqual(self.node('root', 'root')['tg_message_id'], old)
         self.assertIn('/c/4444444444/100', self.text('day', '2026-10-10', channel=new))
         self.assertNotIn('/c/1111111111/77', self.text('day', '2026-10-10', channel=new))
@@ -325,7 +350,7 @@ class ChannelIndexTests(unittest.TestCase):
             other_api.messages, other_api.next_id = self.telegram.messages, self.telegram.next_id
             self.assertEqual(other.process_one(), 'updated')
             self.assertEqual(len([x for x in other_api.calls if x[0] == 'sendMessage']), 1)
-            self.assertEqual(self.archive.conn.execute('SELECT COUNT(*) FROM channel_index_messages').fetchone()[0], 5)
+            self.assertEqual(self.archive.conn.execute('SELECT COUNT(*) FROM channel_index_messages').fetchone()[0], 6)
         finally:
             other_archive.close()
 
@@ -337,7 +362,7 @@ class ChannelIndexTests(unittest.TestCase):
         self.assertEqual(self.index.process_one(), 'retry')
         self.assertEqual(self.archive.conn.execute('SELECT status FROM channel_index_jobs').fetchone()[0], 'pending')
         self.assertEqual(self.index.process_one(), 'updated')
-        self.assertEqual(len(self.sends()), 4)
+        self.assertEqual(len(self.sends()), 5)
 
     def test_429_keeps_node_pending_and_respects_global_retry_after(self):
         self.record()
@@ -369,7 +394,7 @@ class ChannelIndexTests(unittest.TestCase):
         self.index.rebuild('CAM01', dry_run=False)
         self.assertEqual(self.index.process_one(), 'updated')
         self.assertEqual(self.node('root', 'root')['tg_message_id'], root)
-        self.assertEqual(len(self.sends()), 4)
+        self.assertEqual(len(self.sends()), 5)
 
     def test_timeout_send_needs_reconcile_and_rebuild_does_not_duplicate(self):
         self.record()
@@ -413,7 +438,7 @@ class ChannelIndexTests(unittest.TestCase):
         self.assertEqual(self.index.reconcile('CAM01', self.channel, 'root', 'root', accepted), channel_message_url(self.channel, accepted))
         self.assertEqual(self.index.process_one(), 'updated')
         self.assertEqual(self.node('root', 'root')['tg_message_id'], accepted)
-        self.assertEqual(len(self.sends()), 4)
+        self.assertEqual(len(self.sends()), 5)
         with self.assertRaises(ValueError):
             self.index.reconcile('CAM01', self.channel, 'root', 'root', accepted)
 
@@ -439,7 +464,7 @@ class ChannelIndexTests(unittest.TestCase):
             self.archive.conn.execute("UPDATE channel_index_jobs SET status='running',lease_owner='dead',lease_until=?", (self.now - 1,))
         self.assertEqual(self.index.recover(), 1)
         self.assertEqual(self.index.process_one(), 'updated')
-        self.assertEqual(len(self.sends()), 4)
+        self.assertEqual(len(self.sends()), 5)
 
     def test_edit_timeout_retries_same_id_not_a_send(self):
         self.record()
@@ -451,14 +476,14 @@ class ChannelIndexTests(unittest.TestCase):
         self.now += 61
         self.assertEqual(self.index.process_one(), 'updated')
         self.assertEqual(self.node('root', 'root')['tg_message_id'], old)
-        self.assertEqual(len(self.sends()), 4)
+        self.assertEqual(len(self.sends()), 5)
 
     def test_edit_not_modified_is_success(self):
         self.record()
         self.run_job()
         self.index.rebuild('CAM01', dry_run=False)
         self.assertEqual(self.index.process_one(), 'updated')
-        self.assertEqual(len(self.sends()), 4)
+        self.assertEqual(len(self.sends()), 5)
 
     def test_deleted_day_is_recreated_once_and_parent_link_repaired(self):
         self.record()
@@ -469,7 +494,7 @@ class ChannelIndexTests(unittest.TestCase):
         self.assertEqual(self.index.process_one(), 'updated')
         new = self.node('day', '2026-10-10')['tg_message_id']
         self.assertNotEqual(new, old)
-        self.assertEqual(len(self.sends()), 5)
+        self.assertEqual(len(self.sends()), 6)
         self.assertIn(channel_message_url(self.channel, new), self.text('month', '2026-10'))
         self.assertNotIn(channel_message_url(self.channel, old), self.text('month', '2026-10'))
 
@@ -488,7 +513,7 @@ class ChannelIndexTests(unittest.TestCase):
                 break
         new = self.node('root', 'root')['tg_message_id']
         self.assertNotEqual(new, old)
-        self.assertEqual(len(self.sends()), 8)
+        self.assertEqual(len(self.sends()), 9)
         self.assertIn((self.channel, new), self.telegram.pins)
         for year in ('2025', '2026'):
             self.assertIn(channel_message_url(self.channel, new), self.text('year', year))
@@ -500,7 +525,7 @@ class ChannelIndexTests(unittest.TestCase):
         self.index.rebuild('CAM01', dry_run=False)
         self.telegram.failure = ('editMessageText', ApiRejected(400, description="Bad Request: message can't be edited"))
         self.assertEqual(self.index.process_one(), 'blocked')
-        self.assertEqual(len(self.sends()), 4)
+        self.assertEqual(len(self.sends()), 5)
 
     def test_rebuild_dry_run_is_offline_and_apply_never_sends_directly(self):
         self.record()
@@ -535,7 +560,9 @@ class ChannelIndexTests(unittest.TestCase):
                     VALUES(?,?,'year',?,?,'ready',?)''', ('CAM01', self.channel, str(year), year, self.now))
         text = self.index._render('CAM01', self.channel, 'root', 'root')
         self.assertLessEqual(len(text.encode('utf-16-le')) // 2, 4096)
-        self.assertIn('55 năm khác', text.splitlines())
+        self.assertNotIn('năm khác', text)
+        self.assertIn('Kho lưu trữ theo năm', text)
+        self.assertLess(len(text.splitlines()), 9)
         self.assertNotIn('tìm trong bot', text)
         self.assertIn('&amp;', text)
 

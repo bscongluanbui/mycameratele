@@ -55,7 +55,7 @@ def main():
     index.add_argument('--apply',action='store_true')
     index_reconcile=subs.add_parser('reconcile-index',help='Confirm a previously uncertain index send with exact Telegram message ID.')
     index_reconcile.add_argument('--camera',required=True);index_reconcile.add_argument('--chat-id',type=int,required=True)
-    index_reconcile.add_argument('--type',choices=('root','year','month','day'),required=True)
+    index_reconcile.add_argument('--type',choices=('root','years','year','month','day','hour'),required=True)
     index_reconcile.add_argument('--period',required=True);index_reconcile.add_argument('--message-id',type=int,required=True)
     args=parser.parse_args()
     if args.command=='network-routes':
@@ -206,7 +206,7 @@ def main():
                 from .channel_index import ChannelIndex
                 index_archive=Archive(settings)
                 try:
-                    worker=ChannelIndex(index_archive,Telegram(settings));worker.recover()
+                    worker=ChannelIndex(index_archive,Telegram(settings),stop_event=heartbeat_stop);worker.recover()
                     while not heartbeat_stop.is_set():
                         try:
                             result=worker.process_one()

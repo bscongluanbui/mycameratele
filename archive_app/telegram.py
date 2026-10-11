@@ -229,14 +229,15 @@ class Telegram:
         end = from_epoch_ms(row['end_ms'],zone)
         if self.settings.multi_channel_routing:
             seconds=max(1,(row['end_ms']-row['start_ms'])//1000)
-            duration=f'{seconds//60:02d}:{seconds%60:02d}'
+            hours,remainder=divmod(seconds,3600)
+            minutes,seconds=divmod(remainder,60)
+            duration=' '.join(label for amount,label in (
+                (hours,f'{hours:02d} giờ'),(minutes,f'{minutes:02d} phút'),
+                (seconds,f'{seconds:02d} giây')) if amount)
             end_label=end.strftime('%H:%M:%S') if start.date()==end.date() else end.strftime('%d/%m/%Y %H:%M:%S')
-            camera=row['camera'];tag=re.sub(r'[^A-Za-z0-9_]', '_', camera)
-            size=(row.get('file_size') or 0)/1e6
-            return (f'🎥 {camera} | {archive.camera_name(camera)}\n'
-                    f'📅 {start:%d/%m/%Y}\n🕒 {start:%H:%M:%S} → {end_label}\n'
-                    f'⏱ {duration} | 📦 {size:.1f} MB\n'
-                    f'#{tag} #Y{start:%Y} #M{start:%Y%m} #D{start:%Y%m%d}')
+            return (f"🎥 {archive.camera_name(row['camera'])}\n"
+                    f'📅 {start:%d/%m/%Y}\n🕒 {start:%H:%M:%S} – {end_label}\n'
+                    f'⏱ {duration}')
         return f"{archive.camera_name(row['camera'])} | {start.isoformat()} → {end.isoformat()}\nArchive: {row['key']}"
 
     @property

@@ -1,9 +1,18 @@
-# MyCameraTele — House01 Private Channel Archive
+# MyCameraTele — Camera Private Channel Archive
 
-**House01 MVP** dùng một private channel làm kho video, SQLite làm mục lục và
-bot hiện có làm giao diện tra cứu. Recording mới chỉ upload vào private channel;
-owner/viewer nhận phản hồi trong private chat **khi chủ động yêu cầu**, không nhận
-mỗi recording mới. Mục lục: **Camera → Năm → Tháng → Ngày → Video**, có Cũ → Mới.
+**Mỗi camera một private channel** khi bật multi-channel routing; SQLite giữ
+thời gian ghi hình và đích Telegram đã xác nhận. Mỗi channel chỉ ghim **một
+Trang chủ** ngắn, cố định: **Video mới nhất · Hôm nay/ngày gần nhất · Tháng hiện
+tại · Kho lưu trữ theo năm · Bot quản lý**. Mục lục trong channel đi theo
+**Năm → Tháng → Ngày → Giờ → Video**, chỉ dẫn tới dữ liệu đã có. Clip tải bù
+vẫn xếp theo thời gian ghi hình, không theo thời gian upload; giờ bị đảo thứ tự
+hoặc gián đoạn bài đăng có danh sách clip riêng. Chi tiết tại
+[mô hình điều hướng channel](docs/CHANNEL_NAVIGATION_MODEL.md).
+
+Bot hiện có vẫn là lối tra cứu bổ sung. Owner/viewer nhận phản hồi trong private
+chat **khi chủ động yêu cầu**, không nhận mỗi recording mới. Chế độ một kho
+House01 cũ vẫn dùng được khi multi-channel routing chưa bật; không tự di chuyển
+video hoặc ghi đè channel/message ID đã lưu.
 
 Menu dùng các nút một cột với nhãn ngắn: **Start / Menu**, **Hôm nay → Camera → Video**,
 **Hôm qua**, **6 giờ trước**, **Tuần này**, **Tuần trước**, **Tùy chọn thời gian** và **Start sync**.
@@ -22,7 +31,7 @@ người khác. Lượt gửi chưa xác nhận vẫn không tự gửi lại.
 Camera SD → lịch 15 phút / Start sync
   → HCNetSDK hoặc ISAPI → tải recording đã đóng
   → MP4 remux-copy (-c copy, không encode) → cache trung chuyển + SQLite
-  → private storage channel House01 → file_id
+  → private channel đã gắn với camera → file_id
   → người được phép yêu cầu bot → phản hồi trong private chat
 ```
 

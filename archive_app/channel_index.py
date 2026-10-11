@@ -50,13 +50,15 @@ class ChannelIndex:
     rebuild(..., dry_run=True) is an offline plan; False only enqueues work.
     """
     LEASE_SECONDS = 600
-    NAVIGATION_VERSION = 3
+    NAVIGATION_VERSION = 4
+    PAGE_SIZE = 20
     MAX_ROOT_YEARS = 12
     MAX_ROOT_MONTHS = 12
     MAX_ROOT_DAYS = 7
 
-    def __init__(self, archive, telegram):
+    def __init__(self, archive, telegram, *, stop_event=None):
         self.archive, self.telegram = archive, telegram
+        self.stop_event = stop_event
         self.conn, self.settings = archive.conn, archive.settings
         self.zone = get_zone(self.settings.timezone)
         self.owner = secrets.token_hex(16)
@@ -68,7 +70,7 @@ class ChannelIndex:
             '''CREATE TABLE IF NOT EXISTS channel_index_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 camera_id TEXT NOT NULL, channel_chat_id INTEGER NOT NULL,
-                index_type TEXT NOT NULL CHECK(index_type IN ('root','year','month','day')),
+                index_type TEXT NOT NULL CHECK(index_type IN ('root','years','year','month','day','hour')),
                 period_key TEXT NOT NULL, tg_message_id INTEGER, tg_message_url TEXT,
                 state TEXT NOT NULL DEFAULT 'pending', revision INTEGER NOT NULL DEFAULT 0,
                 last_render_hash TEXT, pinned INTEGER NOT NULL DEFAULT 0,
@@ -95,6 +97,8 @@ class ChannelIndex:
         )
         for statement in statements:
             self.conn.execute(statement)
+        from .channel_index_schema import ensure_index_message_schema
+        ensure_index_message_schema(self.conn, statements[0])
         # CREATE TABLE does not commit a caller's pending writes. Root creates
         # this helper before entering the recording mutation transaction.
 
@@ -197,6 +201,11 @@ class ChannelIndex:
         return bool(days)
 
     def _range(self, kind, period):
+        if kind == 'hour':
+            value, _ = self._page(period)
+            start = datetime.strptime(value, '%Y-%m-%dT%H').replace(tzinfo=self.zone)
+            end = start + timedelta(hours=1)
+            return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
         if kind == 'day':
             start = date.fromisoformat(period)
             end = start + timedelta(days=1)
@@ -259,6 +268,66 @@ class ChannelIndex:
             return self._link(label, channel_message_url(channel, node['tg_message_id']))
         return None
 
+    @staticmethod
+    def _page(period):
+        value, separator, page = period.partition(':')
+        if separator and (not page.isdecimal() or not 2 <= int(page) <= 10000):
+            raise ValueError('Invalid navigation page')
+        return value, int(page) if separator else 1
+
+    @staticmethod
+    def _page_key(value, page):
+        return value if page == 1 else f'{value}:{page}'
+
+    def _available_periods(self, camera, channel, kind):
+        rows = self.conn.execute('''SELECT period_key FROM channel_index_messages
+            WHERE camera_id=? AND channel_chat_id=? AND index_type=? AND state='ready'
+            AND tg_message_id BETWEEN 1 AND 2147483647 ORDER BY period_key''',
+            (camera, channel, kind))
+        return [row[0] for row in rows if self._count(camera, channel, kind, row[0])]
+
+    def _hour_records(self, camera, channel, period):
+        value, _ = self._page(period)
+        hour = datetime.strptime(value, '%Y-%m-%dT%H').hour
+        cache = getattr(self, '_day_records_cache', None)
+        if cache is None:
+            cache = self._day_records_cache = {}
+        cache_key = (camera, channel, value[:10])
+        if cache_key not in cache:
+            buckets, seen = [[] for _ in range(24)], set()
+            for row in self._records(camera, channel, 'day', value[:10]):
+                identity = row['storage_message_id']
+                if identity not in seen:
+                    seen.add(identity)
+                    buckets[from_epoch_ms(row['start_ms'], self.zone).hour].append(row)
+            cache[cache_key] = buckets
+        return cache[cache_key][hour]
+
+    @staticmethod
+    def _contiguous(rows):
+        # Consecutive message IDs in recording-time order are a conservative
+        # proof that scrolling visits every clip. Backfill/gaps use a list.
+        return all(right['storage_message_id'] == left['storage_message_id'] + 1
+                   for left, right in zip(rows, rows[1:]))
+
+    def _neighbors(self, camera, channel, kind, period):
+        periods = self._available_periods(camera, channel, kind)
+        before = [value for value in periods if value < period]
+        after = [value for value in periods if value > period]
+        return (before[-1] if before else None, after[0] if after else None)
+
+    def _neighbor_links(self, camera, channel, kind, period, parent):
+        previous, following = self._neighbors(camera, channel, kind, period)
+        label = 'Ngày' if kind == 'day' else 'Tháng'
+        links = []
+        if previous:
+            links.append(self._node_link(camera, channel, kind, previous, f'← {label} trước'))
+        if parent:
+            links.append(parent)
+        if following:
+            links.append(self._node_link(camera, channel, kind, following, f'{label} sau →'))
+        return ' | '.join(link for link in links if link)
+
     def _bot_link(self):
         username = getattr(self.settings, 'bot_username', '') or self.archive.state('telegram_bot_username') or ''
         if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', username):
@@ -310,6 +379,10 @@ class ChannelIndex:
                 for row in roots:
                     self._enqueue(row['camera_id'], row['channel_chat_id'], row['recorded_date'], immediate=True)
                     queued += 1
+                    if markers.get('pin_navigation_version') != self.NAVIGATION_VERSION:
+                        # Upgrade every existing day in-place, not just the
+                        # latest pin. No media copies or recording rewrites.
+                        self.enqueue_camera(row['camera_id'], commit=False)
                 for name, value in (('pin_navigation_version', self.NAVIGATION_VERSION), ('pin_today_ordinal', today)):
                     self.conn.execute('''INSERT INTO channel_index_runtime(name,value) VALUES(?,?)
                         ON CONFLICT(name) DO UPDATE SET value=excluded.value''', (name, value))
@@ -321,101 +394,132 @@ class ChannelIndex:
         return queued
 
     def _render(self, camera, channel, kind, period):
+        self._day_records_cache = {}
         info = self._camera(camera)
         name = html.escape(str(info['name'])[:80])
-        identity = name
         lines = []
         if kind == 'root':
             today = datetime.fromtimestamp(time.time(), self.zone).date()
-            lines = [f'📌 KHO VIDEO – {identity}', '']
-            today_link = None
+            lines = [f'📌 <b>KHO VIDEO – {name}</b>', '']
+            latest = self._records(camera, channel, descending=True, limit=1).fetchone()
+            if latest:
+                lines.append(self._link('🎬 Video mới nhất', channel_message_url(channel, latest['storage_message_id'])))
+            else:
+                lines.append('🎬 Video mới nhất · Chưa có video')
             if self._count(camera, channel, 'day', today.isoformat()):
-                today_link = self._node_link(camera, channel, 'day', today.isoformat(),
-                    'Hôm nay')
-            lines.append(today_link or 'Hôm nay')
-            lines.extend(('', 'Năm'))
-            years = list(self.conn.execute('''SELECT period_key FROM channel_index_messages
-                WHERE camera_id=? AND channel_chat_id=? AND index_type='year' AND state='ready'
-                ORDER BY period_key DESC''', (camera, channel)))
-            active = [row[0] for row in years if self._count(camera, channel, 'year', row[0])]
-            for year in active[:self.MAX_ROOT_YEARS]:
+                day, label = today.isoformat(), '📅 Hôm nay'
+            elif latest:
+                parsed = from_epoch_ms(latest['start_ms'], self.zone).date()
+                day, label = parsed.isoformat(), f'📅 Ngày gần nhất có video · {parsed:%d/%m/%Y}'
+            else:
+                day, label = today.isoformat(), '📅 Hôm nay · Chưa có video'
+            lines.append((self._node_link(camera, channel, 'day', day, label) or label) if latest else label)
+            month = today.strftime('%Y-%m')
+            current = self._node_link(camera, channel, 'month', month, '🗓 Tháng hiện tại') if self._count(camera, channel, 'month', month) else None
+            lines.append(current or '🗓 Tháng hiện tại · Chưa có video')
+            lines.append(self._node_link(camera, channel, 'years', 'years', '📁 Kho lưu trữ theo năm') or '📁 Kho lưu trữ theo năm')
+            lines.append(self._bot_link() or '🤖 Bot quản lý')
+        elif kind == 'years':
+            value, page = self._page(period)
+            if value != 'years':
+                raise ValueError('Invalid year list period')
+            years = list(reversed(self._available_periods(camera, channel, 'year')))
+            lines = [f'📁 <b>KHO LƯU TRỮ – {name}</b>', '']
+            for year in years[(page-1)*self.PAGE_SIZE:page*self.PAGE_SIZE]:
                 link = self._node_link(camera, channel, 'year', year, f'📁 {year}')
                 if link:
                     lines.append(link)
-            if len(active) > self.MAX_ROOT_YEARS:
-                lines.append(f'{len(active) - self.MAX_ROOT_YEARS} năm khác')
-            lines.extend(('', 'Tháng'))
-            for month in self._recent_periods(camera, channel, 'month', self.MAX_ROOT_MONTHS):
-                parsed = date.fromisoformat(month + '-01')
-                lines.append(self._node_link(camera, channel, 'month', month, f'📆 {parsed:%m/%Y}'))
-            lines.extend(('', 'Ngày'))
-            for day in self._recent_periods(camera, channel, 'day', self.MAX_ROOT_DAYS):
-                parsed = date.fromisoformat(day)
-                lines.append(self._node_link(camera, channel, 'day', day, f'🗓 {parsed:%d/%m/%Y}'))
-            latest = self._records(camera, channel, descending=True, limit=1).fetchone()
-            if latest:
-                lines.append('')
-                lines.append(self._link('🎬 Video mới nhất', channel_message_url(
-                    latest['storage_chat_id'], latest['storage_message_id'])))
-            else:
+            if not years[(page-1)*self.PAGE_SIZE:page*self.PAGE_SIZE]:
                 lines.append('Chưa có video')
-            bot = self._bot_link()
-            if bot:
-                lines.extend(('', bot))
+            links = []
+            if page > 1:
+                links.append(self._node_link(camera, channel, 'years', self._page_key('years', page-1), '← Trước'))
+            if page*self.PAGE_SIZE < len(years):
+                links.append(self._node_link(camera, channel, 'years', self._page_key('years', page+1), 'Sau →'))
+            links.append(self._node_link(camera, channel, 'root', 'root', '← Trang chủ'))
+            lines.extend(('', ' | '.join(link for link in links if link)))
         elif kind == 'year':
-            lines = [f'📁 {identity} | NĂM {period}', '']
-            for month in range(1, 13):
-                key = f'{period}-{month:02d}'
-                if self._count(camera, channel, 'month', key):
-                    link = self._node_link(camera, channel, 'month', key, f'📆 Tháng {month:02d}')
-                    if link:
-                        lines.append(link)
-            link = self._node_link(camera, channel, 'root', 'root', '⬆️ Mục lục chính')
-            if link:
-                lines.extend(('', link))
+            lines = [f'📁 <b>NĂM {period} – {name}</b>', '', 'Quý I | Quý II | Quý III | Quý IV']
+            for offset in range(1, 4):
+                row = []
+                for month in (offset, offset+3, offset+6, offset+9):
+                    key = f'{period}-{month:02d}'
+                    link = self._node_link(camera, channel, 'month', key, f'{month:02d}') if self._count(camera, channel, 'month', key) else None
+                    row.append(link or f'{month:02d} —')
+                lines.append(' · '.join(row))
+            link = self._node_link(camera, channel, 'years', 'years', '← Danh sách năm')
+            home = self._node_link(camera, channel, 'root', 'root', 'Trang chủ')
+            lines.extend(('', ' | '.join(value for value in (link, home) if value)))
         elif kind == 'month':
-            parsed = date.fromisoformat(period + '-01')
-            lines = [f'📅 {identity} | THÁNG {parsed:%m/%Y}', '']
+            parsed = date.fromisoformat(period+'-01')
+            lines = [f'📅 <b>THÁNG {parsed:%m/%Y} – {name}</b>', '']
+            cells, populated, total = [], 0, 0
             for number in range(1, 32):
                 try:
                     day = date(parsed.year, parsed.month, number)
                 except ValueError:
                     break
-                if self._count(camera, channel, 'day', day.isoformat()):
-                    link = self._node_link(camera, channel, 'day', day.isoformat(), f'{day:%d/%m}')
-                    if link:
-                        lines.append(link)
-            lines.extend(('', f'Tổng: {self._count(camera, channel, kind, period)} video'))
-            link = self._node_link(camera, channel, 'year', period[:4], f'⬅️ Năm {period[:4]}')
-            if link:
-                lines.append(link)
-        else:
+                total += 1
+                exists = self._count(camera, channel, 'day', day.isoformat())
+                populated += bool(exists)
+                link = self._node_link(camera, channel, 'day', day.isoformat(), f'{number:02d}') if exists else None
+                cells.append(link or f'{number:02d} —')
+                if len(cells) == 7:
+                    lines.append(' · '.join(cells)); cells = []
+            if cells:
+                lines.append(' · '.join(cells))
+            lines.extend(('', f'Có video: {populated}/{total} ngày', '— Chưa có dữ liệu'))
+            parent = self._node_link(camera, channel, 'year', period[:4], f'Năm {period[:4]}')
+            lines.append(self._neighbor_links(camera, channel, kind, period, parent))
+        elif kind == 'day':
             parsed = date.fromisoformat(period)
-            lines = [f'🗓 {identity} | NGÀY {parsed:%d/%m/%Y}', '']
-            buckets = [{'count': 0, 'first': None} for _ in range(6)]
-            first = last = None
-            for row in self._records(camera, channel, 'day', period):
-                bucket = buckets[from_epoch_ms(row['start_ms'], self.zone).hour // 4]
-                bucket['count'] += 1
-                bucket['first'] = bucket['first'] or row
-                first, last = first or row, row
-            for number, bucket in enumerate(buckets):
-                label = f'{number * 4:02d}:00–{number * 4 + 3:02d}:59 · {bucket["count"]} video'
-                row = bucket['first']
-                lines.append(self._link(label, channel_message_url(row['storage_chat_id'],
-                    row['storage_message_id'])) if row else label)
-            lines.extend(('', f'Tổng: {sum(bucket["count"] for bucket in buckets)} video'))
-            for label, row in (('🔗 Video đầu ngày', first), ('🔗 Video cuối ngày', last)):
-                if row:
-                    lines.append(self._link(label, channel_message_url(row['storage_chat_id'], row['storage_message_id'])))
-            link = self._node_link(camera, channel, 'month', period[:7], f'⬅️ Tháng {parsed:%m/%Y}')
-            if link:
-                lines.append(link)
+            lines = [f'📅 <b>{parsed:%d/%m/%Y} – {name}</b>', '', '🕓 Các giờ có video:']
+            cells = []
+            for hour in range(24):
+                key = f'{period}T{hour:02d}'
+                rows = self._hour_records(camera, channel, key)
+                if rows:
+                    if self._contiguous(rows):
+                        link = self._link(f'{hour:02d}:00', channel_message_url(channel, rows[0]['storage_message_id']))
+                    else:
+                        link = self._node_link(camera, channel, 'hour', key, f'{hour:02d}:00')
+                    cells.append(link or f'{hour:02d} —')
+                else:
+                    cells.append(f'{hour:02d} —')
+                if len(cells) == 6:
+                    lines.append(' · '.join(cells)); cells = []
+            lines.extend(('', '— Chưa có dữ liệu'))
+            parent = self._node_link(camera, channel, 'month', period[:7], f'Tháng {parsed:%m/%Y}')
+            lines.append(self._neighbor_links(camera, channel, kind, period, parent))
+        elif kind == 'hour':
+            value, page = self._page(period)
+            parsed = datetime.strptime(value, '%Y-%m-%dT%H')
+            rows = self._hour_records(camera, channel, value)
+            lines = [f'🕓 <b>{parsed:%d/%m/%Y} · {parsed:%H}:00–{parsed:%H}:59 – {name}</b>', '']
+            timings = {}
+            for row in rows:
+                identity = (row['start_ms'], row['end_ms'])
+                timings[identity] = timings.get(identity, 0) + 1
+            for number, row in enumerate(rows[(page-1)*self.PAGE_SIZE:page*self.PAGE_SIZE], (page-1)*self.PAGE_SIZE+1):
+                start, end = (from_epoch_ms(row[field], self.zone) for field in ('start_ms','end_ms'))
+                ending = end.strftime('%H:%M:%S') if start.date() == end.date() else end.strftime('%d/%m/%Y %H:%M:%S')
+                label = f'{start:%H:%M:%S} – {ending}'
+                if timings[(row['start_ms'], row['end_ms'])] > 1:
+                    label += f' · Đoạn {number}'
+                lines.append(self._link(label, channel_message_url(channel, row['storage_message_id'])))
+            if not rows:
+                lines.append('Chưa có video')
+            links = []
+            if page > 1:
+                links.append(self._node_link(camera, channel, kind, self._page_key(value, page-1), '← Trước'))
+            if page*self.PAGE_SIZE < len(rows):
+                links.append(self._node_link(camera, channel, kind, self._page_key(value, page+1), 'Sau →'))
+            links.append(self._node_link(camera, channel, 'day', value[:10], '← Về ngày'))
+            lines.extend(('', ' | '.join(link for link in links if link)))
+        else:
+            raise ValueError('Invalid index type')
         result = '\n'.join(lines)
-        # Telegram's limit counts UTF-16 code units. Do not truncate HTML or
-        # links: bounded identities, 12 root years/months, 7 root days,
-        # 12 year months, 31 month days, 6 day buckets.
-        if len(result.encode('utf-16-le')) // 2 > 4096:
+        if len(result.encode('utf-16-le'))//2 > 4096:
             raise _Blocked('render_limit')
         return result
 
@@ -474,6 +578,8 @@ class ChannelIndex:
             raise
 
     def _target(self):
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise _Retry(1, 'index_stopping')
         if not self.enabled:
             raise _Obsolete()
         try:
@@ -510,20 +616,21 @@ class ChannelIndex:
         raise _Retry(60, 'telegram_unavailable') from None
 
     def _invalidate_children(self, kind, period):
-        child = {'root': 'year', 'year': 'month', 'month': 'day'}.get(kind)
+        child = {'root': 'years', 'years': 'year', 'year': 'month', 'month': 'day', 'day': 'hour'}.get(kind)
         if not child:
             return
         camera, channel = self._job['camera_id'], self._job['channel_chat_id']
-        prefix = '%' if kind == 'root' else period + '-%'
+        prefix = '%' if kind in ('root', 'years') else period + ('T%' if kind == 'day' else '-%')
         with self.conn:
             self.conn.execute('''UPDATE channel_index_messages SET last_render_hash=NULL
                 WHERE camera_id=? AND channel_chat_id=? AND index_type=? AND period_key LIKE ?''',
                 (camera, channel, child, prefix))
             days = list(self.conn.execute('''SELECT period_key FROM channel_index_messages
                 WHERE camera_id=? AND channel_chat_id=? AND index_type='day' AND period_key LIKE ?''',
-                (camera, channel, '%' if kind == 'root' else period + '%')))
+                (camera, channel, '%' if kind in ('root', 'years') else period + '%')))
             for row in days:
-                self._enqueue(camera, channel, row[0])
+                if kind != 'day' or row[0] != self._job['recorded_date']:
+                    self._enqueue(camera, channel, row[0])
 
     def _ensure(self, kind, period, *, recreated=False):
         self._target()
@@ -613,17 +720,46 @@ class ChannelIndex:
         if not job:
             return None
         self._job = job
+        self._day_records_cache = {}
         state, error, delay = 'done', None, 0
         try:
             day = job['recorded_date']
             self.telegram.verify_camera_channel(self.archive,job['camera_id'],require_index=True)
             existing = self._node(job['camera_id'], job['channel_chat_id'], 'day', day)
             if self._count(job['camera_id'], job['channel_chat_id'], 'day', day) or existing:
-                graph = [('root', 'root'), ('year', day[:4]), ('month', day[:7]), ('day', day)]
+                camera, channel = job['camera_id'], job['channel_chat_id']
+                years = set(self._available_periods(camera, channel, 'year'))
+                if self._count(camera, channel, 'day', day):
+                    years.add(day[:4])
+                graph = [('root', 'root')]
+                graph.extend(('years', self._page_key('years', page))
+                             for page in range(1, max(1, math.ceil(len(years)/self.PAGE_SIZE))+1))
+                graph.extend(('years', row[0]) for row in self.conn.execute('''SELECT period_key
+                    FROM channel_index_messages WHERE camera_id=? AND channel_chat_id=?
+                    AND index_type='years' ''', (camera, channel)) if ('years', row[0]) not in graph)
+                graph.extend((('year', day[:4]), ('month', day[:7]), ('day', day)))
+                for hour in range(24):
+                    key = f'{day}T{hour:02d}'
+                    rows = self._hour_records(camera, channel, key)
+                    if rows and not self._contiguous(rows):
+                        graph.extend(('hour', self._page_key(key, page))
+                                     for page in range(1, math.ceil(len(rows)/self.PAGE_SIZE)+1))
+                # Retire old list pages in place when clips were deleted or
+                # the hour becomes contiguous; never leave stale media URLs.
+                graph.extend(('hour', row[0]) for row in self.conn.execute('''SELECT period_key
+                    FROM channel_index_messages WHERE camera_id=? AND channel_chat_id=?
+                    AND index_type='hour' AND period_key LIKE ?''', (camera, channel, day+'T%'))
+                    if ('hour', row[0]) not in graph)
                 for kind, period in graph:
                     self._ensure(kind, period)
                 for kind, period in reversed(graph):
                     self._ensure(kind, period)
+                # Adjacent existing pages gained/lost a neighbor link. Edits
+                # never create empty periods or duplicate their message IDs.
+                for kind, period in (('day', day), ('month', day[:7])):
+                    for neighbor in self._neighbors(camera, channel, kind, period):
+                        if neighbor:
+                            self._ensure(kind, neighbor)
         except _Retry as exc:
             state, error, delay = 'pending', exc.label, exc.delay
         except _Blocked as exc:
@@ -692,7 +828,7 @@ class ChannelIndex:
                 # deleted index is detected. Do not reset uncertain sends.
                 self.conn.execute('''UPDATE channel_index_messages SET last_render_hash=NULL
                     WHERE camera_id=? AND channel_chat_id=? AND state='ready'
-                    AND (index_type='root' OR period_key LIKE ? OR ? LIKE period_key||'%')''',
+                    AND (index_type IN ('root','years') OR period_key LIKE ? OR ? LIKE period_key||'%')''',
                     (camera, channel, period + '%' if period else '%', period or ''))
         return {'camera': camera, 'channel_chat_id': channel, 'period': period,
                 'dry_run': dry_run, 'dates': sorted(days), 'recordings': recordings,
@@ -708,13 +844,18 @@ class ChannelIndex:
         channel = info['channel_chat_id']
         if type(channel_chat_id) is not int or channel_chat_id != channel:
             raise ValueError('Reconciliation target is not the current camera channel')
-        if index_type not in ('root', 'year', 'month', 'day'):
+        if index_type not in ('root', 'years', 'year', 'month', 'day', 'hour'):
             raise ValueError('Invalid index type')
         if index_type == 'root':
             if period != 'root':
                 raise ValueError('Invalid root period')
+        elif index_type == 'years':
+            value, _ = self._page(period)
+            if value != 'years':
+                raise ValueError('Invalid year list period')
         else:
-            expected = {'year': r'\d{4}', 'month': r'\d{4}-\d{2}', 'day': r'\d{4}-\d{2}-\d{2}'}[index_type]
+            expected = {'year': r'\d{4}', 'month': r'\d{4}-\d{2}', 'day': r'\d{4}-\d{2}-\d{2}',
+                        'hour': r'\d{4}-\d{2}-\d{2}T\d{2}(?::[2-9]\d*|:1\d+)?'}[index_type]
             if not isinstance(period, str) or not re.fullmatch(expected, period):
                 raise ValueError('Invalid index period')
             self._range(index_type, period)

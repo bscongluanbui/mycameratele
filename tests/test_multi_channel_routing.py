@@ -114,10 +114,10 @@ class RoutingTests(unittest.TestCase):
         saved=self.row(row['key']);self.assertEqual(saved['status'],'upload_unknown');self.assertIsNone(saved['message_id'])
         self.assertTrue(Path(saved['local_path']).exists())
 
-    def test_caption_is_recording_time_has_tags_no_path_or_token(self):
+    def test_caption_is_recording_time_name_only_no_path_or_token(self):
         row=self.record(start='2026-10-10T23:59:00+07:00',end='2026-10-11T00:01:00+07:00')
         text=self.telegram.caption(self.archive,row)
-        for value in ('10/10/2026','11/10/2026 00:01:00','#A #Y2026 #M202610 #D20261010','02:00'):self.assertIn(value,text)
+        self.assertEqual(text,'🎥 Cổng <chính>\n📅 10/10/2026\n🕒 23:59:00 – 11/10/2026 00:01:00\n⏱ 02 phút')
         self.assertNotIn(str(self.root),text);self.assertNotIn(self.settings.token,text)
 
     def test_restart_does_not_duplicate_committed_upload(self):
