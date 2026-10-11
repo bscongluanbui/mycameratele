@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import queue
 import sys
 import tempfile
 import time
@@ -180,20 +181,51 @@ print(json.dumps({'ok':True,'result':12}),flush=True)""")
         self.assertEqual(snapshots[-1]['download_speed_status'], 'applied')
 
     def test_progress_never_renews_operation_deadline(self):
-        provider = self.child("""with open(item['destination'],'wb',buffering=0) as output:
-    for index in range(300):
-        output.write(b'x')
-        time.sleep(.01)""", timeout=.2)
+        # Exercise the real parent download/exchange loop without making its
+        # deadline depend on Python/QEMU child startup or scheduler latency.
+        provider = HCNetSDKSource('192.168.2.7', 8000, 'admin', 'fixture-secret', 1,
+                                 get_zone('UTC+07:00'), 1024,
+                                 worker_command=['fixture-native-helper'],
+                                 session_timeout=.2, download_speed_kbps=8192)
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        provider.process = process
+        destination = self.root/'hung.part'
+        clock = [100.0]
+        waits = []
         snapshots = []
-        provider.download_progress = snapshots.append
-        started = time.monotonic()
-        with patch('archive_app.sd_source.DOWNLOAD_PROGRESS_INTERVAL', .025), self.assertRaises(SDSourceError) as caught:
-            with provider:
-                provider.download(recording(size=300), self.root/'hung.part')
+        def progress(snapshot):
+            snapshots.append(snapshot)
+            clock[0] += .004  # Progress work also consumes the original budget.
+        def wait_for_response(*, timeout):
+            waits.append(timeout)
+            if len(waits) > 20:
+                self.fail('Progress renewed the original operation deadline')
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, .025)
+            clock[0] += timeout
+            with destination.open('ab') as output:
+                output.write(b'x')  # The helper stays active without completing.
+            raise queue.Empty
+        provider.download_progress = progress
+        provider.inbox = Mock()
+        provider.inbox.get.side_effect = wait_for_response
+        with patch('archive_app.sd_source.time.monotonic', side_effect=lambda: clock[0]), \
+                patch('archive_app.sd_source.DOWNLOAD_PROGRESS_INTERVAL', .025), \
+                self.assertRaises(SDSourceError) as caught:
+            provider.download(recording(size=300), destination)
         self.assertEqual(caught.exception.code, 'sd_native_worker_timeout')
-        self.assertLess(time.monotonic()-started, 3)
+        self.assertGreaterEqual(clock[0]-100, .2-1e-9)
+        self.assertLessEqual(clock[0]-100, .204+1e-9)
         self.assertGreater(len(snapshots), 2)
+        self.assertGreater(snapshots[-1]['current_file_bytes'], snapshots[0]['current_file_bytes'])
+        self.assertEqual(destination.stat().st_size, len(waits))
+        self.assertLess(destination.stat().st_size, 300)
         self.assertIsNone(provider.process)
+        self.assertEqual(provider.config['password'], '')
+        process.stdin.close.assert_called_once()
+        process.stdout.close.assert_called_once()
 
     def test_unrecognized_status_event_is_not_exposed(self):
         provider = self.child("""print(json.dumps({'event':'download_status','download_speed_status':'fixture-secret','download_speed_error_code':23}),flush=True)""")
