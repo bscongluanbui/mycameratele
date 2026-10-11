@@ -15,12 +15,14 @@ import time
 from urllib.parse import urlsplit
 
 from .core import parse_time, validate_sd_collector_url
-from .sd_source import (DOWNLOAD_PROGRESS_INTERVAL, MAX_NATIVE_FILE,
+from .sd_source import (DOWNLOAD_PROGRESS_INTERVAL, MAX_NATIVE_FILE, NATIVE_INIT_TIMEOUT,
                         MAX_SEARCH_RESULTS, SDSourceError, _download_speed,
                         _file_progress)
 
 
 MAX_JSON = 2_000_000
+CREATE_ADMISSION_TIMEOUT = 600
+CREATE_REQUEST_TIMEOUT = NATIVE_INIT_TIMEOUT + 15
 SESSION_ID = re.compile(r'[a-f0-9]{32}')
 CAMERA_FIELDS = ('id', 'host', 'device_port', 'sd_username', 'sd_password',
                  'sd_channel', 'sd_timezone')
@@ -168,10 +170,31 @@ class SDCollectorSource:
     def __enter__(self):
         if self.session_id is not None:
             raise _error('sd_collector_protocol_error')
+        deadline = time.monotonic() + min(CREATE_ADMISSION_TIMEOUT, self.timeout)
+        request_timeout = min(CREATE_REQUEST_TIMEOUT, self.timeout)
+        delay, first_attempt = 0.25, True
         try:
-            result = self._json('POST', '/v1/sessions', {
-                'camera': self.camera, 'max_bytes': self.max_bytes,
-                'download_speed_kbps': self.download_speed_requested_kbps}, timeout=40)
+            while True:
+                remaining = deadline - time.monotonic()
+                # A late short request could abandon a successfully opened SDK
+                # session before its response. Reserve a full normal attempt.
+                if remaining <= 0 or not first_attempt and remaining < request_timeout:
+                    raise _error('sd_collector_busy')
+                try:
+                    result = self._json('POST', '/v1/sessions', {
+                        'camera': self.camera, 'max_bytes': self.max_bytes,
+                        'download_speed_kbps': self.download_speed_requested_kbps},
+                        timeout=min(request_timeout, remaining))
+                    break
+                except SDSourceError as error:
+                    if error.code != 'sd_collector_busy':
+                        raise
+                first_attempt = False
+                remaining = deadline - time.monotonic()
+                if remaining <= request_timeout:
+                    raise _error('sd_collector_busy')
+                time.sleep(min(delay, remaining - request_timeout))
+                delay = min(2, delay * 2)
         finally:
             self.camera['sd_password'] = ''
         session = result.get('session_id')

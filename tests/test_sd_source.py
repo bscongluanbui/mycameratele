@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import sqlite3
 import sys
@@ -24,7 +25,7 @@ import xml.etree.ElementTree as ET
 
 from archive_app.core import Archive, Settings, record_key
 from archive_app.sd_source import (DeviceInfo, DVRTime, FileCondition, FindData,
-    HCNetSDKSource, ISAPISource, SDSource, SDSourceError, _NativeSession,
+    HCNetSDKSource, ISAPISource, NATIVE_INIT_TIMEOUT, SDSource, SDSourceError, _NativeSession,
     _private_address, _sdk_library, _xml, get_zone, recover_staging, _native_worker)
 
 
@@ -367,6 +368,55 @@ for line in sys.stdin:
         self.assertEqual(caught.exception.code, 'sd_native_worker_timeout')
         self.assertLess(time.monotonic()-before, 5)
         self.assertIsNone(provider.process)
+
+    def test_native_initialization_can_complete_after_legacy_thirty_second_limit(self):
+        provider = self.child('unused synthetic helper', timeout=1800)
+        process = Mock()
+        process.poll.return_value = None
+        clock = [0.0]
+        waits = []
+        def initialized(timeout):
+            waits.append(timeout)
+            if timeout < 50:
+                clock[0] += timeout
+                raise queue.Empty
+            clock[0] += 50
+            return b'{"ok":true,"result":null}\n'
+        provider.inbox = Mock()
+        provider.inbox.get.side_effect = initialized
+        with patch('archive_app.sd_source.subprocess.Popen', return_value=process), \
+                patch('archive_app.sd_source.threading.Thread'), \
+                patch('archive_app.sd_source.time.monotonic', side_effect=lambda: clock[0]):
+            with provider:
+                self.assertEqual(clock[0], 50)
+                self.assertEqual(provider.config['password'], '')
+        self.assertEqual(waits, [90])
+        self.assertIsNone(provider.process)
+
+    def test_native_initialization_still_kills_helper_at_true_ninety_second_deadline(self):
+        provider = self.child('unused synthetic helper', timeout=1800)
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [OSError('Synthetic helper does not close'), 0]
+        clock, waits = [0.0], []
+        def stalled(timeout):
+            waits.append(timeout)
+            clock[0] += timeout
+            raise queue.Empty
+        provider.inbox = Mock()
+        provider.inbox.get.side_effect = stalled
+        with patch('archive_app.sd_source.subprocess.Popen', return_value=process), \
+                patch('archive_app.sd_source.threading.Thread'), \
+                patch('archive_app.sd_source.time.monotonic', side_effect=lambda: clock[0]):
+            with self.assertRaises(SDSourceError) as raised:
+                provider.__enter__()
+        self.assertEqual(NATIVE_INIT_TIMEOUT, 90)
+        self.assertEqual(waits, [90])
+        self.assertEqual(clock[0], 90)
+        self.assertEqual(raised.exception.code, 'sd_native_worker_timeout')
+        process.kill.assert_called_once_with()
+        self.assertIsNone(provider.process)
+        self.assertEqual(provider.config['password'], '')
 
     def test_native_child_messages_are_not_echoed(self):
         provider = self.child("import sys,json\nsys.stdin.readline()\nprint(json.dumps({'ok':False,'code':'unknown','message':'synthetic-camera-secret'}),flush=True)\n")

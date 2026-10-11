@@ -273,11 +273,90 @@ class CollectorClientTests(unittest.TestCase):
         self.assert_code('sd_collector_network_error', lambda: self.provider(timeout=.03).__enter__())
         self.assertLess(time.monotonic()-started, .5)
 
+    def test_create_busy_retries_preserve_credentials_then_clear_after_success(self):
+        provider = self.provider()
+        now, requests, sleeps = [0.0], [], []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+        def request(method, path, payload=None, *, timeout):
+            requests.append((now[0], method, path, dict(payload['camera']), timeout))
+            if len(requests) < 4:
+                raise SDSourceError('sd_collector_busy', 'Synthetic admission busy')
+            return {'session_id': SESSION}
+        with patch.object(provider, '_json', side_effect=request), \
+                patch('archive_app.sd_collector_client.time.monotonic', side_effect=lambda: now[0]), \
+                patch('archive_app.sd_collector_client.time.sleep', side_effect=sleep):
+            self.assertIs(provider.__enter__(), provider)
+        self.assertEqual(sleeps, [.25, .5, 1])
+        self.assertEqual([row[0] for row in requests], [0, .25, .75, 1.75])
+        self.assertTrue(all(row[1:3] == ('POST', '/v1/sessions') for row in requests))
+        self.assertTrue(all(row[3]['sd_password'] == CAMERA['sd_password'] for row in requests))
+        self.assertTrue(all(row[4] == 105 for row in requests))
+        self.assertEqual(provider.session_id, SESSION)
+        self.assertEqual(provider.camera['sd_password'], '')
+
+    def test_create_busy_budget_is_absolute_and_reserves_full_last_request(self):
+        for timeout, budget, normal in ((1900, 600, 105), (160, 160, 105), (.5, .5, .5)):
+            with self.subTest(timeout=timeout):
+                provider = self.provider(timeout=timeout)
+                now, requests, sleeps = [0.0], [], []
+                def sleep(seconds):
+                    sleeps.append(seconds)
+                    now[0] += seconds
+                def request(method, path, payload=None, *, timeout):
+                    requests.append((now[0], timeout, payload['camera']['sd_password']))
+                    # Each failed attempt consumes real admission time too.
+                    now[0] += .01
+                    raise SDSourceError('sd_collector_busy', 'Synthetic admission busy')
+                with patch.object(provider, '_json', side_effect=request), \
+                        patch('archive_app.sd_collector_client.time.monotonic', side_effect=lambda: now[0]), \
+                        patch('archive_app.sd_collector_client.time.sleep', side_effect=sleep):
+                    self.assert_code('sd_collector_busy', provider.__enter__)
+                self.assertLessEqual(now[0], budget)
+                self.assertTrue(all(start + duration <= budget + 1e-9 for start, duration, _ in requests))
+                self.assertTrue(all(duration == normal for _, duration, _ in requests))
+                self.assertTrue(all(secret == CAMERA['sd_password'] for _, _, secret in requests))
+                self.assertTrue(all(0 < delay <= 2 for delay in sleeps))
+                self.assertEqual(provider.camera['sd_password'], '')
+                self.assertIsNone(provider.session_id)
+
+    def test_create_never_retries_auth_native_network_or_protocol_failures(self):
+        for code in ('sd_collector_auth_failed', 'sd_auth_failed', 'sd_native_worker_timeout',
+                     'sd_collector_network_error', 'sd_collector_protocol_error'):
+            with self.subTest(code=code):
+                provider = self.provider()
+                with patch.object(provider, '_json', side_effect=SDSourceError(code, 'Synthetic failure')) as request, \
+                        patch('archive_app.sd_collector_client.time.sleep') as sleep:
+                    self.assert_code(code, provider.__enter__)
+                self.assertEqual(request.call_count, 1)
+                sleep.assert_not_called()
+                self.assertEqual(provider.camera['sd_password'], '')
+
+    def test_busy_search_and_download_are_not_retried(self):
+        provider = self.provider()
+        provider.session_id = SESSION
+        with patch.object(provider, '_json', side_effect=SDSourceError('sd_collector_busy', 'Synthetic busy')) as request:
+            self.assert_code('sd_collector_busy', lambda: provider.search(datetime.now(timezone.utc), datetime.now(timezone.utc)))
+        self.assertEqual(request.call_count, 1)
+        self.fixture.status = 409
+        self.assert_code('sd_collector_busy', lambda: provider.download(RECORDING, self.output))
+        self.assertEqual(len(self.fixture.requests), 1)
+
     def test_download_without_session_rejected(self):
         self.assert_code('sd_collector_session_missing', lambda: self.provider().download(RECORDING, self.output))
 
 
 class CollectorRoutingTests(unittest.TestCase):
+    def test_native_owner_http_and_admission_deadlines_are_consistent(self):
+        from archive_app.sd_source import NATIVE_INIT_TIMEOUT
+        from archive_app.sd_collector_client import CREATE_ADMISSION_TIMEOUT, CREATE_REQUEST_TIMEOUT
+        self.assertEqual(NATIVE_INIT_TIMEOUT, 90)
+        self.assertEqual(CREATE_REQUEST_TIMEOUT, 105)
+        self.assertEqual(CREATE_ADMISSION_TIMEOUT, 600)
+        self.assertGreater(CREATE_REQUEST_TIMEOUT, NATIVE_INIT_TIMEOUT + 10)
+        self.assertGreater(CREATE_ADMISSION_TIMEOUT, CREATE_REQUEST_TIMEOUT)
+
     def test_private_tailnet_and_loopback_literals_allowed_public_dns_rejected(self):
         for url in ('http://192.168.2.1:8787', 'https://100.92.56.98:8787/', 'http://[fd7a:115c:a1e0::1]:8787', 'http://127.0.0.1:8787'):
             self.assertEqual(len(collector_endpoint(url)), 3)

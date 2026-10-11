@@ -22,7 +22,8 @@ import time
 import uuid
 
 from .core import get_zone, parse_time
-from .sd_source import HCNetSDKSource, MAX_NATIVE_FILE, MAX_SEARCH_RESULTS, SDSourceError, _download_speed
+from .sd_source import (HCNetSDKSource, MAX_NATIVE_FILE, MAX_SEARCH_RESULTS,
+                       NATIVE_INIT_TIMEOUT, SDSourceError, _download_speed)
 
 MAX_BODY = 64 * 1024
 SESSION_ID = re.compile(r'[a-f0-9]{32}')
@@ -136,7 +137,7 @@ class _NativeSessionOwner:
         self._thread = threading.Thread(target=self._run, args=(initialized,),
             name='sd-sdk-owner-' + uuid.uuid4().hex, daemon=False)
         self._thread.start()
-        self._wait(initialized, 40)
+        self._wait(initialized, NATIVE_INIT_TIMEOUT + 10)
         return self
 
     def _call(self, operation, arguments, timeout):
@@ -169,8 +170,8 @@ class _NativeSessionOwner:
                 except OSError:
                     pass
         if self._thread is not None and self._thread is not threading.current_thread():
-            # Native init has a 30-second bound if shutdown raced before spawn.
-            self._thread.join(timeout=40)
+            # Leave cleanup margin beyond native init if shutdown raced spawn.
+            self._thread.join(timeout=NATIVE_INIT_TIMEOUT + 10)
             if self._thread.is_alive():
                 raise self._failed('sd_native_worker_timeout')
         return False
@@ -269,6 +270,10 @@ class CollectorState:
         self.config, self.clock = config, clock
         self.provider_factory = provider_factory or _NativeSessionOwner
         self.lock, self.sessions, self.reservations = threading.RLock(), {}, {}
+        # Serialize expensive vendor initialization with bounded admission.
+        # Admission never queues HTTP handlers: clients
+        # retry this short busy response, while established transfers continue.
+        self.init_gate = threading.Lock()
         self.metadata, self.active_paths = {}, set()
         self.closing = False
         cache = Path(config.cache_dir)
@@ -324,35 +329,40 @@ class CollectorState:
             speed = _download_speed(body['download_speed_kbps'])
         except SDSourceError:
             raise CollectorError('sd_collector_invalid_request') from None
-        identity, sid = (address, port, channel), uuid.uuid4().hex
-        fingerprint = hmac.digest(self.config.token.encode(),
-            json.dumps([camera['sd_username'], camera['sd_password']], separators=(',', ':')).encode(), 'sha256')
-        session = _Session(identity=identity, scope=(*identity, fingerprint), maximum=maximum, touched=self.clock())
-        session.lock.acquire()
-        with self.lock:
-            if self.closing:
-                raise CollectorError('sd_collector_stopping', 503)
-            if (len(self.sessions) >= self.config.max_sessions or
-                    sum(item.identity == identity for item in self.sessions.values()) >= self.config.per_camera_sessions):
-                raise CollectorError('sd_collector_session_limit', 409)
-            self.sessions[sid] = session
+        if not self.init_gate.acquire(blocking=False):
+            raise CollectorError('sd_collector_session_busy', 409)
         try:
-            session.provider = self.provider_factory(address, port, camera['sd_username'], camera['sd_password'],
-                channel, zone, maximum, cache_dir=self.cache, download_speed_kbps=speed)
-            session.provider.__enter__()
-            with self.lock:
-                if self.closing or self.sessions.get(sid) is not session:
-                    raise CollectorError('sd_collector_stopping', 503)
-            return sid
-        except BaseException:
-            with self.lock:
-                self.sessions.pop(sid, None)
-            if session.provider is not None:
-                session.provider.__exit__(None, None, None)
-            raise
+            identity, sid = (address, port, channel), uuid.uuid4().hex
+            fingerprint = hmac.digest(self.config.token.encode(),
+                json.dumps([camera['sd_username'], camera['sd_password']], separators=(',', ':')).encode(), 'sha256')
+            session = _Session(identity=identity, scope=(*identity, fingerprint), maximum=maximum, touched=self.clock())
+            session.lock.acquire()
+            try:
+                with self.lock:
+                    if self.closing:
+                        raise CollectorError('sd_collector_stopping', 503)
+                    if (len(self.sessions) >= self.config.max_sessions or
+                            sum(item.identity == identity for item in self.sessions.values()) >= self.config.per_camera_sessions):
+                        raise CollectorError('sd_collector_session_limit', 409)
+                    self.sessions[sid] = session
+                session.provider = self.provider_factory(address, port, camera['sd_username'], camera['sd_password'],
+                    channel, zone, maximum, cache_dir=self.cache, download_speed_kbps=speed)
+                session.provider.__enter__()
+                with self.lock:
+                    if self.closing or self.sessions.get(sid) is not session:
+                        raise CollectorError('sd_collector_stopping', 503)
+                return sid
+            except BaseException:
+                with self.lock:
+                    self.sessions.pop(sid, None)
+                if session.provider is not None:
+                    session.provider.__exit__(None, None, None)
+                raise
+            finally:
+                session.touched = self.clock()
+                session.lock.release()
         finally:
-            session.touched = self.clock()
-            session.lock.release()
+            self.init_gate.release()
 
     @contextmanager
     def use(self, sid):

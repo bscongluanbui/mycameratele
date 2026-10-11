@@ -35,6 +35,7 @@ from .core import get_zone, parse_time, record_key
 
 MAX_XML = 2_000_000
 MAX_SEARCH_RESULTS = 4000
+NATIVE_INIT_TIMEOUT = 90
 MAX_NATIVE_FILE = 1024 * 1024 * 1024 - 1  # Avoid SDK's implicit split-file mode.
 SETTLE_SECONDS = 120
 SDK_LOCK = threading.RLock()
@@ -714,7 +715,7 @@ class HCNetSDKSource:
         self.reader = threading.Thread(target=self._reader, daemon=True)
         self.reader.start()
         try:
-            self._exchange({'command': 'init', **self.config}, 30)
+            self._exchange({'command': 'init', **self.config}, NATIVE_INIT_TIMEOUT)
             self.config['password'] = ''
             return self
         except BaseException:

@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from archive_app.sd_collector import (CollectorConfig, CollectorError, CollectorServer,
                                      CollectorState, MAX_BODY, _NativeSessionOwner)
@@ -93,6 +93,110 @@ class CollectorTests(unittest.TestCase):
                 self.assertEqual(size, path.stat().st_size)
                 self.assertTrue(self.state.reservations)
                 return path.read_bytes()
+
+    def test_initialization_gate_rejects_before_reserving_second_session(self):
+        entering, release = threading.Event(), threading.Event()
+        active, peak, outcomes = [0], [0], []
+        guard = threading.Lock()
+        original = self.factory
+        def factory(*args, **kwargs):
+            provider = original(*args, **kwargs)
+            enter = provider.__enter__
+            def blocked_enter():
+                with guard:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                entering.set()
+                try:
+                    if not release.wait(5):
+                        raise AssertionError('Synthetic initialization was not released')
+                    return enter()
+                finally:
+                    with guard:
+                        active[0] -= 1
+            provider.__enter__ = blocked_enter
+            return provider
+        self.state.provider_factory = factory
+        def create_first():
+            try:
+                outcomes.append(self.state.create(create_body()))
+            except BaseException as error:
+                outcomes.append(error)
+        worker = threading.Thread(target=create_first)
+        worker.start()
+        try:
+            self.assertTrue(entering.wait(2))
+            with self.assertRaises(CollectorError) as raised:
+                self.state.create(create_body('192.168.2.8', 'camera-8'))
+            self.assertEqual((raised.exception.code, raised.exception.status),
+                             ('sd_collector_session_busy', 409))
+            self.assertEqual(len(self.state.sessions), 1)
+            self.assertEqual(len(self.factory.providers), 1)
+            self.assertEqual(self.state.reservations, {})
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(outcomes), 1)
+        self.assertIsInstance(outcomes[0], str)
+        second = self.state.create(create_body('192.168.2.8', 'camera-8'))
+        self.assertEqual(peak[0], 1)
+        self.assertFalse(self.state.init_gate.locked())
+        self.state.close_session(outcomes[0])
+        self.state.close_session(second)
+        self.assertEqual(self.state.sessions, {})
+
+    def test_initialization_gate_released_after_sdk_failure_and_capacity_rejection(self):
+        self.factory.enter_failure = True
+        with self.assertRaises(SDSourceError):
+            self.state.create(create_body())
+        self.assertFalse(self.state.init_gate.locked())
+        self.assertEqual(self.state.sessions, {})
+        self.assertTrue(self.factory.providers[-1].closed)
+        self.factory.enter_failure = False
+        first = self.state.create(create_body())
+        second = self.state.create(create_body())
+        with self.assertRaises(CollectorError) as raised:
+            self.state.create(create_body())
+        self.assertEqual(raised.exception.code, 'sd_collector_session_limit')
+        self.assertFalse(self.state.init_gate.locked())
+        self.state.close_session(first)
+        self.state.close_session(second)
+        self.assertEqual(self.state.sessions, {})
+
+    def test_initialization_gate_does_not_block_two_established_downloads(self):
+        first = self.searched()
+        second = self.state.create(create_body())
+        barrier, release, errors = threading.Barrier(3), threading.Event(), []
+        for provider in self.factory.providers:
+            download = provider.download
+            def blocked_download(entry, path, original=download):
+                original(entry, path)
+                barrier.wait(5)
+                if not release.wait(5):
+                    raise AssertionError('Synthetic transfer was not released')
+            provider.download = blocked_download
+        def transfer(sid):
+            try:
+                self.download(sid)
+            except BaseException as error:
+                errors.append(error)
+        self.state.init_gate.acquire()
+        workers = [threading.Thread(target=transfer, args=(sid,)) for sid in (first, second)]
+        for worker in workers:
+            worker.start()
+        try:
+            barrier.wait(5)
+            self.assertEqual(len(self.state.reservations), 2)
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(5)
+            self.state.init_gate.release()
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual(self.state.reservations, {})
+        self.assertEqual(list(self.state.root.iterdir()), [])
 
     def test_config_env_file_and_limits(self):
         path = Path(self.tmp.name) / 'bearer'
@@ -508,6 +612,17 @@ sys.stdin.buffer.read()
 
 
 class NativeSessionOwnerShutdownTests(unittest.TestCase):
+    def test_owner_initialization_and_shutdown_allow_native_deadline_cleanup_margin(self):
+        owner = _NativeSessionOwner('192.168.2.7', 8000, 'admin', 'secret', 1, None, 8)
+        thread = Mock()
+        thread.is_alive.return_value = False
+        with patch('archive_app.sd_collector.threading.Thread', return_value=thread), \
+                patch.object(owner, '_wait') as wait:
+            owner.__enter__()
+            owner.__exit__(None, None, None)
+        self.assertEqual(wait.call_args.args[1], 100)
+        thread.join.assert_called_once_with(timeout=100)
+
     def test_shutdown_interrupts_active_helper_before_joining_owner(self):
         started, interrupted = threading.Event(), threading.Event()
         calls = []
