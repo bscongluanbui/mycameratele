@@ -16,6 +16,7 @@
 .sync-row-summary:focus-visible{outline:3px solid #4b80ff;outline-offset:2px;position:relative;z-index:1}
 .sync-row-summary .status-chip{flex-shrink:0;white-space:nowrap}
 .sync-row-line{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:#465874}
+.sync-rate-badge{flex-shrink:0;white-space:nowrap;font-size:10px;font-weight:650;font-variant-numeric:tabular-nums;color:#31579b}
 .sync-detail-label{color:var(--primary);font-weight:600;white-space:nowrap;flex-shrink:0;font-size:10px}
 .sync-detail-label:after{content:"›";display:inline-block;margin-left:5px;font-size:15px;line-height:1}
 details[open]>.sync-row-summary .sync-detail-label:after{transform:rotate(90deg)}

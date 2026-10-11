@@ -118,18 +118,28 @@
       const blocked = jobs.filter(job => ["blocked", "failed"].includes(job?.state)).length;
       return running || queued || blocked ? `${running} đang chạy · ${queued} chờ · ${blocked} cần xử lý` : "Không có sync đang chạy";
     },
-    syncLine(job) {
+    syncLine(job, includeTransfer = true) {
       if (!job) return "Bấm Start sync để bắt đầu";
       const statistics = job.statistics || {}, parts = [helpers.syncPhase(job)];
       const transfer = helpers.syncTransfer(job);
       // Keep the measured rate visible before the phase/counts are ellipsized.
-      if (transfer) parts.unshift(transfer);
+      if (transfer && includeTransfer) parts.unshift(transfer);
       for (const [key, label] of [["sd_searched", "SD"], ["sd_downloaded", "Tải"], ["uploaded", "Upload"], ["failed", "Lỗi"]]) {
         const value = statistics[key];
         if (typeof value === "number" && Number.isFinite(value) && value >= 0) parts.push(`${label} ${value}`);
       }
       if (typeof statistics.sd_media_failed === "number" && Number.isFinite(statistics.sd_media_failed) && statistics.sd_media_failed > 0) parts.push(`Cách ly ${statistics.sd_media_failed}`);
       return parts.join(" · ");
+    },
+    syncUploadRate(job) {
+      const s = job?.statistics || {}, positive = value => typeof value === "number" && Number.isFinite(value) && value > 0;
+      let bytes = s.upload_confirmed_bytes, seconds = s.upload_request_seconds;
+      if (!positive(bytes) || !positive(seconds)) {
+        if (!positive(s.upload_last_file_confirmed_at)) return "";
+        bytes = s.upload_last_file_bytes; seconds = s.upload_last_file_seconds;
+      }
+      if (!positive(bytes) || !positive(seconds) || !positive(bytes / seconds)) return "";
+      return `↑ ${bytes / seconds < 10000 ? "< 0.01" : (bytes / seconds / 1e6).toFixed(2)} MB/s`;
     },
     syncTransfer(job, now = Date.now()) {
       const s = job?.statistics || {}, parts = [], valid = value => typeof value === "number" && Number.isFinite(value) && value >= 0;
@@ -408,9 +418,16 @@
       time.title = helpers.syncTimestamp(job.created_at);
       summary.append(time, node("strong", "sync-log-camera", name));
     }
-    const line = helpers.syncLine(job), lineNode = node("span", "sync-row-line", line);
+    const line = helpers.syncLine(job), uploadRate = scope === "logs" ? "" : helpers.syncUploadRate(job);
+    const lineNode = node("span", "sync-row-line", uploadRate ? helpers.syncLine(job, false) : line);
     lineNode.title = line;
-    summary.append(chip(...helpers.syncState(job)), lineNode, node("span", "sync-detail-label", "Detail"));
+    summary.append(chip(...helpers.syncState(job)));
+    if (uploadRate) {
+      const badge = node("span", "sync-rate-badge", uploadRate);
+      badge.title = "Tốc độ upload hiệu dụng trung bình của file đã được Telegram xác nhận";
+      summary.append(badge);
+    }
+    summary.append(lineNode, node("span", "sync-detail-label", "Detail"));
     summary.setAttribute("aria-label", `Chi tiết đồng bộ ${name}${scope === "logs" ? ` · ${helpers.syncTimestamp(job.created_at)}` : ""} · ${helpers.syncState(job)[0]} · ${line}`);
     const body = node("div", "sync-row-detail");
     if (!job) body.append(node("p", "small muted", "Chưa có công việc sync. Bấm Start sync để bắt đầu."));

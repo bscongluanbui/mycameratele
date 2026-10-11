@@ -4,6 +4,11 @@ const helpers = require("./app.js");
 let checks = 0;
 // Detail must show the same live waiting clock as the compact upload row.
 equal(helpers.syncDetailFields({state:"running",statistics:{upload_state:"sending",upload_current_file_started_at:100,upload_current_file_elapsed_seconds:0}},107000).find(([label])=>label==="Thời gian yêu cầu upload (giây)"),["Thời gian yêu cầu upload (giây)","7"]);
+equal(helpers.syncUploadRate({statistics:{upload_confirmed_bytes:5000000,upload_request_seconds:2}}),"↑ 2.50 MB/s");
+equal(helpers.syncUploadRate({statistics:{upload_last_file_confirmed_at:100,upload_last_file_bytes:1200000,upload_last_file_seconds:1}}),"↑ 1.20 MB/s");
+equal(helpers.syncUploadRate({statistics:{upload_confirmed_bytes:1,upload_request_seconds:2}}),"↑ < 0.01 MB/s");
+equal(helpers.syncUploadRate({statistics:{upload_confirmed_bytes:NaN,upload_request_seconds:2}}),"");
+equal(helpers.syncUploadRate({statistics:{upload_last_file_bytes:1200000,upload_last_file_seconds:1}}),"");
 function equal(actual, expected) { checks++; assert.deepEqual(actual, expected); }
 
 equal(helpers.channelId(''), null);
@@ -280,8 +285,11 @@ const ui = context.testUi;
 ui.state.cameras = [{id: 'pn', name: 'PN', enabled: true, host: '192.168.1.2'}, {id: 'door', name: 'Cửa trước', enabled: true}];
 const job = {id: 'job-1', camera_id: 'pn', camera_name: 'PN', state: 'running', phase: 'uploading', message: '<img src=x onerror=alert(1)>', code: 'fixture_code', source: 'dashboard', created_at: 100, started_at: 101, updated_at: 102, finished_at: null, statistics: {sd_searched: 27, sd_downloaded: 27, uploaded: 16, failed: 0, remuxed: 20, sd_error_code: 'fixture_error'}};
 const confirmedSpeedRow = ui.syncDisclosure({...job, state: 'completed', phase: 'finished', statistics: uploadConfirmed}, ui.state.cameras[0], 'camera');
-equal(confirmedSpeedRow.childNodes[0].childNodes[1].textContent, 'TB VPS→Telegram 1.25 MB/s · Kết thúc');
-equal(confirmedSpeedRow.childNodes[0].childNodes[1].title, 'TB VPS→Telegram 1.25 MB/s · Kết thúc');
+equal(confirmedSpeedRow.childNodes[0].childNodes[1].textContent, '↑ 1.25 MB/s');
+equal(confirmedSpeedRow.childNodes[0].childNodes[1].className, 'sync-rate-badge');
+equal(stylesheet.includes('.sync-rate-badge{flex-shrink:0;white-space:nowrap'), true);
+equal(confirmedSpeedRow.childNodes[0].childNodes[2].textContent, 'Kết thúc');
+equal(confirmedSpeedRow.childNodes[0].childNodes[2].title, 'TB VPS→Telegram 1.25 MB/s · Kết thúc');
 equal(confirmedSpeedRow.childNodes[1].childNodes[0].textContent, 'TB VPS→Telegram 1.25 MB/s');
 equal(confirmedSpeedRow.childNodes[1].childNodes[0].rawHtml, undefined);
 equal(confirmedSpeedRow.childNodes[0].getAttribute('aria-label').includes('TB VPS→Telegram 1.25 MB/s'), true);
