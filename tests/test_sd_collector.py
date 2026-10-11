@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -13,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from archive_app.sd_collector import (CollectorConfig, CollectorError, CollectorServer,
-                                     CollectorState, MAX_BODY)
+                                     CollectorState, MAX_BODY, _NativeSessionOwner)
 from archive_app.sd_source import MAX_NATIVE_FILE, SDSourceError
 from archive_app.sd_collector_client import SDCollectorSource
 from archive_app.core import parse_time
@@ -402,6 +404,154 @@ class CollectorHTTPTests(CollectorTests):
             serve('0.0.0.0', 8787)
             self.assertEqual(server.call_args.args[0], ('0.0.0.0', 8787))
             server.return_value.server_close.assert_called_once()
+
+    def test_default_native_session_has_one_persistent_owner_across_http_threads(self):
+        calls, handlers, providers = [], [], []
+        factory = self.factory
+        def native(*args, **kwargs):
+            provider = factory(*args, **kwargs)
+            owner = threading.current_thread()
+            calls.append(('construct', owner))
+            for method in ('__enter__', 'search', 'download', '__exit__'):
+                original = getattr(provider, method)
+                def call(*arguments, method=method, original=original):
+                    calls.append((method, threading.current_thread()))
+                    self.assertIs(threading.current_thread(), owner)
+                    return original(*arguments)
+                setattr(provider, method, call)
+            providers.append(provider)
+            return provider
+        from archive_app.sd_collector import CollectorHandler
+        original_run = CollectorHandler._run
+        def handle(instance, method):
+            handlers.append(threading.current_thread())
+            return original_run(instance, method)
+        self.state.provider_factory = _NativeSessionOwner
+        with patch('archive_app.sd_collector.HCNetSDKSource', side_effect=native), \
+                patch.object(CollectorHandler, '_run', handle):
+            with self.request('POST', '/v1/sessions', create_body()) as response:
+                sid = json.loads(response.read())['session_id']
+            proxy = self.state.sessions[sid].provider
+            with self.request('POST', f'/v1/sessions/{sid}/search', SEARCH) as response:
+                self.assertEqual(json.loads(response.read()), {'recordings': [recording()]})
+            for _ in range(2):
+                with self.request('POST', f'/v1/sessions/{sid}/download',
+                        {'recording': recording(), 'max_bytes': 8}) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), b'original')
+            self._wait_empty()
+            self.assertEqual(providers[0].max_bytes, 8)
+            self.assertEqual(proxy.download_speed_status, 'off')
+            self.assertTrue(proxy._thread.is_alive())
+            with self.request('DELETE', '/v1/sessions/'+sid) as response:
+                self.assertEqual(json.loads(response.read()), {'closed': True})
+        self.assertEqual([method for method, _ in calls],
+                         ['construct', '__enter__', 'search', 'download', 'download', '__exit__'])
+        self.assertEqual(len({thread for _, thread in calls}), 1)
+        self.assertEqual(len(set(handlers)), 5)
+        self.assertNotIn(calls[0][1], handlers)
+        self.assertFalse(proxy._thread.is_alive())
+        self.assertTrue(providers[0].closed)
+
+    def test_default_native_owner_failure_propagates_sdk_code_and_stops_owner(self):
+        self.state.provider_factory = _NativeSessionOwner
+        self.factory.enter_failure = True
+        with patch('archive_app.sd_collector.HCNetSDKSource', side_effect=self.factory):
+            with self.request('POST', '/v1/sessions', create_body()) as response:
+                self.assertEqual(response.status, 502)
+                self.assertEqual(json.loads(response.read()), {'error': 'sd_auth_failed'})
+        self.assertEqual(self.state.sessions, {})
+        self.assertTrue(self.factory.providers[0].closed)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux creator-thread PR_SET_PDEATHSIG regression')
+    def test_linux_parent_death_helper_survives_create_handler_exit(self):
+        child_code = """import ctypes,os,signal,sys
+libc=ctypes.CDLL(None,use_errno=True)
+assert libc.prctl(1,signal.SIGKILL,0,0,0)==0
+print('ready',flush=True)
+sys.stdin.buffer.read()
+"""
+        providers = []
+        def native(*args, **kwargs):
+            provider = self.factory(*args, **kwargs)
+            original_enter, original_exit, original_search = provider.__enter__, provider.__exit__, provider.search
+            def enter():
+                original_enter()
+                provider.process = subprocess.Popen([sys.executable, '-c', child_code],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                self.assertEqual(provider.process.stdout.readline(), b'ready\n')
+                return provider
+            def search(*arguments):
+                self.assertIsNone(provider.process.poll(), 'Creator handler exit killed native helper')
+                return original_search(*arguments)
+            def exit(*arguments):
+                if hasattr(provider, 'process'):
+                    provider.process.communicate(timeout=5)
+                return original_exit(*arguments)
+            provider.__enter__, provider.search, provider.__exit__ = enter, search, exit
+            providers.append(provider)
+            return provider
+        self.state.provider_factory = _NativeSessionOwner
+        with patch('archive_app.sd_collector.HCNetSDKSource', side_effect=native):
+            with self.request('POST', '/v1/sessions', create_body()) as response:
+                sid = json.loads(response.read())['session_id']
+            # Ensure the short-lived creator HTTP handler has fully exited.
+            for thread in list(self.server._threads):
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+            self.assertIsNone(providers[0].process.poll())
+            with self.request('POST', f'/v1/sessions/{sid}/search', SEARCH) as response:
+                self.assertEqual(json.loads(response.read()), {'recordings': [recording()]})
+            with self.request('DELETE', '/v1/sessions/'+sid) as response:
+                self.assertEqual(json.loads(response.read()), {'closed': True})
+        self.assertEqual(providers[0].process.returncode, 0)
+
+
+class NativeSessionOwnerShutdownTests(unittest.TestCase):
+    def test_shutdown_interrupts_active_helper_before_joining_owner(self):
+        started, interrupted = threading.Event(), threading.Event()
+        calls = []
+        class Process:
+            def poll(self):
+                return None if not interrupted.is_set() else -9
+            def kill(self):
+                interrupted.set()
+        class Provider:
+            process = Process()
+            download_speed_status, download_speed_error_code, download_speed_requested_kbps = 'off', None, 0
+            def __enter__(self):
+                calls.append(('enter', threading.current_thread()))
+                return self
+            def download(self, *_):
+                calls.append(('download', threading.current_thread()))
+                started.set()
+                if not interrupted.wait(5):
+                    raise AssertionError('Shutdown queued close behind a blocked native operation')
+                raise SDSourceError('sd_native_worker_failed', 'synthetic fixed worker failure')
+            def __exit__(self, *_):
+                calls.append(('exit', threading.current_thread()))
+        with patch('archive_app.sd_collector.HCNetSDKSource', return_value=Provider()):
+            proxy = _NativeSessionOwner('192.168.2.7', 8000, 'admin', 'secret', 1, None, 8)
+            proxy.__enter__()
+            errors = []
+            def download():
+                try:
+                    proxy.download(recording(), Path('unused'))
+                except SDSourceError as error:
+                    errors.append(error.code)
+            request = threading.Thread(target=download)
+            request.start()
+            self.assertTrue(started.wait(2))
+            before = time.monotonic()
+            proxy.__exit__(None, None, None)
+            self.assertLess(time.monotonic()-before, 2)
+            request.join(timeout=2)
+            self.assertFalse(request.is_alive())
+            self.assertFalse(proxy._thread.is_alive())
+            self.assertTrue(interrupted.is_set())
+            self.assertEqual(errors, ['sd_native_worker_failed'])
+            self.assertEqual([operation for operation, _ in calls], ['enter', 'download', 'exit'])
+            self.assertEqual(len({thread for _, thread in calls}), 1)
 
 
 if __name__ == '__main__':

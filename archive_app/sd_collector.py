@@ -13,6 +13,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import signal
@@ -36,6 +37,143 @@ class CollectorError(Exception):
     def __init__(self, code, status=400):
         self.code, self.status = code, status
         super().__init__(code)
+
+
+class _NativeSessionOwner:
+    """Keep the native helper's Linux creator thread alive for its session.
+
+    PR_SET_PDEATHSIG is intentionally retained in HCNetSDKSource. Linux watches
+    the thread that spawned that child, not merely the collector process. HTTP
+    handler threads therefore submit bounded commands to one persistent owner.
+    """
+    def __init__(self, *args, **kwargs):
+        self._arguments, self._keywords = args, kwargs
+        self.max_bytes = args[6]
+        self.download_speed_requested_kbps = kwargs.get('download_speed_kbps', 0)
+        self.download_speed_status = 'pending' if self.download_speed_requested_kbps else 'off'
+        self.download_speed_error_code = None
+        self._commands = queue.Queue(maxsize=1)
+        self._closing, self._stopped, self._busy = threading.Event(), threading.Event(), threading.Event()
+        self._provider, self._thread = None, None
+
+    @staticmethod
+    def _failed(code='sd_native_worker_failed'):
+        return SDSourceError(code, 'Collector native session stopped or exceeded its bounded operation timeout.')
+
+    def _snapshot(self):
+        for name in ('download_speed_requested_kbps', 'download_speed_status', 'download_speed_error_code'):
+            setattr(self, name, getattr(self._provider, name))
+
+    def _run(self, initialized):
+        try:
+            self._busy.set()
+            try:
+                self._provider = HCNetSDKSource(*self._arguments, **self._keywords)
+                # Remove the proxy's duplicate credential reference after construction.
+                self._arguments, self._keywords = (), {}
+                if self._closing.is_set():
+                    raise self._failed()
+                self._provider.__enter__()
+                self._snapshot()
+                initialized.put_nowait((True, None))
+            except Exception as error:
+                initialized.put_nowait((False, error if isinstance(error, SDSourceError) else self._failed()))
+                return
+            finally:
+                self._busy.clear()
+            while not self._closing.is_set():
+                try:
+                    operation, arguments, maximum, result = self._commands.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                self._busy.set()
+                try:
+                    if self._closing.is_set():
+                        raise self._failed()
+                    self._provider.max_bytes = maximum
+                    value = getattr(self._provider, operation)(*arguments)
+                    self._snapshot()
+                    result.put_nowait((True, value))
+                except Exception as error:
+                    result.put_nowait((False, error if isinstance(error, SDSourceError) else self._failed()))
+                finally:
+                    self._busy.clear()
+        finally:
+            self._arguments, self._keywords = (), {}
+            if self._provider is not None:
+                try:
+                    self._provider.__exit__(None, None, None)
+                except Exception:
+                    pass
+            self._stopped.set()
+            # Wake a submitted request if shutdown raced with queue admission.
+            while True:
+                try:
+                    *_, result = self._commands.get_nowait()
+                    result.put_nowait((False, self._failed()))
+                except queue.Empty:
+                    break
+
+    def _wait(self, result, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                successful, value = result.get(timeout=min(0.2, max(0.001, deadline-time.monotonic())))
+                if successful:
+                    return value
+                raise value
+            except queue.Empty:
+                if self._stopped.is_set():
+                    raise self._failed()
+                if time.monotonic() >= deadline:
+                    self.__exit__(None, None, None)
+                    raise self._failed('sd_native_worker_timeout')
+
+    def __enter__(self):
+        if self._thread is not None or self._closing.is_set():
+            raise self._failed()
+        initialized = queue.Queue(maxsize=1)
+        self._thread = threading.Thread(target=self._run, args=(initialized,),
+            name='sd-sdk-owner-' + uuid.uuid4().hex, daemon=False)
+        self._thread.start()
+        self._wait(initialized, 40)
+        return self
+
+    def _call(self, operation, arguments, timeout):
+        if self._thread is None or self._closing.is_set() or self._stopped.is_set():
+            raise self._failed()
+        result = queue.Queue(maxsize=1)
+        try:
+            self._commands.put((operation, arguments, self.max_bytes, result), timeout=1)
+        except queue.Full:
+            raise self._failed() from None
+        return self._wait(result, timeout)
+
+    def search(self, start, end):
+        return self._call('search', (start, end), 135)
+
+    def download(self, recording, destination):
+        return self._call('download', (recording, destination), 1810)
+
+    def __exit__(self, *_):
+        self._closing.set()
+        # Do not queue close behind a potentially 1800-second active download.
+        # Killing only its isolated child wakes _exchange; SDK exit itself still
+        # runs on the owner thread. Its parent-death signal remains enabled.
+        if self._busy.is_set() and self._provider is not None:
+            process = getattr(self._provider, 'process', None)
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except OSError:
+                    pass
+        if self._thread is not None and self._thread is not threading.current_thread():
+            # Native init has a 30-second bound if shutdown raced before spawn.
+            self._thread.join(timeout=40)
+            if self._thread.is_alive():
+                raise self._failed('sd_native_worker_timeout')
+        return False
 
 
 def _integer(value, minimum, maximum):
@@ -129,7 +267,7 @@ class _Session:
 class CollectorState:
     def __init__(self, config, provider_factory=None, clock=time.monotonic):
         self.config, self.clock = config, clock
-        self.provider_factory = provider_factory or HCNetSDKSource
+        self.provider_factory = provider_factory or _NativeSessionOwner
         self.lock, self.sessions, self.reservations = threading.RLock(), {}, {}
         self.metadata, self.active_paths = {}, set()
         self.closing = False
@@ -350,7 +488,7 @@ class CollectorState:
         for session in closing:
             try:
                 session.provider.__exit__(None, None, None)
-            except (OSError, ValueError):
+            except (OSError, ValueError, SDSourceError):
                 pass
             finally:
                 session.lock.release()
@@ -378,7 +516,7 @@ class CollectorState:
             if session.provider is not None:
                 try:
                     session.provider.__exit__(None, None, None)
-                except (OSError, ValueError):
+                except (OSError, ValueError, SDSourceError):
                     pass
 
 
