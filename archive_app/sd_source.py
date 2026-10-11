@@ -35,6 +35,9 @@ from .core import get_zone, parse_time, record_key
 
 MAX_XML = 2_000_000
 MAX_SEARCH_RESULTS = 4000
+NATIVE_SEARCH_PAGE_LIMIT = 500
+MAX_NATIVE_SEARCH_QUERIES = 128
+MAX_KNOWN_SEARCH_PREFIXES = 16
 NATIVE_INIT_TIMEOUT = 90
 MAX_NATIVE_FILE = 1024 * 1024 * 1024 - 1  # Avoid SDK's implicit split-file mode.
 SETTLE_SECONDS = 120
@@ -465,43 +468,80 @@ class _NativeSession:
         return False
 
     def search(self, start, end):
-        condition = FileCondition(channel=self.channel, file_type=0xff, locked=0xff,
-                                  start=DVRTime.from_datetime(start.astimezone(self.zone)),
-                                  end=DVRTime.from_datetime(end.astimezone(self.zone)))
-        handle = int(self.sdk.NET_DVR_FindFile_V30(self.user, C.byref(condition)))
-        if handle < 0:
-            raise self._error('search')
-        results, seen, deadline = [], set(), time.monotonic() + 120
-        try:
-            while len(results) < MAX_SEARCH_RESULTS:
-                data = FindData()
-                status = int(self.sdk.NET_DVR_FindNextFile_V30(handle, C.byref(data)))
-                if status in (1001, 1003):
-                    return results
-                if status == 1002:
-                    if time.monotonic() > deadline:
+        # Some EZVIZ devices silently end a wide query after 500 matches. A
+        # normal NOMORE therefore does not establish that all newer footage
+        # was listed. Bisect saturated time windows instead of trusting device
+        # ordering or advancing by a recording's end (which can skip overlaps).
+        first = start.astimezone(self.zone).replace(microsecond=0)
+        last = end.astimezone(self.zone).replace(microsecond=0)
+        windows = [(first, last)]
+        results, seen, queries, deadline = [], {}, 0, time.monotonic() + 120
+        while windows:
+            if time.monotonic() >= deadline:
+                raise SDSourceError('sd_search_timeout', 'Native camera SD search timed out.')
+            if queries >= MAX_NATIVE_SEARCH_QUERIES:
+                raise SDSourceError('sd_search_limit', 'Native SD time-window search exceeded its bounded query limit.')
+            low, high = windows.pop()
+            queries += 1
+            condition = FileCondition(channel=self.channel, file_type=0xff, locked=0xff,
+                                      start=DVRTime.from_datetime(low), end=DVRTime.from_datetime(high))
+            handle = int(self.sdk.NET_DVR_FindFile_V30(self.user, C.byref(condition)))
+            if handle < 0:
+                raise self._error('search')
+            page, page_seen = [], set()
+            try:
+                while len(page) < NATIVE_SEARCH_PAGE_LIMIT:
+                    if time.monotonic() >= deadline:
                         raise SDSourceError('sd_search_timeout', 'Native camera SD search timed out.')
-                    time.sleep(0.1)
+                    data = FindData()
+                    status = int(self.sdk.NET_DVR_FindNextFile_V30(handle, C.byref(data)))
+                    if status in (1001, 1003):
+                        break
+                    if status == 1002:
+                        time.sleep(0.1)
+                        continue
+                    if status != 1000:
+                        raise self._error('search result')
+                    try:
+                        filename = bytes(data.filename)
+                        rid = filename.decode('utf-8')
+                        begun, finished = data.start.as_datetime(self.zone), data.end.as_datetime(self.zone)
+                        if not rid or len(filename) >= 100 or finished <= begun:
+                            raise ValueError('Invalid recording metadata')
+                    except (UnicodeError, ValueError):
+                        raise SDSourceError('sd_protocol_error', 'Native camera returned invalid SD recording metadata.') from None
+                    identity = (rid, begun.isoformat())
+                    if identity in page_seen:
+                        raise SDSourceError('sd_protocol_error', 'Native camera SD search repeated a file without advancing.')
+                    page_seen.add(identity)
+                    page.append({'record_id': rid, 'remote_filename': filename, 'start_time': begun.isoformat(),
+                                 'end_time': finished.isoformat(), 'size': int(data.size)})
+            finally:
+                self.sdk.NET_DVR_FindClose_V30(handle)
+            if len(page) == NATIVE_SEARCH_PAGE_LIMIT:
+                seconds = int((high-low).total_seconds())
+                if seconds <= 1:
+                    raise SDSourceError('sd_search_limit', 'Native SD search saturated its smallest time window.')
+                middle = low + timedelta(seconds=seconds//2)
+                # Shared boundary prevents gaps; canonical identity removes
+                # overlap. Stack order visits older windows before newer ones.
+                windows.extend(((middle, high), (low, middle)))
+                continue
+            for item in sorted(page, key=lambda row: (parse_time(row['start_time']), row['record_id'])):
+                identity = item['record_id'], item['start_time']
+                previous = seen.get(identity)
+                if previous is not None:
+                    if previous != item:
+                        raise SDSourceError('sd_protocol_error', 'Native camera changed recording metadata between time windows.')
                     continue
-                if status != 1000:
-                    raise self._error('search result')
-                try:
-                    filename = bytes(data.filename)
-                    rid = filename.decode('utf-8')
-                    first, last = data.start.as_datetime(self.zone), data.end.as_datetime(self.zone)
-                    if not rid or len(filename) >= 100 or last <= first:
-                        raise ValueError('Invalid recording metadata')
-                except (UnicodeError, ValueError):
-                    raise SDSourceError('sd_protocol_error', 'Native camera returned invalid SD recording metadata.') from None
-                identity = (rid, first.isoformat())
-                if identity in seen:
-                    raise SDSourceError('sd_protocol_error', 'Native camera SD search repeated a file without advancing.')
-                seen.add(identity)
-                results.append({'record_id': rid, 'remote_filename': filename, 'start_time': first.isoformat(),
-                                'end_time': last.isoformat(), 'size': int(data.size)})
-            raise SDSourceError('sd_search_limit', 'SD search exceeded 4000 files; shorten the lookback window.')
-        finally:
-            self.sdk.NET_DVR_FindClose_V30(handle)
+                seen[identity] = item
+                results.append(item)
+                if len(results) == MAX_SEARCH_RESULTS:
+                    # Return a bounded chronological prefix. SDSource skips
+                    # fully known prefixes on subsequent scans, so a busy
+                    # camera cannot fail forever at the 4000-result ceiling.
+                    return results
+        return results
 
     def _set_download_speed(self, handle):
         if not self.download_speed_requested_kbps or self._speed_rejected:
@@ -908,6 +948,64 @@ class SDSource:
                 raise SDSourceError('sd_config_invalid', 'Camera SD download threads must be 1 or 2.')
             return self._sync(now, max_files, progress, stop_requested, threads)
 
+    def _search_history(self, provider, start, end, stop_requested=None):
+        """Skip bounded, entirely known prefixes without losing older gaps.
+
+        Only a completely accounted-for prefix may move the search cursor.
+        The final provider search remains the collector's canonical metadata
+        set, so selected files need no extra metadata retention or protocol.
+        """
+        cursor, boundary = start, {}
+        skipped = {'searched': 0, 'already_known': 0, 'deferred': 0, 'backlog': 0}
+        channel = self.config.get('sd_channel', self.config.get('channel', 1))
+        for _ in range(MAX_KNOWN_SEARCH_PREFIXES):
+            raw = sorted(provider.search(cursor, end), key=lambda row: (parse_time(row['start_time']), row['record_id']))
+            recordings = []
+            for item in raw:
+                identity = item['record_id'], item['start_time']
+                if identity in boundary:
+                    if item['end_time'] != boundary[identity]:
+                        raise SDSourceError('sd_record_changed', 'Camera changed a closed recording interval; archived footage needs operator review.')
+                    continue
+                recordings.append(item)
+            if len(raw) < MAX_SEARCH_RESULTS:
+                return recordings, skipped
+            if stop_requested is not None and stop_requested():
+                skipped['backlog'] = 1
+                return recordings, skipped
+            known_count, deferred_count, unknown = 0, 0, False
+            for item in recordings:
+                first, last = parse_time(item['start_time']), parse_time(item['end_time'])
+                if last > end or last <= first or first >= end or last <= start:
+                    deferred_count += 1
+                    continue
+                key = record_key({'camera': self.camera_id, 'source': 'camera-sd',
+                                  'record_id': f'ch{channel}:{_utc(first)}'})
+                row = self.archive.conn.execute('SELECT status,deleted_at,end_ms,media_expired_at FROM recordings WHERE key=?', (key,)).fetchone()
+                if row is not None and (row['media_expired_at'] is not None or row['deleted_at'] is not None or row['status'] not in ('failed', 'ingesting')):
+                    if row['end_ms'] != int(last.timestamp()*1000):
+                        raise SDSourceError('sd_record_changed', 'Camera changed a closed recording interval; archived footage needs operator review.')
+                    known_count += 1
+                else:
+                    unknown = True
+            if unknown:
+                # A full prefix may hide newer records even when every
+                # returned unknown fits this job. Keep a continuation sentinel.
+                skipped['backlog'] = 1
+                return recordings, skipped
+            if not raw:
+                return recordings, skipped
+            following = max(parse_time(item['start_time']) for item in raw)
+            if following <= cursor:
+                raise SDSourceError('sd_search_limit', 'Native SD known-prefix pagination did not advance.')
+            skipped['searched'] += len(recordings)
+            skipped['already_known'] += known_count
+            skipped['deferred'] += deferred_count
+            boundary = {(item['record_id'], item['start_time']): item['end_time']
+                        for item in raw if parse_time(item['start_time']) == following}
+            cursor = following  # Inclusive: never skip overlapping recordings.
+        raise SDSourceError('sd_search_limit', 'Native SD known-prefix search exceeded its bounded query limit.')
+
     def _sync(self, now, max_files, progress, stop_requested, threads):
         from .pipeline_runtime import cache_used_bytes, reserve_cache
 
@@ -962,13 +1060,14 @@ class SDSource:
             notify('sd_search')
             try:
                 started = time.monotonic()
-                recordings = sorted(provider.search(start, end), key=lambda row: (parse_time(row['start_time']), row['record_id']))
+                recordings, skipped = self._search_history(provider, start, end, stop_requested)
                 statistics['search_seconds'] = round(time.monotonic()-started, 6)
             except SDSourceError as error:
                 if getattr(provider, 'native_sdk_missing', False) and error.code in ('sd_isapi_unsupported', 'sd_network_error'):
                     raise SDSourceError('sd_sdk_missing', 'ISAPI SD history did not respond; mount the architecture-matching official Linux HCNetSDK to use camera port 8000.') from None
                 raise
-            statistics['searched'] = len(recordings)
+            statistics.update(skipped)
+            statistics['searched'] += len(recordings)
             notify('sd_download')
             root = self._staging()
             for position, recording in enumerate(recordings):
@@ -1121,14 +1220,14 @@ class SDSource:
             notify('sd_search')
             try:
                 started = time.monotonic()
-                recordings = sorted(provider.search(start, end),
-                                    key=lambda row: (parse_time(row['start_time']), row['record_id']))
+                recordings, skipped = self._search_history(provider, start, end, stop_requested)
                 statistics['search_seconds'] = round(time.monotonic()-started, 6)
             except SDSourceError as error:
                 if getattr(provider, 'native_sdk_missing', False) and error.code in ('sd_isapi_unsupported', 'sd_network_error'):
                     raise SDSourceError('sd_sdk_missing', 'ISAPI SD history did not respond; mount the architecture-matching official Linux HCNetSDK to use camera port 8000.') from None
                 raise
-        statistics['searched'] = len(recordings)
+        statistics.update(skipped)
+        statistics['searched'] += len(recordings)
         root = self._staging()
         todo, seen = [], {}
         for position, recording in enumerate(recordings):
