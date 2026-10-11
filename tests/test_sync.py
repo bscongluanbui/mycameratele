@@ -165,7 +165,7 @@ class SyncTests(unittest.TestCase):
         self.assertNotIn('synthetic secret',json.dumps(job))
 
     def test_sd_adapter_import_upload_pipeline_uses_managed_staging(self):
-        def sd_sync(*, progress=None):
+        def sd_sync(*, progress=None, max_files=100):
             root=self.settings.cache_dir/'sd-stage'/'front';root.mkdir(parents=True)
             source=root/'sample.source';source.write_bytes(b'synthetic SDK download')
             self.archive.ingest_download(dict(self.entry(),source='sd-hcnetsdk'),source)
@@ -237,7 +237,7 @@ class SyncTests(unittest.TestCase):
     def test_remux_upload_pause_survives_sd_and_final_upload_phases(self):
         self.settings.media_mode='remux_copy'
         self.archive.ingest_entry(self.entry())
-        def sd_sync(*,progress=None):
+        def sd_sync(*,progress=None,max_files=100):
             snapshot={'backend':'hcnetsdk','searched':2,'downloaded':2,'imported':1,'already_known':0,'deferred':0,'backlog':0}
             progress(snapshot)
             snapshot={**snapshot,'imported':2}

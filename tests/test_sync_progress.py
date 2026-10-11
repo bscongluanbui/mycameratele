@@ -17,7 +17,7 @@ class SyncProgressTests(unittest.TestCase):
         self.a.close();self.assertEqual(self.root.resolve().parent,self.parent);shutil.rmtree(self.root)
     def test_partial_sd_statistics_survive_later_failure_without_double_count(self):
         q=SyncQueue(self.a);q.enqueue('fixture');observed=[]
-        def fake_sync(*,progress):
+        def fake_sync(*,progress,max_files=100):
             snapshot={'phase':'sd_download','backend':'isapi','searched':2,'downloaded':1,'imported':1,'already_known':0,'deferred':0,'backlog':0}
             progress(snapshot);progress(snapshot)
             observed.append(q.status('fixture')['latest']['fixture'])
@@ -29,7 +29,7 @@ class SyncProgressTests(unittest.TestCase):
         self.assertEqual(job['statistics']['sd_downloaded'],1);self.assertEqual(job['statistics']['imported'],1)
     def test_camera_disabled_during_sd_is_explicit_even_without_records(self):
         q=SyncQueue(self.a);q.enqueue('fixture')
-        def pause(*,progress):
+        def pause(*,progress,max_files=100):
             self.a.update_camera('fixture',{'enabled':False});raise SDSourceError('camera_disabled','fixed pause')
         with patch.object(Archive,'probe_camera',return_value={'tcp':{}}),patch('archive_app.sd_source.SDSource.sync',side_effect=pause):
             q.run_once(Telegram(self.settings))

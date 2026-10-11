@@ -103,6 +103,21 @@ class MediaRetentionTests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertEqual(self.row(key)['media_expired_at'], ERROR_AT+ERROR_TTL)
 
+    def test_running_camera_retry_preserves_error_and_active_staging_until_job_finishes(self):
+        key, path = self.seed('failed', extension='.ps')
+        staged = self.aliases(key)
+        queue = SyncQueue(self.archive)
+        queue.enqueue('Front')
+        job = queue._claim()
+        self.assertEqual(self.expire(), 0)
+        self.assertIsNone(self.row(key)['media_expired_at'])
+        self.assertTrue(path.exists())
+        self.assertTrue(all(item.exists() for item in staged))
+        queue._finish(job, _statistics(), 'blocked', 'sd_native_error', 'Synthetic retry stopped')
+        self.assertEqual(self.expire(), 1)
+        self.assertFalse(path.exists())
+        self.assertTrue(all(not item.exists() for item in staged))
+
     def test_all_error_statuses_expire_but_pending_and_active_media_remain(self):
         candidates = {status:self.seed(status,record_id=status)
                       for status in ('failed','needs_review','upload_unknown','downloaded','uploading','ingesting')}

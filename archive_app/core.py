@@ -110,6 +110,11 @@ class Settings:
     multi_channel_routing: bool = False
     channel_index_enabled: bool = True
     channel_index_debounce_seconds: int = 60
+    # Fair bounded SD batches and opt-in native download speed. Media codecs
+    # never change; the speed value is a transport request in kilobits/second.
+    sd_max_files_per_job: int = 10
+    sd_download_speed_kbps: int = 0
+    sd_download_workers: int = 1
 
     @property
     def effective_owner(self):
@@ -131,6 +136,17 @@ class Settings:
             if value not in ('true', 'false'):
                 raise ValueError(name + ' must be true or false')
             return value == 'true'
+        def bounded_int(name, default, lower, upper, *, allow_zero=False):
+            raw = os.environ.get(name, str(default)).strip()
+            if not re.fullmatch(r'[0-9]+', raw):
+                raise ValueError(name + ' must be an integer')
+            value = int(raw)
+            if not (allow_zero and value == 0) and not lower <= value <= upper:
+                raise ValueError(name + ' is outside its supported range')
+            return value
+        sd_batch = bounded_int('SD_MAX_FILES_PER_JOB', 10, 1, 100)
+        sd_speed = bounded_int('SD_DOWNLOAD_SPEED_KBPS', 0, 256, 32768, allow_zero=True)
+        sd_workers = bounded_int('SD_DOWNLOAD_WORKERS', 1, 1, 5)
         multi_channel = flag('MULTI_CHANNEL_ROUTING', 'false')
         index_enabled = flag('CHANNEL_INDEX_ENABLED', 'true')
         index_debounce = int(os.environ.get('CHANNEL_INDEX_DEBOUNCE_SECONDS', '60'))
@@ -204,6 +220,8 @@ class Settings:
             passthrough_probe=os.environ.get('PASSTHROUGH_PROBE_METADATA', 'false').lower() == 'true',
             tenant_id=tenant, telegram_destination=destination, storage_channel_id=channel,
             media_mode=media_mode,
+            sd_max_files_per_job=sd_batch, sd_download_speed_kbps=sd_speed,
+            sd_download_workers=sd_workers,
             player_public_url=os.environ.get('TELEGRAM_PLAYER_PUBLIC_URL', '').strip().rstrip('/'),
             bot_api_file_root=Path(os.environ.get('TELEGRAM_BOT_API_FILE_ROOT', '/var/lib/telegram-bot-api')),
             bot_api_spool_root=Path(spool_path) if spool_path else None,
@@ -1015,38 +1033,42 @@ class Archive:
                 if old['end_ms'] != end_ms:
                     raise ValueError('Closed recording end_time changed; operator review required')
                 return dict(old, record_key=key)
-        in_cache = sum(p.stat().st_size for p in self.settings.cache_dir.rglob('*') if p.is_file())
+        from .pipeline_runtime import reserve_cache
         needed = source.stat().st_size * (2 if self.settings.media_mode == 'remux_copy' else 1)
-        free = shutil.disk_usage(self.settings.cache_dir).free
-        if in_cache + needed > self.settings.cache_max_bytes or free - needed < self.settings.min_free_bytes:
-            raise ValueError('Cache budget reached; source was retained')
-        dest = _confined_path(self._cache_root / (key + '.mp4'), self._cache_root, allow_missing=True)
-        with self.conn:
-            self.conn.execute('''INSERT INTO recordings(key,camera,record_id,start_ms,end_ms,source_path,status,created_at)
-                VALUES(?,?,?,?,?,?,'ingesting',?) ON CONFLICT(key) DO UPDATE SET status='ingesting',end_ms=excluded.end_ms''',
-                (key, entry['camera'], str(entry['record_id']), start_ms, end_ms, str(source), time.time()))
-        try:
-            info = normalize(source, dest, self.settings)
-            dest = self._store_media(key, info, dest, (end-start).total_seconds())
-            # Remove only this row's prior managed converted copy, after the
-            # original-byte copy and its durable catalog reference exist.
-            if (old and old['local_path'] and old['local_path'] != str(dest)
-                    and re.fullmatch(re.escape(key) + r'\.[a-z0-9]{1,10}', Path(old['local_path']).name)):
-                prior = _confined_path(old['local_path'], self._cache_root, allow_missing=True)
-                if prior.exists():
-                    prior.unlink()
-        except Exception as exc:
-            if self.settings.media_mode == 'remux_copy':
-                try:
-                    self._retain_raw_remux_failure(key, source, (end-start).total_seconds())
-                except Exception:
-                    with self.conn:
-                        self.conn.execute("UPDATE recordings SET status='needs_review',last_error='failed_remux' WHERE key=?", (key,))
-                raise
+        with reserve_cache(self.settings, needed, self.settings.cache_dir) as admitted:
+            if not admitted:
+                raise ValueError('Cache budget reached; source was retained')
+            dest = _confined_path(self._cache_root / (key + '.mp4'), self._cache_root, allow_missing=True)
             with self.conn:
-                self.conn.execute("UPDATE recordings SET status='failed',last_error=? WHERE key=?", (type(exc).__name__, key))
-            raise
-        return dict(self.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone(), record_key=key)
+                self.conn.execute('''INSERT INTO recordings(key,camera,record_id,start_ms,end_ms,source_path,status,created_at)
+                    VALUES(?,?,?,?,?,?,'ingesting',?) ON CONFLICT(key) DO UPDATE SET status='ingesting',end_ms=excluded.end_ms''',
+                    (key, entry['camera'], str(entry['record_id']), start_ms, end_ms, str(source), time.time()))
+            try:
+                info = normalize(source, dest, self.settings)
+                dest = self._store_media(key, info, dest, (end-start).total_seconds())
+                # Remove only this row's prior managed converted copy, after the
+                # original-byte copy and its durable catalog reference exist.
+                if (old and old['local_path'] and old['local_path'] != str(dest)
+                        and re.fullmatch(re.escape(key) + r'\.[a-z0-9]{1,10}', Path(old['local_path']).name)):
+                    prior = _confined_path(old['local_path'], self._cache_root, allow_missing=True)
+                    prior.unlink(missing_ok=True)
+            except Exception as exc:
+                current = self.conn.execute('SELECT status FROM recordings WHERE key=?', (key,)).fetchone()
+                if current is not None and current[0] != 'ingesting':
+                    # Another uploader may already own/confirm this committed
+                    # artifact. A late housekeeping error cannot rewrite it.
+                    raise
+                if self.settings.media_mode == 'remux_copy':
+                    try:
+                        self._retain_raw_remux_failure(key, source, (end-start).total_seconds())
+                    except Exception:
+                        with self.conn:
+                            self.conn.execute("UPDATE recordings SET status='needs_review',last_error='failed_remux' WHERE key=?", (key,))
+                    raise
+                with self.conn:
+                    self.conn.execute("UPDATE recordings SET status='failed',last_error=? WHERE key=?", (type(exc).__name__, key))
+                raise
+            return dict(self.conn.execute('SELECT * FROM recordings WHERE key=?', (key,)).fetchone(), record_key=key)
 
     def _store_media(self, key, info, fallback_path, fallback_duration, *, status='downloaded', error=None):
         """Persist one confirmed local artifact without changing stable identity."""
@@ -1240,42 +1262,38 @@ class Archive:
             # from its current pending state. A full disk is backpressure, not
             # an unsupported-codec failure, and must not strand valid raw data
             # in needs_review or repeatedly claim it in a limit=1 caller loop.
+            from .pipeline_runtime import reserve_cache
             try:
                 existing_source = _confined_path(row['local_path'], self._cache_root)
-                source_size = existing_source.stat().st_size
+                reserved = existing_source.stat().st_size * 2
             except (OSError, TypeError, ValueError):
-                # The existing claim/error path below diagnoses missing or
-                # invalid paths atomically and preserves uncertain row guards.
-                pass
-            else:
-                used = sum(path.stat().st_size for path in self._cache_root.rglob('*') if path.is_file())
-                reserved = source_size * 2
-                free = shutil.disk_usage(self._cache_root).free
-                if used + reserved > self.settings.cache_max_bytes or free - reserved < self.settings.min_free_bytes:
+                reserved = 0  # Existing claim/error path diagnoses missing source.
+            with reserve_cache(self.settings, reserved, self._cache_root) as admitted:
+                if not admitted:
                     return dict(result, budget_blocked=1)
-            with self.conn:
-                claimed = self.conn.execute("UPDATE recordings SET status='ingesting' WHERE key=? AND "+where,
-                                            [row['key'], *values]).rowcount
-            if not claimed:
-                continue
-            try:
-                source = _confined_path(row['local_path'], self._cache_root)
-                dest = _confined_path(self._cache_root/(row['key']+'.mp4'), self._cache_root, allow_missing=True)
-                info = normalize(source, dest, self.settings)
-                saved = self._store_media(row['key'], info, dest, (row['end_ms']-row['start_ms'])/1000)
-                if source != saved and re.fullmatch(re.escape(row['key'])+r'\.[a-z0-9]{1,10}', source.name):
-                    _confined_path(source, self._cache_root).unlink()
-                result['converted'] += 1
-            except FileNotFoundError:
                 with self.conn:
-                    self.conn.execute("UPDATE recordings SET status='failed',last_error='raw_reingest_required',local_path=NULL WHERE key=?", (row['key'],))
-                result['failed'] += 1
-            except Exception:
-                # The previous raw local_path and its SHA remain referenced;
-                # never retry it as a document or alter Telegram references.
-                with self.conn:
-                    self.conn.execute("UPDATE recordings SET status='needs_review',last_error='failed_remux' WHERE key=?", (row['key'],))
-                result['failed'] += 1
+                    claimed = self.conn.execute("UPDATE recordings SET status='ingesting' WHERE key=? AND "+where,
+                                                [row['key'], *values]).rowcount
+                if not claimed:
+                    continue
+                try:
+                    source = _confined_path(row['local_path'], self._cache_root)
+                    dest = _confined_path(self._cache_root/(row['key']+'.mp4'), self._cache_root, allow_missing=True)
+                    info = normalize(source, dest, self.settings)
+                    saved = self._store_media(row['key'], info, dest, (row['end_ms']-row['start_ms'])/1000)
+                    if source != saved and re.fullmatch(re.escape(row['key'])+r'\.[a-z0-9]{1,10}', source.name):
+                        _confined_path(source, self._cache_root, allow_missing=True).unlink(missing_ok=True)
+                    result['converted'] += 1
+                except FileNotFoundError:
+                    with self.conn:
+                        self.conn.execute("UPDATE recordings SET status='failed',last_error='raw_reingest_required',local_path=NULL WHERE key=? AND status='ingesting'", (row['key'],))
+                    result['failed'] += 1
+                except Exception:
+                    # The previous raw local_path and its SHA remain referenced;
+                    # never retry it as a document or alter Telegram references.
+                    with self.conn:
+                        self.conn.execute("UPDATE recordings SET status='needs_review',last_error='failed_remux' WHERE key=? AND status='ingesting'", (row['key'],))
+                    result['failed'] += 1
         return result
 
     def _managed_media_paths(self, row):
@@ -1352,11 +1370,17 @@ class Archive:
         cutoff = now-hours*3600
         self.conn.execute('BEGIN IMMEDIATE')
         try:
-            rows = self.conn.execute("""SELECT * FROM recordings
+            # A retrying SD worker may still have an old failed row while its
+            # new .part is growing. Do not expire/delete that camera's active
+            # staging. Claim and expiry serialize through BEGIN IMMEDIATE.
+            active_guard = ''
+            if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_jobs'").fetchone():
+                active_guard = " AND NOT EXISTS (SELECT 1 FROM sync_jobs j WHERE j.camera_id=r.camera AND j.state='running')"
+            rows = self.conn.execute("""SELECT r.* FROM recordings r
                 WHERE status IN ('failed','needs_review','upload_unknown')
                 AND ((media_expired_at IS NULL AND error_started_at<=?)
                     OR (media_expired_at IS NOT NULL AND cleanup_revision<1))
-                ORDER BY error_started_at,key LIMIT ?""", (cutoff,limit)).fetchall()
+                """ + active_guard + " ORDER BY error_started_at,key LIMIT ?", (cutoff,limit)).fetchall()
             # No active upload/ingest enters this transaction; retaining the
             # tombstone prevents SD/manifest scans from recreating expired data.
             plans = [(row,self._managed_media_paths(row)) for row in rows]

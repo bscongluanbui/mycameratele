@@ -18,7 +18,7 @@ class InterleavedTransferTests(unittest.TestCase):
  def test_upload_occurs_before_sd_batch_returns_and_duplicate_snapshot_does_not_repeat(self):
   q=SyncQueue(self.a);q.enqueue('fixture');start=datetime.fromisoformat('2026-10-03T10:00:00+07:00')
   entry={'camera':'fixture','record_id':'raw-one','path':str(self.source),'start_time':start.isoformat(),'end_time':(start+timedelta(minutes=1)).isoformat()}
-  def fake(*,progress):
+  def fake(*,progress,max_files=100):
    self.a.ingest_entry(entry)
    snapshot={'phase':'sd_download','backend':'hcnetsdk','searched':2,'downloaded':1,'imported':1}
    progress(snapshot)

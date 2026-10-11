@@ -12,6 +12,7 @@ import time
 from .core import Archive, Settings
 from .telegram import Telegram
 from .sync import SyncQueue
+from .pipeline_runtime import PipelineRuntime, serialized_uploads
 
 
 def emit(event, **data):
@@ -134,9 +135,11 @@ def main():
             archive.cleanup(args.key)
             emit('reconciled',key=args.key);return 0
         running=True
+        pipeline_stop=threading.Event()
         def stop(*_):
             nonlocal running
             running=False
+            pipeline_stop.set()
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
         archive.recover_uploads()
         legacy=archive.invalidate_legacy_cache()
@@ -150,7 +153,7 @@ def main():
             expired=archive.expire_error_media()
             if expired:emit('error_media_expired',files=expired,retention_hours=settings.error_retention_hours)
         except Exception as exc:emit('error_media_cleanup_error',error_type=type(exc).__name__)
-        sync=SyncQueue(archive)
+        sync=SyncQueue(archive,stop_event=pipeline_stop)
         sync.recover()  # The exclusive worker lock above prevents two runners.
         sync_interval=int(os.environ.get('SD_SYNC_INTERVAL_SECONDS','900'))
         if not 30<=sync_interval<=86400:raise ValueError('SD_SYNC_INTERVAL_SECONDS must be between 30 and 86400')
@@ -162,7 +165,7 @@ def main():
                 heartbeat_stop.wait(10)
         heartbeat_thread=threading.Thread(target=heartbeat,daemon=True)
         heartbeat_thread.start()
-        telegram=Telegram(settings)
+        telegram=serialized_uploads(Telegram(settings))
         def poll_commands():
             # Each thread owns its SQLite connection; ingestion/upload cannot block the menu.
             poll_archive=Archive(settings)
@@ -213,44 +216,57 @@ def main():
                 finally:index_archive.close()
             index_thread=threading.Thread(target=channel_indexes,daemon=True)
             index_thread.start()
-        emit('started',**archive.status())
-        while running:
-            if time.monotonic()>=next_sync:
+        parallel=getattr(settings,'sd_download_workers',1)>1
+        runtime=PipelineRuntime(settings,stop_event=pipeline_stop,emit=emit) if parallel else None
+        try:
+            if runtime:runtime.start()
+            emit('started',sd_download_workers=getattr(settings,'sd_download_workers',1),**archive.status())
+            while running and not pipeline_stop.is_set():
+                if time.monotonic()>=next_sync:
+                    try:
+                        queued=sync.enqueue(source='automatic')
+                        if queued['jobs']:emit('sync_scheduled',cameras=len(queued['jobs']))
+                        if runtime:runtime.wake()
+                    except Exception as exc:emit('sync_schedule_error',error_type=type(exc).__name__)
+                    next_sync=time.monotonic()+sync_interval
+                if not runtime:
+                    try:
+                        if sync.run_once(telegram):emit('sync_job_finished')
+                    except Exception as exc:emit('sync_error',error_type=type(exc).__name__)
                 try:
-                    queued=sync.enqueue(source='automatic')
-                    if queued['jobs']:emit('sync_scheduled',cameras=len(queued['jobs']))
-                except Exception as exc:emit('sync_schedule_error',error_type=type(exc).__name__)
-                next_sync=time.monotonic()+sync_interval
-            try:
-                if sync.run_once(telegram):emit('sync_job_finished')
-            except Exception as exc:emit('sync_error',error_type=type(exc).__name__)
-            try:
-                if archive.backup_daily():emit('backup',result='created',retention_days=7)
-            except Exception as exc:emit('backup_error',error_type=type(exc).__name__)
-            for manifest in sorted(settings.input_dir.glob('*.json')):
+                    if archive.backup_daily():emit('backup',result='created',retention_days=7)
+                except Exception as exc:emit('backup_error',error_type=type(exc).__name__)
+                if not runtime:
+                    # Parallel jobs import only their own camera's manifests;
+                    # the legacy unfiltered scan would duplicate ingest owners.
+                    for manifest in sorted(settings.input_dir.glob('*.json')):
+                        try:
+                            for row in archive.ingest_manifest(manifest,continue_on_error=True):
+                                if row['status']=='failed':emit('ingest_error',manifest=manifest.name,error_type=row['error_type'])
+                        except Exception as exc:emit('ingest_error',manifest=manifest.name,error_type=type(exc).__name__)
                 try:
-                    for row in archive.ingest_manifest(manifest,continue_on_error=True):
-                        if row['status']=='failed':emit('ingest_error',manifest=manifest.name,error_type=row['error_type'])
-                except Exception as exc:emit('ingest_error',manifest=manifest.name,error_type=type(exc).__name__)
-            try:
-                result=telegram.upload_one(archive)
-                if result:emit('upload',status=result)
-            except Exception as exc:emit('telegram_error',error_type=type(exc).__name__)
-            if not settings.keep_cache:
-                for row in archive.conn.execute("SELECT key FROM recordings WHERE status='uploaded' AND (cleaned_at IS NULL OR cleanup_revision<1)").fetchall():
-                    try:archive.cleanup(row[0])
-                    except Exception as exc:emit('cleanup_error',error_type=type(exc).__name__)
-            try:
-                expired=archive.expire_error_media()
-                if expired:emit('error_media_expired',files=expired,retention_hours=settings.error_retention_hours)
-            except Exception as exc:emit('error_media_cleanup_error',error_type=type(exc).__name__)
-            for _ in range(settings.interval):
-                if not running:break
-                if archive.conn.execute("SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1").fetchone():break
-                time.sleep(1)
-        heartbeat_stop.set();heartbeat_thread.join(timeout=11);poll_thread.join(timeout=36);bulk_thread.join(timeout=36)
-        if index_thread:index_thread.join(timeout=36)
-        emit('stopped');return 0
+                    result=telegram.upload_one(archive)
+                    if result:emit('upload',status=result)
+                except Exception as exc:emit('telegram_error',error_type=type(exc).__name__)
+                if not settings.keep_cache:
+                    for row in archive.conn.execute("SELECT key FROM recordings WHERE status='uploaded' AND (cleaned_at IS NULL OR cleanup_revision<1)").fetchall():
+                        try:archive.cleanup(row[0])
+                        except Exception as exc:emit('cleanup_error',error_type=type(exc).__name__)
+                try:
+                    expired=archive.expire_error_media()
+                    if expired:emit('error_media_expired',files=expired,retention_hours=settings.error_retention_hours)
+                except Exception as exc:emit('error_media_cleanup_error',error_type=type(exc).__name__)
+                for _ in range(settings.interval):
+                    if not running or pipeline_stop.is_set():break
+                    if not runtime and archive.conn.execute("SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1").fetchone():break
+                    if runtime:pipeline_stop.wait(1)
+                    else:time.sleep(1)
+        finally:
+            if runtime:
+                runtime.stop();runtime.join()
+            heartbeat_stop.set();heartbeat_thread.join(timeout=11);poll_thread.join(timeout=36);bulk_thread.join(timeout=36)
+            if index_thread:index_thread.join(timeout=36)
+        emit('stopped');return 1 if runtime and runtime.failed else 0
     finally:
         archive.close()
         if lock_scope is not None:lock_scope.__exit__(None,None,None)

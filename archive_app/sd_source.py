@@ -39,6 +39,27 @@ SETTLE_SECONDS = 120
 SDK_LOCK = threading.RLock()
 NS = 'http://www.hikvision.com/ver20/XMLSchema'
 STAGING_NAME = re.compile(r'[a-f0-9]{64}\.[a-f0-9]{32}\.(?:part|source)')
+DOWNLOAD_PROGRESS_INTERVAL = 2.0
+
+
+def _download_speed(value):
+    # NET_DVR_SETSPEED takes a DWORD in kbps, not a playback multiplier.
+    # Zero leaves device/SDK defaults untouched (including older cameras).
+    if type(value) is not int or value != 0 and not 256 <= value <= 32768:
+        raise SDSourceError('sd_config_invalid', 'SD download speed must be 0 or 256 to 32768 kbps.')
+    return value
+
+
+def _file_progress(destination, recording, started):
+    try:
+        size = destination.stat().st_size
+    except FileNotFoundError:
+        size = 0
+    elapsed = max(0.0, time.monotonic() - started)
+    return {'current_file_bytes': size,
+            'current_file_total_bytes': max(0, recording.get('size', 0)),
+            'current_file_elapsed_seconds': round(elapsed, 6),
+            'current_file_bytes_per_second': round(size / elapsed, 3) if elapsed > 0 else 0.0}
 
 
 class SDSourceError(Exception):
@@ -141,6 +162,10 @@ class ISAPISource:
         literal = f'[{address}]' if ':' in address else address
         self.base = f'http://{literal}:{port}'
         self.address, self.channel, self.zone, self.max_bytes = address, channel, zone, max_bytes
+        self.download_progress = None
+        self.download_speed_requested_kbps = 0
+        self.download_speed_status = 'off'
+        self.download_speed_error_code = None
         manager = HTTPPasswordMgrWithDefaultRealm()
         manager.add_password(None, self.base, username, password)
         # Never send credentials to an environment HTTP proxy or a redirect.
@@ -225,6 +250,7 @@ class ISAPISource:
         root = ET.Element('downloadRequest', {'version': '1.0', 'xmlns': NS})
         ET.SubElement(root, 'playbackURI').text = recording['playback_uri']
         total = 0
+        started, last_progress = time.monotonic(), None
         with self._request('/ISAPI/ContentMgmt/download', ET.tostring(root), 'GET', timeout=120) as response:
             content_type = response.headers.get('Content-Type', '').lower()
             if 'xml' in content_type or 'html' in content_type or 'json' in content_type:
@@ -250,6 +276,13 @@ class ISAPISource:
                         if total > self.max_bytes or time.monotonic() > deadline:
                             raise SDSourceError('sd_size_limit', 'SD download exceeded its staging limit or time budget.')
                         output.write(block)
+                        clock = time.monotonic()
+                        if callable(self.download_progress) and (last_progress is None or clock - last_progress >= DOWNLOAD_PROGRESS_INTERVAL):
+                            # Flush Python's small output buffer for an accurate
+                            # read-only stat; do not fsync every progress tick.
+                            output.flush()
+                            self.download_progress(_file_progress(destination, recording, started))
+                            last_progress = clock
                     output.flush()
                     os.fsync(output.fileno())
             except (OSError, TimeoutError):
@@ -258,6 +291,8 @@ class ISAPISource:
             raise SDSourceError('sd_download_incomplete', 'SD recording transfer ended with missing bytes.')
         if recording.get('size', 0) > 0 and total != recording['size']:
             raise SDSourceError('sd_download_incomplete', 'SD file length did not match the searched recording size.')
+        if callable(self.download_progress):
+            self.download_progress(_file_progress(destination, recording, started))
         return total
 
 
@@ -322,9 +357,15 @@ def _sdk_library():
 class _NativeSession:
     backend = 'hcnetsdk'
 
-    def __init__(self, address, port, username, password, channel, zone, max_bytes, sdk=None):
+    def __init__(self, address, port, username, password, channel, zone, max_bytes, sdk=None,
+                 download_speed_kbps=0):
         self.address, self.port, self.username, self.password = address, port, username, password
         self.channel, self.zone, self.max_bytes = channel, zone, max_bytes
+        self.download_speed_requested_kbps = _download_speed(download_speed_kbps)
+        self.download_speed_status = 'pending' if download_speed_kbps else 'off'
+        self.download_speed_error_code = None
+        self.download_progress = None
+        self._speed_rejected = False
         self.sdk, self.directory = sdk if sdk is not None else _sdk_library()
         self.user = -1
         self.initialized = False
@@ -442,6 +483,21 @@ class _NativeSession:
         finally:
             self.sdk.NET_DVR_FindClose_V30(handle)
 
+    def _set_download_speed(self, handle):
+        if not self.download_speed_requested_kbps or self._speed_rejected:
+            return
+        speed, out_length = C.c_uint32(self.download_speed_requested_kbps), C.c_uint32(0)
+        # Vendor download API: PLAYSTART (1), then SETSPEED (24). Do not use
+        # playback-fast or transcoding controls; recording bytes stay intact.
+        if self.sdk.NET_DVR_PlayBackControl_V40(handle, 24, C.byref(speed), C.sizeof(speed), None, C.byref(out_length)):
+            self.download_speed_status = 'applied'
+            self.download_speed_error_code = None
+        else:
+            code = int(self.sdk.NET_DVR_GetLastError())
+            self.download_speed_status = 'unsupported' if code == 23 else 'rejected'
+            self.download_speed_error_code = code
+            self._speed_rejected = True
+
     def download(self, recording, destination):
         remote = recording.get('remote_filename', recording['record_id'])
         if isinstance(remote, str):
@@ -454,6 +510,11 @@ class _NativeSession:
             offset, out_length = C.c_uint32(0), C.c_uint32(0)
             if not self.sdk.NET_DVR_PlayBackControl_V40(handle, 1, C.byref(offset), C.sizeof(offset), None, C.byref(out_length)):
                 raise self._error('download start')
+            self._set_download_speed(handle)
+            if callable(self.download_progress):
+                self.download_progress({'download_speed_requested_kbps': self.download_speed_requested_kbps,
+                                        'download_speed_status': self.download_speed_status,
+                                        'download_speed_error_code': self.download_speed_error_code})
             deadline = time.monotonic() + 1800
             while time.monotonic() < deadline:
                 progress = int(self.sdk.NET_DVR_GetDownloadPos(handle))
@@ -491,7 +552,7 @@ class HCNetSDKSource:
     backend = 'hcnetsdk'
 
     def __init__(self, address, port, username, password, channel, zone, max_bytes,
-                 worker_command=None, session_timeout=1800, cache_dir=None):
+                 worker_command=None, session_timeout=1800, cache_dir=None, download_speed_kbps=0):
         # Check before spawning so auto can distinguish absent SDK from a
         # broken or wrong-architecture SDK (which should not be concealed).
         self.directory = Path(os.environ.get('HCNETSDK_DIR', '/opt/hcnetsdk')).resolve()
@@ -499,8 +560,12 @@ class HCNetSDKSource:
             raise SDSourceError('sd_sdk_missing', 'Mount the official Linux HCNetSDK and its HCNetSDKCom directory for this CPU architecture.')
         self.config = {'address': address, 'port': port, 'username': username, 'password': password,
                        'channel': channel, 'timezone': getattr(zone, 'key', None) or self._zone_name(zone),
-                       'max_bytes': max_bytes}
+                       'max_bytes': max_bytes, 'download_speed_kbps': _download_speed(download_speed_kbps)}
         self.max_bytes = max_bytes
+        self.download_speed_requested_kbps = download_speed_kbps
+        self.download_speed_status = 'pending' if download_speed_kbps else 'off'
+        self.download_speed_error_code = None
+        self.download_progress = None
         self.command = worker_command or [sys.executable, '-m', 'archive_app.sd_source', '--native-worker']
         self.timeout = session_timeout
         self.cache_dir = cache_dir
@@ -527,7 +592,7 @@ class HCNetSDKSource:
         except (OSError, ValueError, queue.Full):
             pass
 
-    def _exchange(self, payload, timeout):
+    def _exchange(self, payload, timeout, progress=None):
         if self.process is None:
             raise SDSourceError('sd_native_worker_failed', 'Native SD helper is not running.')
         try:
@@ -538,10 +603,40 @@ class HCNetSDKSource:
             remaining = min(timeout, self.timeout)
             if remaining <= 0:
                 raise queue.Empty
-            raw = self.inbox.get(timeout=remaining)
-            if raw is None:
-                raise SDSourceError('sd_native_worker_failed', 'Native SD helper stopped unexpectedly; check the SDK package.')
-            response = json.loads(raw)
+            # Progress ticks never renew the operation's deadline. A helper
+            # that keeps writing a partial file can still be stopped on time.
+            deadline = time.monotonic() + remaining
+            status_received = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                if progress is not None:
+                    progress()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise queue.Empty
+                try:
+                    raw = self.inbox.get(timeout=min(remaining, DOWNLOAD_PROGRESS_INTERVAL) if progress is not None else remaining)
+                except queue.Empty:
+                    if progress is None or time.monotonic() >= deadline:
+                        raise
+                    continue
+                if raw is None:
+                    raise SDSourceError('sd_native_worker_failed', 'Native SD helper stopped unexpectedly; check the SDK package.')
+                response = json.loads(raw)
+                if isinstance(response, dict) and response.get('event') == 'download_status' and payload.get('command') == 'download':
+                    status, code = response.get('download_speed_status'), response.get('download_speed_error_code')
+                    if (status_received or status not in ('off', 'applied', 'unsupported', 'rejected') or
+                            code is not None and (type(code) is not int or not 0 <= code <= 0xffffffff) or
+                            status in ('off', 'applied') and code is not None or
+                            status in ('unsupported', 'rejected') and code is None or
+                            status == 'unsupported' and code != 23):
+                        raise ValueError('Invalid helper speed status')
+                    self.download_speed_status, self.download_speed_error_code = status, code
+                    status_received = True
+                    continue
+                break
             if not isinstance(response, dict) or 'ok' not in response:
                 raise ValueError('Invalid helper protocol')
             if response['ok'] is not True:
@@ -635,8 +730,18 @@ class HCNetSDKSource:
         return result
 
     def download(self, recording, destination):
-        return self._exchange({'command': 'download', 'recording': recording,
-                               'destination': str(destination), 'max_bytes': self.max_bytes}, 1805)
+        started = time.monotonic()
+        def report():
+            if callable(self.download_progress):
+                self.download_progress(dict(_file_progress(destination, recording, started),
+                    download_speed_requested_kbps=self.download_speed_requested_kbps,
+                    download_speed_status=self.download_speed_status,
+                    download_speed_error_code=self.download_speed_error_code))
+        result = self._exchange({'command': 'download', 'recording': recording,
+                                 'destination': str(destination), 'max_bytes': self.max_bytes}, 1805,
+                                progress=report)
+        report()
+        return result
 
 
 def _native_worker():
@@ -668,7 +773,8 @@ def _native_worker():
                 if command == 'init' and provider is None:
                     provider = _NativeSession(request['address'], request['port'], request['username'],
                                               request['password'], request['channel'],
-                                              get_zone(request['timezone']), request['max_bytes'])
+                                              get_zone(request['timezone']), request['max_bytes'],
+                                              download_speed_kbps=request.get('download_speed_kbps', 0))
                     provider.__enter__()
                     result = None
                 elif command == 'search' and provider is not None:
@@ -682,6 +788,10 @@ def _native_worker():
                     if not destination.is_absolute() or not destination.resolve().is_relative_to(stage) or destination.exists():
                         raise SDSourceError('sd_stage_invalid', 'Native SD destination escaped staging.')
                     provider.max_bytes = request['max_bytes']
+                    def report_status(snapshot):
+                        sys.stdout.write(json.dumps(dict(snapshot, event='download_status')) + '\n')
+                        sys.stdout.flush()
+                    provider.download_progress = report_status
                     result = provider.download(request['recording'], destination)
                 else:
                     raise SDSourceError('sd_protocol_error', 'Invalid native helper command.')
@@ -729,7 +839,8 @@ class SDSource:
         if backend in ('auto', 'hcnetsdk'):
             try:
                 return HCNetSDKSource(address, config.get('device_port', 8000), *common[1:],
-                                     cache_dir=self.archive.settings.cache_dir)
+                                     cache_dir=self.archive.settings.cache_dir,
+                                     download_speed_kbps=getattr(self.archive.settings, 'sd_download_speed_kbps', 0))
             except SDSourceError as error:
                 if backend != 'auto' or error.code != 'sd_sdk_missing':
                     raise
@@ -749,10 +860,8 @@ class SDSource:
         root.mkdir(exist_ok=True)
         if not root.resolve().is_relative_to(cache):
             raise SDSourceError('sd_stage_invalid', 'SD staging directory escaped the cache directory.')
-        # An exclusive archive worker owns staging. Its prior SDK children
-        # die with the worker on Linux, so unfinished managed files are not
-        # retained forever after a crash. Never follow links or delete unknown
-        # files placed by a user in this directory.
+        # The queue permits only one active job for each camera. Cleanup is
+        # confined to this camera's folder; other workers' partials stay intact.
         for candidate in root.iterdir():
             if (STAGING_NAME.fullmatch(candidate.name)
                     and not candidate.is_symlink()
@@ -761,11 +870,15 @@ class SDSource:
                 candidate.unlink()
         return root
 
-    def sync(self, now=None, max_files=100, progress=None):
+    def sync(self, now=None, max_files=100, progress=None, stop_requested=None):
+        from .pipeline_runtime import cache_used_bytes, reserve_cache
+
         if type(max_files) is not int or not 1 <= max_files <= 100:
             raise SDSourceError('sd_config_invalid', 'SD batch must contain 1 to 100 files.')
         if progress is not None and not callable(progress):
             raise SDSourceError('sd_config_invalid', 'SD progress callback must be callable.')
+        if stop_requested is not None and not callable(stop_requested):
+            raise SDSourceError('sd_config_invalid', 'SD stop callback must be callable.')
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None or now.utcoffset() is None:
             raise SDSourceError('sd_config_invalid', 'SD sync time requires a UTC offset.')
@@ -777,7 +890,13 @@ class SDSource:
         statistics = {'backend': provider.backend, 'searched': 0, 'downloaded': 0,
                       'imported': 0, 'already_known': 0, 'deferred': 0, 'backlog': 0,
                       'connect_seconds': 0.0, 'search_seconds': 0.0,
-                      'download_seconds': 0.0, 'ingest_seconds': 0.0, 'download_bytes': 0}
+                      'download_seconds': 0.0, 'ingest_seconds': 0.0, 'download_bytes': 0,
+                      'current_file_bytes': 0, 'current_file_total_bytes': 0,
+                      'current_file_elapsed_seconds': 0.0, 'current_file_bytes_per_second': 0.0,
+                      'download_speed_requested_kbps': getattr(provider, 'download_speed_requested_kbps', 0),
+                      'download_speed_status': getattr(provider, 'download_speed_status', 'off'),
+                      'download_speed_error_code': getattr(provider, 'download_speed_error_code', None),
+                      'interrupted': False}
         last_notification = None
         def notify(phase, *, force=True):
             nonlocal last_notification
@@ -785,6 +904,18 @@ class SDSource:
             if progress is not None and (force or last_notification is None or clock-last_notification >= 1):
                 progress(dict(statistics, phase=phase))
                 last_notification = time.monotonic()
+        current_fields = ('current_file_bytes', 'current_file_total_bytes',
+                          'current_file_elapsed_seconds', 'current_file_bytes_per_second')
+        def reset_current():
+            for field in current_fields:
+                statistics[field] = 0
+        def file_progress(snapshot):
+            for field in (*current_fields, 'download_speed_requested_kbps',
+                          'download_speed_status', 'download_speed_error_code'):
+                if field in snapshot:
+                    statistics[field] = snapshot[field]
+            notify('sd_download', force=False)
+        provider.download_progress = file_progress
         started = time.monotonic()
         with provider:
             statistics['connect_seconds'] = round(time.monotonic()-started, 6)
@@ -800,7 +931,11 @@ class SDSource:
             statistics['searched'] = len(recordings)
             notify('sd_download')
             root = self._staging()
-            for recording in recordings:
+            for position, recording in enumerate(recordings):
+                if stop_requested is not None and stop_requested():
+                    statistics['interrupted'] = True
+                    statistics['backlog'] += len(recordings) - position
+                    break
                 enabled = self.archive.conn.execute('SELECT enabled FROM cameras WHERE id=?', (self.camera_id,)).fetchone()
                 if enabled is None or not enabled['enabled']:
                     raise SDSourceError('camera_disabled', 'Camera was paused during SD sync; no further recording was downloaded.')
@@ -827,7 +962,7 @@ class SDSource:
                     statistics['backlog'] += 1
                     notify('sd_download', force=False)
                     continue
-                used = sum(path.stat().st_size for path in self.archive.settings.cache_dir.rglob('*') if path.is_file())
+                used = cache_used_bytes(self.archive.settings.cache_dir)
                 free = shutil.disk_usage(root).free
                 # One staged source plus the same worst-case MP4 reservation
                 # used by ingest. Reject before downloading, not after it.
@@ -844,36 +979,51 @@ class SDSource:
                     raise SDSourceError('sd_cache_budget', 'SD staging cache budget reached; confirmed recordings remain intact.')
                 partial = root / f'{key}.{uuid.uuid4().hex}.part'
                 complete = root / f'{key}.{uuid.uuid4().hex}.source'
-                try:
-                    notify('sd_download')
-                    started = time.monotonic()
-                    provider.download(recording, partial)
-                    statistics['download_seconds'] += round(time.monotonic()-started, 6)
-                    statistics['download_bytes'] += partial.stat().st_size
-                    partial.replace(complete)
-                    statistics['downloaded'] += 1
-                    entry['path'] = str(complete)
-                    started = time.monotonic()
-                    result = self.archive.ingest_download(entry, complete)
-                    statistics['ingest_seconds'] += round(time.monotonic()-started, 6)
-                    if result.get('status') == 'camera_disabled':
-                        statistics['deferred'] += 1
-                        raise SDSourceError('camera_disabled', 'Camera was paused during SD sync; the download was not imported.')
-                    statistics['imported'] += 1
-                    # Ingest has committed the independent managed artifact.
-                    # Release the SD staging copy before progress can block
-                    # in a Telegram upload; unconfirmed managed MP4 stays.
-                    complete.unlink()
-                    notify('sd_download')
-                except SDSourceError:
-                    raise
-                except Exception:
-                    raise SDSourceError('sd_media_validation_failed', 'Downloaded SD recording could not be copied intact into the managed cache; no Telegram upload was attempted.') from None
-                finally:
-                    # Catalog owns an identical-byte cached original; staging
-                    # files are temporary, including after a copy failure.
-                    partial.unlink(missing_ok=True)
-                    complete.unlink(missing_ok=True)
+                # Unknown-size files reserve their entire bounded allowance,
+                # not a token byte. Known-size transfers cannot exceed the
+                # searched size, so a shared reservation bounds all workers.
+                if recording.get('size', 0) > 0:
+                    provider.max_bytes = min(provider.max_bytes, recording['size'])
+                reserved = provider.max_bytes * reserve_factor
+                with reserve_cache(self.archive.settings, reserved, directory=root) as admitted:
+                    if not admitted:
+                        raise SDSourceError('sd_cache_budget', 'SD staging cache budget reached; confirmed recordings remain intact.')
+                    try:
+                        reset_current()
+                        statistics['current_file_total_bytes'] = max(0, recording.get('size', 0))
+                        notify('sd_download')
+                        started = time.monotonic()
+                        provider.download(recording, partial)
+                        statistics['download_seconds'] += round(time.monotonic()-started, 6)
+                        statistics['download_bytes'] += partial.stat().st_size
+                        partial.replace(complete)
+                        statistics['downloaded'] += 1
+                        reset_current()
+                        entry['path'] = str(complete)
+                        started = time.monotonic()
+                        result = self.archive.ingest_download(entry, complete)
+                        statistics['ingest_seconds'] += round(time.monotonic()-started, 6)
+                        if result.get('status') == 'camera_disabled':
+                            statistics['deferred'] += 1
+                            raise SDSourceError('camera_disabled', 'Camera was paused during SD sync; the download was not imported.')
+                        statistics['imported'] += 1
+                        # Ingest has committed the independent managed artifact.
+                        # Release the SD staging copy before progress can block
+                        # in a Telegram upload; unconfirmed managed MP4 stays.
+                        # A parallel uploader may already have committed its
+                        # Telegram receipt and cleaned this same staging file.
+                        complete.unlink(missing_ok=True)
+                        notify('sd_download')
+                    except SDSourceError:
+                        raise
+                    except Exception:
+                        raise SDSourceError('sd_media_validation_failed', 'Downloaded SD recording could not be copied intact into the managed cache; no Telegram upload was attempted.') from None
+                    finally:
+                        # Catalog owns an identical-byte cached original;
+                        # staging is temporary, including after a copy failure.
+                        reset_current()
+                        partial.unlink(missing_ok=True)
+                        complete.unlink(missing_ok=True)
         notify('sd_complete')
         return statistics
 

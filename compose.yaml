@@ -45,6 +45,9 @@ services:
       CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-0}
       ERROR_RETENTION_HOURS: ${ERROR_RETENTION_HOURS:-72}
       SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-900}
+      SD_MAX_FILES_PER_JOB: ${SD_MAX_FILES_PER_JOB:-10}
+      SD_DOWNLOAD_WORKERS: ${SD_DOWNLOAD_WORKERS:-1}
+      SD_DOWNLOAD_SPEED_KBPS: ${SD_DOWNLOAD_SPEED_KBPS:-0}
       HCNETSDK_DIR: /opt/hcnetsdk
     volumes:
       - archive-state:/data
@@ -62,7 +65,8 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    stop_grace_period: 45s
+    # Finish one bounded SDK download and its confirmed upload before exiting.
+    stop_grace_period: 65m
     logging:
       driver: json-file
       options:
@@ -109,6 +113,9 @@ services:
       CACHE_RETENTION_HOURS: ${CACHE_RETENTION_HOURS:-0}
       ERROR_RETENTION_HOURS: ${ERROR_RETENTION_HOURS:-72}
       SD_SYNC_INTERVAL_SECONDS: ${SD_SYNC_INTERVAL_SECONDS:-900}
+      SD_MAX_FILES_PER_JOB: ${SD_MAX_FILES_PER_JOB:-10}
+      SD_DOWNLOAD_WORKERS: ${SD_DOWNLOAD_WORKERS:-1}
+      SD_DOWNLOAD_SPEED_KBPS: ${SD_DOWNLOAD_SPEED_KBPS:-0}
       HCNETSDK_DIR: /opt/hcnetsdk
       DASHBOARD_COOKIE_SECURE: ${DASHBOARD_COOKIE_SECURE:-false}
       DISCOVERY_ROUTES_FILE: /network/subnets.json

@@ -53,6 +53,24 @@ class RemuxCopyTests(unittest.TestCase):
         self.settings.media_mode='remux_copy'
         return row
 
+    def test_global_upload_cleanup_after_remux_commit_preserves_confirmed_receipt(self):
+        row = self.raw_row()
+        self.settings.keep_cache = False
+        store = self.archive._store_media
+        def upload_immediately(key, *args, **kwargs):
+            saved = store(key, *args, **kwargs)
+            self.archive.mark_uploaded(key, 42, 101, 'confirmed-fixture-file')
+            self.archive.cleanup(key)
+            return saved
+        with patch('archive_app.core.subprocess.run', side_effect=self.ffmpeg), patch.object(self.archive, '_store_media', side_effect=upload_immediately):
+            result = self.archive.remux_pending_cache(limit=1)
+        saved = dict(self.archive.conn.execute('SELECT * FROM recordings WHERE key=?', (row['key'],)).fetchone())
+        self.assertEqual(result['converted'], 1)
+        self.assertEqual(result['failed'], 0)
+        self.assertEqual(saved['status'], 'uploaded')
+        self.assertEqual(saved['file_id'], 'confirmed-fixture-file')
+        self.assertEqual(saved['message_id'], 101)
+
     def test_modes_are_explicit_and_existing_raw_constructor_default_is_unchanged(self):
         self.assertEqual(Settings(Path('state'),Path('cache'),Path('input'),'UTC+07:00').media_mode,'raw')
         with patch.dict(os.environ, {'DISPLAY_TIMEZONE':'UTC+07:00'}, clear=True):

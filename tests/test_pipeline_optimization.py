@@ -44,7 +44,9 @@ class NativeBudgetTests(unittest.TestCase):
 
     def test_search_retains_its_shorter_operation_bound(self):
         p=self.provider();p._exchange({'command':'search'},130)
-        self.assertEqual(p.inbox.get.call_args.kwargs['timeout'],130)
+        remaining=p.inbox.get.call_args.kwargs['timeout']
+        self.assertGreater(remaining,129)
+        self.assertLessEqual(remaining,130)
 
     def test_hung_operation_still_stops_the_native_process(self):
         p=self.provider();p.inbox.get.side_effect=queue.Empty

@@ -121,14 +121,26 @@
     syncLine(job) {
       if (!job) return "Bấm Start sync để bắt đầu";
       const statistics = job.statistics || {}, parts = [helpers.syncPhase(job)];
+      const transfer = helpers.syncTransfer(job);
+      if (transfer) parts.push(transfer);
       for (const [key, label] of [["sd_searched", "SD"], ["sd_downloaded", "Tải"], ["uploaded", "Upload"], ["failed", "Lỗi"]]) {
         const value = statistics[key];
         if (typeof value === "number" && Number.isFinite(value) && value >= 0) parts.push(`${label} ${value}`);
       }
       return parts.join(" · ");
     },
+    syncTransfer(job) {
+      if (job?.state !== "running" || job?.phase !== "sd_download") return "";
+      const s = job.statistics || {}, valid = value => typeof value === "number" && Number.isFinite(value) && value >= 0;
+      if (!valid(s.sd_current_file_bytes) || !valid(s.sd_current_file_elapsed_seconds) || s.sd_current_file_elapsed_seconds <= 0) return "";
+      let value = `${(s.sd_current_file_bytes / 1e6).toFixed(1)} MB`;
+      if (valid(s.sd_current_file_total_bytes) && s.sd_current_file_total_bytes > 0) value += ` / ${(s.sd_current_file_total_bytes / 1e6).toFixed(1)} MB`;
+      if (valid(s.sd_current_file_bytes_per_second)) value += ` · ${(s.sd_current_file_bytes_per_second / 1e6).toFixed(2)} MB/s`;
+      return value;
+    },
     syncDetailFields(job) {
       const labels = { manifests: "Manifest", matched: "Khớp nguồn", imported: "Đã nhập", already_known: "Đã có", uploaded: "Đã upload", failed: "Lỗi", ready: "Sẵn sàng", pending: "Chờ upload", remuxed: "Đã remux", remux_failed: "Lỗi remux", remux_budget_blocked: "Chờ dung lượng cache", needs_review: "Cần kiểm tra", upload_unknown: "Upload chưa xác nhận", deleted: "Đã xóa", failed_records: "Bản ghi lỗi", probe_tcp_open: "Cổng TCP mở", probe_error_type: "Lỗi kết nối", sd_backend: "Bộ tải SD", sd_searched: "Tìm thấy SD", sd_downloaded: "Đã tải SD", sd_imported: "Đã nhập SD", sd_deferred: "SD chờ tải", sd_backlog: "SD tồn đọng", sd_error_code: "Mã lỗi SD" };
+      Object.assign(labels, {sd_current_file_bytes: "File đang tải (byte)", sd_current_file_total_bytes: "Dung lượng file (byte)", sd_current_file_elapsed_seconds: "Thời gian file (giây)", sd_current_file_bytes_per_second: "Tốc độ tải (byte/s)", sd_download_bytes: "Tổng byte đã tải xong", sd_download_seconds: "Thời gian tải SD (giây)", sd_ingest_seconds: "Thời gian remux/ingest (giây)", upload_seconds: "Thời gian upload (giây)", sd_download_speed_requested_kbps: "Tốc độ SDK yêu cầu (kbps)", sd_download_speed_status: "Trạng thái tăng tốc SDK", sd_download_speed_error_code: "Mã SDK tốc độ", sd_interrupted: "Dừng sau file hiện tại"});
       return Object.entries(job?.statistics || {}).filter(([key, value]) => Object.prototype.hasOwnProperty.call(labels, key) && (value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value) && value >= 0))).map(([key, value]) => [labels[key], value === null || value === "" ? "—" : String(value)]);
     },
     syncTimestamp(value, compact = false) {
