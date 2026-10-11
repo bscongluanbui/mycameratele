@@ -459,11 +459,15 @@ def _confined_path(path, root, *, allow_missing=False):
         current = current / part
         if _is_link(current):
             raise ValueError('Managed paths must not contain symlinks or junctions')
-    if path.exists():
-        if not path.is_file():
+    # Confirmed SD cleanup can unlink the file before this single metadata read.
+    try:
+        info = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if not allow_missing:
+            raise FileNotFoundError(path) from None
+    else:
+        if not stat.S_ISREG(info.st_mode):
             raise ValueError('Managed path must be a regular file')
-    elif not allow_missing:
-        raise FileNotFoundError(path)
     return path
 
 
