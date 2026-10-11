@@ -1,10 +1,10 @@
 """Real worker loop with local SQLite and bounded mocked transport/clock."""
 from contextlib import redirect_stdout
 from io import StringIO
-import json,os,shutil,signal,tempfile,unittest,uuid
+import json,os,shutil,signal,tempfile,threading,unittest,uuid
 from pathlib import Path
 from unittest.mock import patch
-from archive_app.__main__ import main
+from archive_app.__main__ import main,emit as real_emit
 from archive_app.core import Archive,Settings
 from archive_app.sync import SyncQueue
 
@@ -21,13 +21,27 @@ class AutomaticSyncWorkerTests(unittest.TestCase):
         with patch.dict(os.environ,self.env,clear=True):settings=Settings.from_env()
         a=Archive(settings);a.add_camera({'id':'c6n','host':'192.168.31.166'});a.close()
         handlers={};out=StringIO()
+        finished=threading.Event();timed_out=threading.Event()
         def register(sig,handler):handlers[sig]=handler
-        def sleep(_):handlers[signal.SIGTERM]()
-        with patch.dict(os.environ,self.env,clear=True),patch('sys.argv',['archive','run']),redirect_stdout(out), \
-             patch('archive_app.__main__.signal.signal',side_effect=register), \
-             patch('archive_app.__main__.time.sleep',side_effect=sleep), \
-             patch('archive_app.core.Archive.probe_camera',return_value={'tcp':{'8000':'open'}}):
-            self.assertEqual(main(),0)
+        def emit(event,**fields):
+            real_emit(event,**fields)
+            if event=='sync_job_finished':
+                finished.set();handlers[signal.SIGTERM]()
+        def timeout():
+            timed_out.set()
+            handler=handlers.get(signal.SIGTERM)
+            if handler is not None:handler()
+        timer=threading.Timer(10,timeout)
+        try:
+            timer.start()
+            with patch.dict(os.environ,self.env,clear=True),patch('sys.argv',['archive','run']),redirect_stdout(out), \
+                 patch('archive_app.__main__.signal.signal',side_effect=register), \
+                 patch('archive_app.__main__.emit',side_effect=emit), \
+                 patch('archive_app.core.Archive.probe_camera',return_value={'tcp':{'8000':'open'}}):
+                self.assertEqual(main(),0)
+        finally:timer.cancel();timer.join()
+        self.assertFalse(timed_out.is_set(),'Worker did not finish before the bounded test deadline')
+        self.assertTrue(finished.is_set())
         events=[json.loads(line)['event'] for line in out.getvalue().splitlines()]
         self.assertIn('sync_scheduled',events);self.assertIn('sync_job_finished',events);self.assertEqual(events[-1],'stopped')
         a=Archive(settings)

@@ -25,7 +25,7 @@ class ChannelDirectory:
                 error TEXT,updated_at REAL NOT NULL,checked_at REAL,
                 PRIMARY KEY(bot_key,chat_id))''')
         # IDs survive restarts; real titles are populated by events/getChat.
-        ids={row[0] for row in self.conn.execute('SELECT channel_chat_id FROM cameras WHERE channel_chat_id IS NOT NULL')}
+        ids={row[0] for row in self.conn.execute('SELECT channel_chat_id FROM cameras WHERE channel_chat_id IS NOT NULL AND deleted_at IS NULL')}
         ids.add(archive.settings.storage_channel_id)
         with self.conn:
             for channel in ids:
@@ -67,7 +67,7 @@ class ChannelDirectory:
         return False
 
     def list(self):
-        bound={r['channel_chat_id']:r for r in self.conn.execute('SELECT id,channel_chat_id,channel_name FROM cameras WHERE channel_chat_id IS NOT NULL')}
+        bound={r['channel_chat_id']:r for r in self.conn.execute('SELECT id,channel_chat_id,channel_name FROM cameras WHERE channel_chat_id IS NOT NULL AND deleted_at IS NULL')}
         channels=[]
         for r in self.conn.execute('SELECT * FROM telegram_channels WHERE bot_key=?',(self.bot_key,)):
             camera=bound.get(r['chat_id'])

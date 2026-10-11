@@ -7,6 +7,7 @@ Only finished downloads enter Archive's stream-copy/remux/upload pipeline.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager, ExitStack
 import ctypes as C
 import json
 import ipaddress
@@ -40,6 +41,24 @@ SDK_LOCK = threading.RLock()
 NS = 'http://www.hikvision.com/ver20/XMLSchema'
 STAGING_NAME = re.compile(r'[a-f0-9]{64}\.[a-f0-9]{32}\.(?:part|source)')
 DOWNLOAD_PROGRESS_INTERVAL = 2.0
+_CAMERA_LEASE_LOCK = threading.Lock()
+_CAMERA_LEASES = set()
+
+
+@contextmanager
+def _camera_download_lease(archive, camera):
+    # The runner file lock + SQLite active-job constraint are durable guards.
+    # Also protect direct in-process calls from clearing another call's stage.
+    identity = (str(archive.settings.state_dir.resolve()), camera)
+    with _CAMERA_LEASE_LOCK:
+        if identity in _CAMERA_LEASES:
+            raise SDSourceError('sd_camera_busy', 'Camera already has an active SD sync.')
+        _CAMERA_LEASES.add(identity)
+    try:
+        yield
+    finally:
+        with _CAMERA_LEASE_LOCK:
+            _CAMERA_LEASES.remove(identity)
 
 
 def _download_speed(value):
@@ -871,6 +890,13 @@ class SDSource:
         return root
 
     def sync(self, now=None, max_files=100, progress=None, stop_requested=None):
+        with _camera_download_lease(self.archive, self.camera_id):
+            threads = self.config.get('sd_download_threads', getattr(self.archive.settings, 'sd_download_threads', 1))
+            if type(threads) is not int or not 1 <= threads <= 2:
+                raise SDSourceError('sd_config_invalid', 'Camera SD download threads must be 1 or 2.')
+            return self._sync(now, max_files, progress, stop_requested, threads)
+
+    def _sync(self, now, max_files, progress, stop_requested, threads):
         from .pipeline_runtime import cache_used_bytes, reserve_cache
 
         if type(max_files) is not int or not 1 <= max_files <= 100:
@@ -886,6 +912,8 @@ class SDSource:
         if type(hours) is not int or not 1 <= hours <= 720:
             raise SDSourceError('sd_config_invalid', 'SD lookback must be 1 to 720 hours.')
         start, end = now - timedelta(hours=hours), now - timedelta(seconds=SETTLE_SECONDS)
+        if threads == 2:
+            return self._sync_parallel(start, end, max_files, progress, stop_requested)
         provider = self._provider()
         statistics = {'backend': provider.backend, 'searched': 0, 'downloaded': 0,
                       'imported': 0, 'already_known': 0, 'deferred': 0, 'backlog': 0,
@@ -896,7 +924,7 @@ class SDSource:
                       'download_speed_requested_kbps': getattr(provider, 'download_speed_requested_kbps', 0),
                       'download_speed_status': getattr(provider, 'download_speed_status', 'off'),
                       'download_speed_error_code': getattr(provider, 'download_speed_error_code', None),
-                      'interrupted': False}
+                      'interrupted': False, 'download_threads': 1, 'active_downloads': 0, 'peak_downloads': 0}
         last_notification = None
         def notify(phase, *, force=True):
             nonlocal last_notification
@@ -936,7 +964,7 @@ class SDSource:
                     statistics['interrupted'] = True
                     statistics['backlog'] += len(recordings) - position
                     break
-                enabled = self.archive.conn.execute('SELECT enabled FROM cameras WHERE id=?', (self.camera_id,)).fetchone()
+                enabled = self.archive.conn.execute('SELECT enabled FROM cameras WHERE id=? AND deleted_at IS NULL', (self.camera_id,)).fetchone()
                 if enabled is None or not enabled['enabled']:
                     raise SDSourceError('camera_disabled', 'Camera was paused during SD sync; no further recording was downloaded.')
                 first, last = parse_time(recording['start_time']), parse_time(recording['end_time'])
@@ -991,6 +1019,7 @@ class SDSource:
                     try:
                         reset_current()
                         statistics['current_file_total_bytes'] = max(0, recording.get('size', 0))
+                        statistics['active_downloads'] = statistics['peak_downloads'] = 1
                         notify('sd_download')
                         started = time.monotonic()
                         provider.download(recording, partial)
@@ -998,6 +1027,7 @@ class SDSource:
                         statistics['download_bytes'] += partial.stat().st_size
                         partial.replace(complete)
                         statistics['downloaded'] += 1
+                        statistics['active_downloads'] = 0
                         reset_current()
                         entry['path'] = str(complete)
                         started = time.monotonic()
@@ -1024,6 +1054,277 @@ class SDSource:
                         reset_current()
                         partial.unlink(missing_ok=True)
                         complete.unlink(missing_ok=True)
+        notify('sd_complete')
+        return statistics
+
+    def _sync_parallel(self, start, end, max_files, progress, stop_requested):
+        """Two independent SDK sessions download; only the owner touches SQLite.
+
+        A bounded pair reserves its entire raw + remux working set in the owner
+        thread. That reservation remains held until BOTH transfers drain and
+        ordered ingestion finishes, allowing nested ingest to reuse the budget.
+        No arbitrary prefetch queue or worker-side database/progress callback is
+        involved. Search closes before either download session is opened.
+        """
+        from .pipeline_runtime import cache_used_bytes, reserve_cache
+
+        provider = self._provider()
+        statistics = {'backend': provider.backend, 'searched': 0, 'downloaded': 0,
+                      'imported': 0, 'already_known': 0, 'deferred': 0, 'backlog': 0,
+                      'connect_seconds': 0.0, 'search_seconds': 0.0,
+                      'download_seconds': 0.0, 'ingest_seconds': 0.0, 'download_bytes': 0,
+                      'current_file_bytes': 0, 'current_file_total_bytes': 0,
+                      'current_file_elapsed_seconds': 0.0, 'current_file_bytes_per_second': 0.0,
+                      'download_speed_requested_kbps': getattr(provider, 'download_speed_requested_kbps', 0),
+                      'download_speed_status': getattr(provider, 'download_speed_status', 'off'),
+                      'download_speed_error_code': None, 'interrupted': False,
+                      'download_threads': 2, 'active_downloads': 0, 'peak_downloads': 0}
+        guard = threading.Lock()
+        current = {}
+        activity = {'active': 0, 'peak': 0}
+        last_notification = None
+
+        def notify(phase, force=True):
+            nonlocal last_notification
+            with guard:
+                values = list(current.values())
+                for field in ('current_file_bytes', 'current_file_total_bytes', 'current_file_bytes_per_second'):
+                    statistics[field] = sum(value.get(field, 0) for value in values)
+                statistics['current_file_elapsed_seconds'] = max(
+                    (value.get('current_file_elapsed_seconds', 0) for value in values), default=0)
+                statistics['active_downloads'] = activity['active']
+                statistics['peak_downloads'] = activity['peak']
+                for value in values:
+                    if value.get('download_speed_status') in ('unsupported', 'rejected', 'applied'):
+                        statistics['download_speed_status'] = value['download_speed_status']
+                        statistics['download_speed_error_code'] = value.get('download_speed_error_code')
+            clock = time.monotonic()
+            if progress is not None and (force or last_notification is None or clock-last_notification >= 1):
+                progress(dict(statistics, phase=phase))
+                last_notification = time.monotonic()
+
+        started = time.monotonic()
+        with provider:
+            statistics['connect_seconds'] = round(time.monotonic()-started, 6)
+            notify('sd_search')
+            try:
+                started = time.monotonic()
+                recordings = sorted(provider.search(start, end),
+                                    key=lambda row: (parse_time(row['start_time']), row['record_id']))
+                statistics['search_seconds'] = round(time.monotonic()-started, 6)
+            except SDSourceError as error:
+                if getattr(provider, 'native_sdk_missing', False) and error.code in ('sd_isapi_unsupported', 'sd_network_error'):
+                    raise SDSourceError('sd_sdk_missing', 'ISAPI SD history did not respond; mount the architecture-matching official Linux HCNetSDK to use camera port 8000.') from None
+                raise
+        statistics['searched'] = len(recordings)
+        root = self._staging()
+        todo, seen = [], {}
+        for position, recording in enumerate(recordings):
+            if stop_requested is not None and stop_requested():
+                statistics['interrupted'] = True
+                statistics['backlog'] += len(recordings)-position
+                break
+            first, last = parse_time(recording['start_time']), parse_time(recording['end_time'])
+            if last > end or last <= first or first >= end or last <= start:
+                statistics['deferred'] += 1
+                continue
+            channel = self.config.get('sd_channel', self.config.get('channel', 1))
+            entry = {'camera': self.camera_id, 'source': 'camera-sd',
+                     'record_id': f'ch{channel}:{_utc(first)}',
+                     'start_time': first.isoformat(), 'end_time': last.isoformat()}
+            key = record_key(entry)
+            if key in seen:
+                if seen[key] != last:
+                    raise SDSourceError('sd_record_changed', 'Camera returned conflicting intervals for the same recording.')
+                statistics['already_known'] += 1
+                continue
+            seen[key] = last
+            known = self.archive.conn.execute('SELECT status,deleted_at,end_ms,media_expired_at FROM recordings WHERE key=?', (key,)).fetchone()
+            if known is not None and (known['media_expired_at'] is not None or known['deleted_at'] is not None or known['status'] not in ('failed', 'ingesting')):
+                if known['end_ms'] != int(last.timestamp()*1000):
+                    raise SDSourceError('sd_record_changed', 'Camera changed a closed recording interval; archived footage needs operator review.')
+                statistics['already_known'] += 1
+            elif len(todo) < max_files:
+                todo.append((recording, entry, key))
+            else:
+                statistics['backlog'] += 1
+        if statistics['interrupted']:
+            statistics['backlog'] += len(todo)
+            notify('sd_complete')
+            return statistics
+        if not todo:
+            notify('sd_complete')
+            return statistics
+
+        tasks = [queue.Queue(maxsize=1) for _ in range(2)]
+        results = queue.Queue(maxsize=2)
+        workers = []
+
+        def download_worker(number):
+            session = None
+            try:
+                while True:
+                    task = tasks[number].get()
+                    if task is None:
+                        return
+                    item, maximum, partial, complete = task
+                    recording, entry, key = item
+                    elapsed, connected, size = 0.0, 0.0, 0
+                    error = None
+                    try:
+                        if session is None:
+                            opened = time.monotonic()
+                            session = self._provider()
+                            session.__enter__()
+                            connected = round(time.monotonic()-opened, 6)
+                        session.max_bytes = maximum
+                        def report(snapshot):
+                            with guard:
+                                current[number] = dict(snapshot)
+                        session.download_progress = report
+                        with guard:
+                            current[number] = {'current_file_total_bytes': max(0, recording.get('size', 0))}
+                            activity['active'] += 1
+                            activity['peak'] = max(activity['peak'], activity['active'])
+                        downloaded_at = time.monotonic()
+                        try:
+                            session.download(recording, partial)
+                            size = partial.stat().st_size
+                            if not 0 < size <= maximum:
+                                raise SDSourceError('sd_size_limit', 'SD recording exceeded its reserved staging limit.')
+                            partial.replace(complete)
+                        finally:
+                            elapsed = round(time.monotonic()-downloaded_at, 6)
+                            with guard:
+                                activity['active'] -= 1
+                                current.pop(number, None)
+                    except Exception as exc:
+                        error = exc if isinstance(exc, SDSourceError) else SDSourceError(
+                            'sd_download_incomplete', 'SD recording download did not complete; no partial video was uploaded.')
+                    finally:
+                        try:
+                            partial.unlink(missing_ok=True)
+                        except OSError:
+                            error = error or SDSourceError('sd_stage_invalid', 'SD staging cleanup did not complete.')
+                    results.put((number, complete, size, elapsed, connected, error))
+            finally:
+                if session is not None:
+                    session.__exit__(None, None, None)
+
+        def clean_complete(path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                return SDSourceError('sd_stage_invalid', 'SD staging cleanup did not complete; admitted transfers were drained.')
+            return None
+
+        try:
+            for number in range(2):
+                thread = threading.Thread(target=download_worker, args=(number,),
+                                          name=f'sd-file-{self.camera_id}-{number+1}', daemon=False)
+                thread.start()
+                workers.append(thread)
+            position = 0
+            while position < len(todo):
+                if stop_requested is not None and stop_requested():
+                    statistics['interrupted'] = True
+                    statistics['backlog'] += len(todo)-position
+                    break
+                active = self.archive.conn.execute('SELECT enabled FROM cameras WHERE id=? AND deleted_at IS NULL', (self.camera_id,)).fetchone()
+                if active is None or not active['enabled']:
+                    raise SDSourceError('camera_disabled', 'Camera was paused during SD sync; no further recording was downloaded.')
+                with ExitStack() as reservation:
+                    batch = []
+                    # Under pressure degrade to one real transfer, not an
+                    # unbounded backlog of completed staged files.
+                    for width in range(min(2, len(todo)-position), 0, -1):
+                        used = cache_used_bytes(self.archive.settings.cache_dir)
+                        free = shutil.disk_usage(root).free
+                        factor = 3 if self.archive.settings.media_mode == 'remux_copy' else 2
+                        allowance = min(self.archive.settings.cache_max_bytes-used,
+                                        free-self.archive.settings.min_free_bytes) // factor
+                        selected = todo[position:position+width]
+                        known_bytes = sum(max(0, item[0].get('size', 0)) for item in selected)
+                        unknown = sum(item[0].get('size', 0) <= 0 for item in selected)
+                        unknown_limit = min(MAX_NATIVE_FILE, max(0, allowance-known_bytes)//max(1, unknown))
+                        maxima = [min(MAX_NATIVE_FILE, item[0]['size']) if item[0].get('size', 0) > 0 else unknown_limit for item in selected]
+                        if any(maximum <= 0 or item[0].get('size', 0) > maximum for item, maximum in zip(selected, maxima)):
+                            if width > 1:
+                                continue
+                            raise SDSourceError('sd_size_limit' if allowance > 0 else 'sd_cache_budget', 'SD staging budget cannot admit this recording; confirmed files remain intact.')
+                        candidate = ExitStack()
+                        admitted = candidate.enter_context(reserve_cache(self.archive.settings, sum(maxima)*factor, directory=root))
+                        if admitted:
+                            reservation.enter_context(candidate)
+                            batch = list(zip(selected, maxima))
+                            break
+                        candidate.close()
+                    if not batch:
+                        raise SDSourceError('sd_cache_budget', 'SD staging cache budget reached; confirmed recordings remain intact.')
+                    for number, (item, maximum) in enumerate(batch):
+                        suffix = uuid.uuid4().hex
+                        tasks[number].put((item, maximum, root/f'{item[2]}.{suffix}.part', root/f'{item[2]}.{suffix}.source'))
+                    received = {}
+                    failure = None
+                    for number, (item, _) in enumerate(batch):
+                        while number not in received:
+                            try:
+                                received_result = results.get(timeout=0.2)
+                                received[received_result[0]] = received_result
+                            except queue.Empty:
+                                pass
+                            try:
+                                notify('sd_download', force=False)
+                            except Exception:
+                                failure = failure or SDSourceError('sd_progress_failed', 'SD progress reporting failed; admitted downloads were drained.')
+                                progress = None
+                        _, complete, size, elapsed, connected, error = received.pop(number)
+                        statistics['connect_seconds'] += connected
+                        statistics['download_seconds'] += elapsed
+                        if error is not None:
+                            failure = failure or error
+                            cleanup_error = clean_complete(complete)
+                            failure = failure or cleanup_error
+                            continue
+                        statistics['downloaded'] += 1
+                        statistics['download_bytes'] += size
+                        if failure is not None:
+                            # Match the serial prefix: a later clip must not
+                            # become uploadable ahead of a failed predecessor.
+                            statistics['backlog'] += 1
+                            clean_complete(complete)
+                            continue
+                        try:
+                            entry = dict(item[1], path=str(complete))
+                            begun = time.monotonic()
+                            result = self.archive.ingest_download(entry, complete)
+                            statistics['ingest_seconds'] += round(time.monotonic()-begun, 6)
+                            if result.get('status') == 'camera_disabled':
+                                statistics['deferred'] += 1
+                                raise SDSourceError('camera_disabled', 'Camera was paused during SD sync; the download was not imported.')
+                            statistics['imported'] += 1
+                            cleanup_error = clean_complete(complete)
+                            if cleanup_error is not None:
+                                raise cleanup_error
+                            notify('sd_download')
+                        except Exception as exc:
+                            failure = failure or (exc if isinstance(exc, SDSourceError) else SDSourceError(
+                                'sd_media_validation_failed', 'Downloaded SD recording could not be copied intact into the managed cache; no Telegram upload was attempted.'))
+                        finally:
+                            cleanup_error = clean_complete(complete)
+                            failure = failure or cleanup_error
+                    position += len(batch)
+                    if failure is not None:
+                        raise failure
+            if stop_requested is not None and stop_requested():
+                statistics['interrupted'] = True
+        finally:
+            # A stop drains the two admitted files and closes each native
+            # helper on its owning thread. It never kills a current download.
+            for number in range(len(workers)):
+                tasks[number].put(None)
+            for thread in workers:
+                thread.join()
         notify('sd_complete')
         return statistics
 

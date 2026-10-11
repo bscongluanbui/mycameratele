@@ -137,23 +137,73 @@ class PipelineRuntime:
         self._threads = []
         self._started = False
         self._failed = threading.Event()
+        self._admission = threading.Lock()
+        self._active = 0
+
+    def set_limit(self, count):
+        """A lower limit drains admitted jobs; it never interrupts a file."""
+        if type(count) is not int or not 1 <= count <= 5:
+            raise ValueError('SD download workers must be between 1 and 5')
+        with self._admission:
+            changed = self.count != count
+            self.count = count
+        if changed:
+            self.wake()
+        return changed
+
+    def _admit(self, archive):
+        with self._admission:
+            # Each active worker reads on its own connection before admitting
+            # the next job. Dormant workers use the main loop's live snapshot.
+            if archive is not None and hasattr(archive, 'pipeline_settings'):
+                count = archive.pipeline_settings()['sd_download_workers']
+                if type(count) is not int or not 1 <= count <= 5:
+                    raise ValueError('Invalid persistent camera worker limit')
+                self.count = count
+            if self.stop_event.is_set() or self._active >= self.count:
+                return False
+            self._active += 1
+            return True
+
+    def _confirm_admission(self, archive):
+        # A newly activated slot did not yet own a connection at _admit().
+        # Recheck persistence after opening it, before claiming any job.
+        with self._admission:
+            if hasattr(archive, 'pipeline_settings'):
+                count = archive.pipeline_settings()['sd_download_workers']
+                if type(count) is not int or not 1 <= count <= 5:
+                    raise ValueError('Invalid persistent camera worker limit')
+                self.count = count
+            return not self.stop_event.is_set() and self._active <= self.count
 
     def _worker(self, number):
         archive = None
+        initialized = False
         try:
             # sqlite3 connections must not cross thread boundaries. Schema and
             # crash recovery were already completed once by the main runner.
-            archive = self.archive_factory(self.settings)
-            queue = self.queue_factory(archive, stop_event=self.stop_event)
-            telegram = serialized_uploads(self.telegram_factory(self.settings),
-                                          stop_event=self.stop_event)
             while not self.stop_event.is_set():
+                admitted = False
                 try:
-                    if queue.run_once(telegram):
-                        self.emit('sync_job_finished', worker=number)
-                        continue
+                    admitted = self._admit(archive)
+                    if admitted:
+                        if archive is None:
+                            archive = self.archive_factory(self.settings)
+                            queue = self.queue_factory(archive, stop_event=self.stop_event)
+                            telegram = serialized_uploads(self.telegram_factory(self.settings),
+                                                          stop_event=self.stop_event)
+                            initialized = True
+                        if self._confirm_admission(archive) and queue.run_once(telegram):
+                            self.emit('sync_job_finished', worker=number)
+                            continue
                 except Exception as error:
+                    if not initialized:
+                        raise
                     self.emit('sync_error', worker=number, error_type=type(error).__name__)
+                finally:
+                    if admitted:
+                        with self._admission:
+                            self._active -= 1
                 # Bound latency for jobs queued by dashboard/bot as well as the
                 # scheduler; do not busy-spin when there is no queued work.
                 self._wake.wait(0.5)
@@ -171,7 +221,9 @@ class PipelineRuntime:
             raise RuntimeError('Camera download workers already started')
         self._started = True
         try:
-            for number in range(1, self.count + 1):
+            # Stable maximum-size executor enables 1 -> 5 without a restart.
+            # Connections remain lazy: dormant slots own no SQLite resources.
+            for number in range(1, 6):
                 thread = threading.Thread(target=self._worker, args=(number,),
                                           name='camera-download-' + str(number), daemon=False)
                 thread.start()

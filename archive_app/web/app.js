@@ -55,8 +55,8 @@
     },
     cameraPatch(original, edited) {
       const patch = {};
-      for (const key of ["name", "model", "host", "device_port", "rtsp_port", "http_port", "enabled", "upload_enabled", "channel_chat_id", "channel_name", "channel_enabled", "sd_backend", "sd_username", "sd_channel", "sd_timezone", "sd_lookback_hours"]) {
-        if (edited[key] !== undefined && edited[key] !== original[key]) patch[key] = edited[key];
+      for (const key of ["name", "model", "host", "device_port", "rtsp_port", "http_port", "enabled", "upload_enabled", "channel_chat_id", "channel_name", "channel_enabled", "sd_backend", "sd_username", "sd_channel", "sd_timezone", "sd_lookback_hours", "sd_download_threads"]) {
+        if (edited[key] !== undefined && edited[key] !== (key === "sd_download_threads" ? original[key] ?? 1 : original[key])) patch[key] = edited[key];
       }
       if (typeof edited.sd_password === "string" && edited.sd_password) patch.sd_password = edited.sd_password;
       if (edited.sd_password_clear === true) patch.sd_password_clear = true;
@@ -208,6 +208,9 @@
 
   const $ = id => document.getElementById(id);
   const state = { cameras: [], status: {}, csrf: "", probes: new Map(), calendar: [], offset: 0, limit: 25, total: 0, archiveRequest: 0, calendarRequest: 0, editing: null, view: "cameras", authenticated: false, sessionRevision: 0, account: null, accountRequired: false, loginBusy: false, accountBusy: false, logoutBusy: false, sync: {jobs: [], latest: {}, worker_alive: false}, syncRequest: 0, syncTimer: null, syncBusy: new Set(), syncSummary: "", expandedSync: new Set(), discovery: {scan: null, choices: new Map(), timer: null, revision: 0, starting: false, adding: false, cancelling: false} };
+  state.cameraRevision = 0;
+  state.cameraDelete = {camera: null, busy: false, revision: 0, returnFocus: null};
+  state.pipeline = {settings: null, busy: false, loading: false, dirty: false, request: 0};
   let toastTimer;
   function node(tag, className, text) {
     const item = document.createElement(tag);
@@ -218,6 +221,7 @@
   const iconPaths = {
     camera: '<rect x="3" y="6" width="13" height="12" rx="2"/><path d="m16 10 5-3v10l-5-3"/>',
     edit: '<path d="m16 3 5 5-12 12H4v-5zM13 6l5 5"/>',
+    trash: '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>',
     network: '<circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 7v6M5 17v-4h14v4"/>',
     video: '<path d="M6 3h8l4 4v14H6zM14 3v5h4"/><path d="m10 12 5 3-5 3z"/>',
     external: '<path d="M14 3h7v7M21 3l-9 9M10 3H3v18h18v-7"/>',
@@ -256,6 +260,9 @@
     if (field && $(field)) { $(field).setAttribute("aria-invalid", "true"); $(field).focus(); } else errorBox.focus();
   }
   function showLogin({ username = state.account?.username || "", message = "" } = {}) {
+    closeCameraDelete(true, false);
+    state.pipeline = {settings: null, busy: false, loading: false, dirty: false, request: state.pipeline.request + 1};
+    $("pipeline-workers").value = ""; pipelineControls();
     resetDiscovery();
     stopSyncPolling(); state.syncRequest++; state.sync = {jobs: [], latest: {}, worker_alive: false}; state.syncBusy.clear(); state.expandedSync.clear();
     state.authenticated = false; state.sessionRevision++; state.archiveRequest++; state.calendarRequest++;
@@ -269,6 +276,7 @@
     (username ? $("login-password") : $("login-username")).focus();
   }
   function showAccount(account, required = !!account?.password_change_required) {
+    closeCameraDelete(true, false);
     closeDiscovery();
     stopSyncPolling(); state.syncRequest++;
     state.account = account; state.accountRequired = required; state.archiveRequest++; state.calendarRequest++;
@@ -399,7 +407,7 @@
   }
   function renderCameras() {
     const focused = document.activeElement;
-    const focusKey = focused?.dataset?.cameraStart ? ["cameraStart", focused.dataset.cameraStart] : focused?.dataset?.cameraUpload ? ["cameraUpload", focused.dataset.cameraUpload] : focused?.dataset?.cameraChannel ? ["cameraChannel", focused.dataset.cameraChannel] : null;
+    const focusKey = focused?.dataset?.cameraStart ? ["cameraStart", focused.dataset.cameraStart] : focused?.dataset?.cameraUpload ? ["cameraUpload", focused.dataset.cameraUpload] : focused?.dataset?.cameraChannel ? ["cameraChannel", focused.dataset.cameraChannel] : focused?.dataset?.cameraDelete ? ["cameraDelete", focused.dataset.cameraDelete] : null;
     const syncFocus = rememberSyncRows($("camera-grid"));
     const query = $("camera-search").value.toLocaleLowerCase("vi-VN").trim();
     const cameras = state.cameras.filter(camera => [camera.name, camera.id, camera.model, camera.host].some(value => String(value || "").toLocaleLowerCase("vi-VN").includes(query)));
@@ -413,6 +421,7 @@
       info.append(infoRow("Địa chỉ LAN", camera.host || "Chưa khai báo", true), infoRow("Mã camera", camera.id, true), infoRow("Kết nối", chip(...summary)), infoRow("Cấu hình", chip(camera.enabled === false ? "Đã tạm dừng" : "Đang bật", camera.enabled === false ? "neutral" : "green")));
       const total = helpers.cameraCount(camera, "total"), uploaded = helpers.cameraCount(camera, "uploaded");
       info.append(infoRow("Video / Đã lưu", `${displayCount(total)} / ${displayCount(uploaded)}`));
+      info.append(infoRow("Luồng tải SD", `${camera.sd_download_threads ?? 1} file / camera`));
       info.append(infoRow("Channel riêng", camera.channel_name || (camera.channel_chat_id ? String(camera.channel_chat_id) : "Chưa gán"), !camera.channel_name));
       if (camera.channel_name && camera.channel_chat_id) info.append(infoRow("Channel ID", String(camera.channel_chat_id), true));
       info.append(infoRow("Telegram", chip(...helpers.channelState(camera))));
@@ -436,6 +445,11 @@
       const channelButton = button(state.channelBusy?.has(camera.id) ? "Đang kiểm tra…" : "Kiểm tra channel", "ghost", () => checkCameraChannel(camera), "external");
       channelButton.dataset.cameraChannel = camera.id; channelButton.disabled = !camera.channel_chat_id || camera.channel_enabled === false || !!state.channelBusy?.has(camera.id);
       channelButton.setAttribute("aria-label", `Kiểm tra channel ${camera.name || camera.id}`); actions.append(channelButton);
+      const remove = button("Xóa camera", "danger subtle", () => openCameraDelete(camera, remove), "trash");
+      remove.dataset.cameraDelete = camera.id; remove.disabled = job?.state === "running" || state.syncBusy.has(camera.id) || state.syncBusy.has("upload:" + camera.id);
+      remove.setAttribute("aria-label", `Xóa camera ${camera.name || camera.id}`);
+      if (remove.disabled) remove.title = "Chờ lượt đồng bộ đang chạy kết thúc trước khi xóa camera.";
+      actions.append(remove);
       card.append(top, info, syncDetail, uploadBox, actions); $("camera-grid").append(card);
     }
     renderStats();
@@ -549,6 +563,51 @@
     $("system-sd-description").textContent = `Nguồn SD: ${adapter}. Worker chọn ISAPI hoặc HCNetSDK theo cấu hình camera; House01 dùng MP4 remux-copy (không encode/AAC/full decode) rồi lưu private channel. Bot trả media khi có yêu cầu. Cache trung chuyển mặc định 1 giờ. HCNetSDK cần compose.sdk.yaml / HCNETSDK_DIR và SDK đúng kiến trúc tại /opt/hcnetsdk. VPS cần route camera LAN qua Tailscale / Armbian; cổng mở không xác nhận đã tải được SD.`;
     renderProbes();
   }
+  function pipelineControls() {
+    const pipeline = state.pipeline, value = Number($("pipeline-workers").value);
+    $("pipeline-workers").disabled = pipeline.busy || pipeline.loading || !pipeline.settings;
+    $("pipeline-save").disabled = pipeline.busy || pipeline.loading || !pipeline.settings || !Number.isInteger(value) || value < 1 || value > 5 || value === pipeline.settings?.sd_download_workers;
+    $("pipeline-save").textContent = pipeline.busy ? "Đang lưu…" : "Lưu số luồng";
+    if (pipeline.busy || pipeline.loading) $("pipeline-form").setAttribute("aria-busy", "true"); else $("pipeline-form").removeAttribute("aria-busy");
+  }
+  async function loadPipelineSettings() {
+    if (!state.authenticated || state.accountRequired || state.pipeline.busy) return;
+    const pipeline = state.pipeline, request = ++pipeline.request, session = state.sessionRevision;
+    pipeline.loading = true; pipelineControls();
+    $("pipeline-status").textContent = "Đang tải cấu hình luồng…";
+    try {
+      const result = await api("/api/pipeline-settings");
+      if (!state.authenticated || state.accountRequired || session !== state.sessionRevision || request !== state.pipeline.request) return;
+      if (!Number.isInteger(result.sd_download_workers) || result.sd_download_workers < 1 || result.sd_download_workers > 5) throw new Error("Cấu hình số camera đồng bộ chưa hợp lệ.");
+      pipeline.settings = result;
+      if (!pipeline.dirty) $("pipeline-workers").value = String(result.sd_download_workers);
+      $("pipeline-status").textContent = pipeline.dirty ? "Có thay đổi chưa lưu." : `Hiện tại: tối đa ${result.sd_download_workers} camera đồng bộ cùng lúc.`;
+      clearFormError($("pipeline-form"), $("pipeline-error"));
+    } catch (error) {
+      if (state.authenticated && !state.accountRequired && session === state.sessionRevision && request === state.pipeline.request) { $("pipeline-status").textContent = "Chưa tải được cấu hình luồng."; formError($("pipeline-form"), $("pipeline-error"), error.message); }
+    } finally { if (session === state.sessionRevision && request === state.pipeline.request) { pipeline.loading = false; pipelineControls(); } }
+  }
+  async function savePipelineSettings(event) {
+    event.preventDefault();
+    const pipeline = state.pipeline, value = Number($("pipeline-workers").value);
+    if (!state.authenticated || state.accountRequired || pipeline.busy || pipeline.loading || !pipeline.settings) return;
+    clearFormError($("pipeline-form"), $("pipeline-error"));
+    if (!Number.isInteger(value) || value < 1 || value > 5) { formError($("pipeline-form"), $("pipeline-error"), "Chọn từ 1 đến 5 camera đồng bộ cùng lúc.", "pipeline-workers"); return; }
+    const session = state.sessionRevision, request = ++pipeline.request;
+    pipeline.busy = true; pipelineControls(); $("pipeline-status").textContent = "Đang lưu cấu hình luồng…";
+    try {
+      const result = await api("/api/pipeline-settings", {method: "PATCH", body: {sd_download_workers: value}});
+      if (!state.authenticated || state.accountRequired || session !== state.sessionRevision || request !== state.pipeline.request) return;
+      if (result.sd_download_workers !== value || result.applies_to !== "next_jobs") throw new Error("Dashboard chưa xác nhận cấu hình luồng. Tải lại trước khi thử lại.");
+      pipeline.settings = result; pipeline.dirty = false;
+      $("pipeline-status").textContent = `Đã lưu ${value} camera cùng lúc. Áp dụng cho lượt đồng bộ kế tiếp; không cần khởi động lại.`;
+      toast("Đã lưu số luồng tải camera.");
+    } catch (error) {
+      if (state.authenticated && !state.accountRequired && session === state.sessionRevision && request === state.pipeline.request) {
+        $("pipeline-status").textContent = "Chưa xác nhận lưu cấu hình."; formError($("pipeline-form"), $("pipeline-error"), error.message);
+      }
+    } finally { if (session === state.sessionRevision && request === state.pipeline.request) { pipeline.busy = false; pipelineControls(); } }
+  }
   function renderProbes() {
     const target = $("system-probes"); target.replaceChildren();
     if (!state.probes.size) { target.textContent = "Chưa có kết quả kiểm tra trong phiên này. Chọn “Kiểm tra LAN” ở thẻ camera."; return; }
@@ -565,16 +624,18 @@
   }
   async function refresh() {
     if (!state.authenticated || state.accountRequired) return;
-    const revision = state.sessionRevision;
+    const revision = state.sessionRevision, cameraRevision = state.cameraRevision;
     $("refresh-button").disabled = true; $("camera-loading").hidden = false; globalError("");
     try {
       const status = await api("/api/status");
       if (!state.authenticated || state.accountRequired || revision !== state.sessionRevision) return;
       const response = await api("/api/cameras");
       if (!state.authenticated || state.accountRequired || revision !== state.sessionRevision) return;
+      if (cameraRevision !== state.cameraRevision) return;
       state.status = status; state.csrf = status.csrf_token || state.csrf; state.cameras = Array.isArray(response.cameras) ? response.cameras : [];
       $("boot-loading").hidden = true; $("login-screen").hidden = true; if ($("account-screen").hidden) $("app-shell").hidden = false;
       renderCameras(); refreshCameraOptions(); renderSystem();
+      if (state.view === "system") await loadPipelineSettings();
       await loadSync();
       if (state.view === "archive") { await loadCalendar(true); await loadArchive(); }
     } catch (error) {
@@ -592,7 +653,7 @@
     for (const link of document.querySelectorAll("[data-view]")) { const active = link.dataset.view === name; link.classList.toggle("active", active); if (active) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current"); }
     $("topbar-page").textContent = { cameras: "Camera", archive: "Thư viện video", logs: "Logs", system: "Hệ thống" }[name];
     if (name === "archive" && load && state.authenticated && !state.accountRequired) { loadCalendar(true).then(loadArchive).catch(error => globalError(error.message)); }
-    if (name === "system") renderSystem();
+    if (name === "system") { renderSystem(); if (load && state.authenticated && !state.accountRequired) loadPipelineSettings(); }
     if (name === "logs") { renderLogs(); if (load && state.authenticated && !state.accountRequired) loadSync(); }
   }
   async function openCameraArchive(id) {
@@ -865,6 +926,7 @@
     $("camera-channel-manual").open = false;
     $("camera-sd-backend").value = camera?.sd_backend || "auto"; $("camera-sd-username").value = camera?.sd_username || "admin";
     $("camera-sd-channel").value = camera?.sd_channel || 1; $("camera-sd-timezone").value = camera?.sd_timezone || "Asia/Ho_Chi_Minh"; $("camera-sd-lookback").value = camera?.sd_lookback_hours || 168;
+    $("camera-sd-download-threads").value = String(camera?.sd_download_threads ?? 1);
     $("camera-sd-password").value = ""; $("camera-sd-password-clear").checked = false; $("camera-sd-clear-control").hidden = !camera?.sd_password_configured;
     $("camera-sd-password-hint").textContent = camera?.sd_password_configured ? "Đã có mật khẩu thiết bị. Để trống sẽ giữ nguyên; mật khẩu hiện có không hiển thị." : "Chưa lưu mật khẩu thiết bị. Nhập mật khẩu / mã xác thực của camera để thử tải SD.";
     renderChannelOptions(state.knownChannels || []);
@@ -874,11 +936,12 @@
     event.preventDefault(); if (!$("camera-form").reportValidity()) return;
     const values = new FormData($("camera-form"));
     const data = { id: String(values.get("id") || "").trim(), name: String(values.get("name") || "").trim(), model: String(values.get("model") || "").trim(), host: String(values.get("host") || "").trim(), enabled: $("camera-enabled").checked, upload_enabled: $("camera-upload-enabled").checked,
-      sd_backend: $("camera-sd-backend").value, sd_username: $("camera-sd-username").value.trim(), sd_channel: Number($("camera-sd-channel").value), sd_timezone: $("camera-sd-timezone").value.trim(), sd_lookback_hours: Number($("camera-sd-lookback").value) };
+      sd_backend: $("camera-sd-backend").value, sd_username: $("camera-sd-username").value.trim(), sd_channel: Number($("camera-sd-channel").value), sd_timezone: $("camera-sd-timezone").value.trim(), sd_lookback_hours: Number($("camera-sd-lookback").value), sd_download_threads: Number($("camera-sd-download-threads").value) };
     if ($("camera-sd-password").value) data.sd_password = $("camera-sd-password").value;
     if ($("camera-sd-password-clear").checked) data.sd_password_clear = true;
     for (const name of ["device_port", "rtsp_port", "http_port"]) data[name] = Number(values.get(name));
     const errorBox = $("camera-form-error"); clearFormError($("camera-form"), errorBox);
+    if (![1, 2].includes(data.sd_download_threads)) { formError($("camera-form"), errorBox, "Chọn 1 hoặc 2 file tải SD cùng lúc cho camera.", "camera-sd-download-threads"); return; }
     try { data.channel_chat_id = helpers.channelId($("camera-channel-chat-id").value); }
     catch (error) { formError($("camera-form"), errorBox, error.message, "camera-channel-chat-id"); return; }
     data.channel_name = $("camera-channel-name").value.trim();
@@ -903,6 +966,67 @@
       $("camera-sd-password").value = ""; $("camera-dialog").close(); await refresh(); toast(wasEditing ? "Đã cập nhật camera. Mã và lịch sử video được giữ nguyên." : data.enabled ? "Đã thêm camera và gửi Start vào hàng đợi. Theo dõi tiến trình đồng bộ." : "Đã thêm camera ở trạng thái tạm dừng. Bật camera trước khi Start.");
     } catch (error) { errorBox.textContent = error.message; errorBox.hidden = false; errorBox.focus(); }
     finally { $("save-camera-button").disabled = false; }
+  }
+  function cameraDeleteControls() {
+    const deletion = state.cameraDelete;
+    $("confirm-camera-delete").disabled = deletion.busy || !deletion.camera || $("camera-delete-name").value !== deletion.camera.name;
+    $("camera-delete-name").disabled = deletion.busy;
+    $("cancel-camera-delete").disabled = deletion.busy; $("close-camera-delete").disabled = deletion.busy;
+    $("confirm-camera-delete").textContent = deletion.busy ? "Đang xóa…" : "Xóa camera";
+    if (deletion.busy) $("camera-delete-form").setAttribute("aria-busy", "true"); else $("camera-delete-form").removeAttribute("aria-busy");
+  }
+  function closeCameraDelete(force = false, restoreFocus = true) {
+    const deletion = state.cameraDelete;
+    if (deletion.busy && !force) return;
+    const cameraId = deletion.camera?.id, previous = deletion.returnFocus;
+    deletion.camera = null; deletion.busy = false; deletion.returnFocus = null; deletion.revision++;
+    $("camera-delete-name").value = ""; cameraDeleteControls();
+    if ($("camera-delete-dialog").open) $("camera-delete-dialog").close();
+    if (!restoreFocus || !state.authenticated || state.accountRequired) return;
+    const replacement = [...$("camera-grid").querySelectorAll("button")].find(control => control.dataset.cameraDelete === cameraId && !control.disabled);
+    if (replacement) replacement.focus({preventScroll: true});
+    else if (previous && document.contains(previous) && !previous.disabled) previous.focus({preventScroll: true});
+    else $("camera-search").focus({preventScroll: true});
+  }
+  function openCameraDelete(camera, control = document.activeElement) {
+    if (!state.authenticated || state.accountRequired || state.cameraDelete.busy) return;
+    const current = state.cameras.find(value => value.id === camera.id);
+    if (!current) return;
+    if ((state.sync.latest?.[current.id] || current.sync)?.state === "running") { toast("Chờ lượt đồng bộ đang chạy kết thúc trước khi xóa camera.", true); return; }
+    state.cameraDelete = {camera: {id: current.id, name: current.name, host: current.host}, busy: false, revision: state.cameraDelete.revision + 1, returnFocus: control};
+    $("camera-delete-form").reset(); $("camera-delete-name").value = "";
+    clearFormError($("camera-delete-form"), $("camera-delete-error"));
+    $("camera-delete-target").textContent = `${current.name || current.id} · ${current.host || "Chưa khai báo IP"}`;
+    $("camera-delete-expected").textContent = current.name;
+    cameraDeleteControls(); $("camera-delete-dialog").showModal(); $("cancel-camera-delete").focus();
+  }
+  async function deleteCamera(event) {
+    event.preventDefault();
+    const deletion = state.cameraDelete, camera = deletion.camera, revision = deletion.revision, session = state.sessionRevision;
+    if (!state.authenticated || state.accountRequired || !camera || deletion.busy || !$("camera-delete-dialog").open) return;
+    const form = $("camera-delete-form"), errorBox = $("camera-delete-error"); clearFormError(form, errorBox);
+    if ($("camera-delete-name").value !== camera.name) { formError(form, errorBox, "Nhập đúng tên camera để xác nhận xóa.", "camera-delete-name"); return; }
+    deletion.busy = true; cameraDeleteControls();
+    try {
+      const result = await api(`/api/cameras/${encodeURIComponent(camera.id)}`, {method: "DELETE", body: {confirm_name: camera.name}});
+      if (!state.authenticated || state.accountRequired || session !== state.sessionRevision || revision !== state.cameraDelete.revision) return;
+      if (result.deleted !== true || result.camera_id !== camera.id || result.recordings_preserved !== true) throw new Error("Dashboard chưa xác nhận xóa camera. Tải lại danh sách trước khi thử lại.");
+      state.cameraRevision++; state.archiveRequest++; state.calendarRequest++; state.offset = 0;
+      state.cameras = state.cameras.filter(value => value.id !== camera.id); state.probes.delete(camera.id);
+      state.channelBusy?.delete(camera.id); state.expandedSync.delete(`camera:${camera.id}`);
+      if (state.editing === camera.id && $("camera-dialog").open) $("camera-dialog").close();
+      delete state.sync.latest[camera.id];
+      renderCameras(); refreshCameraOptions(); renderSync(); renderProbes();
+      closeCameraDelete(true); toast("Đã xóa camera. Channel và video đã lưu được giữ nguyên.");
+      await refresh();
+    } catch (error) {
+      if (state.authenticated && !state.accountRequired && session === state.sessionRevision && revision === state.cameraDelete.revision && $("camera-delete-dialog").open) {
+        const message = error.code === "camera_busy" ? "Camera đang tải hoặc upload video. Chờ lượt đang chạy kết thúc rồi thử lại." : error.message;
+        formError(form, errorBox, message);
+      }
+    } finally {
+      if (session === state.sessionRevision && revision === state.cameraDelete.revision) { deletion.busy = false; cameraDeleteControls(); }
+    }
   }
   async function probeCamera(camera, control) {
     control.disabled = true; const oldText = control.querySelector("span").textContent; control.querySelector("span").textContent = "Đang kiểm tra…";
@@ -1078,6 +1202,13 @@
   for (const id of ["close-camera-dialog", "cancel-camera-dialog"]) $(id).addEventListener("click", () => { $("camera-sd-password").value = ""; $("camera-dialog").close(); });
   $("camera-dialog").addEventListener("close", () => { $("camera-sd-password").value = ""; state.channelFormRevision = (state.channelFormRevision || 0) + 1; });
   $("camera-form").addEventListener("submit", saveCamera);
+  $("pipeline-form").addEventListener("submit", savePipelineSettings);
+  $("pipeline-workers").addEventListener("change", () => { state.pipeline.dirty = true; clearFormError($("pipeline-form"), $("pipeline-error")); $("pipeline-status").textContent = "Có thay đổi chưa lưu."; pipelineControls(); });
+  $("camera-delete-form").addEventListener("submit", deleteCamera);
+  $("camera-delete-name").addEventListener("input", () => { clearFormError($("camera-delete-form"), $("camera-delete-error")); cameraDeleteControls(); });
+  for (const id of ["close-camera-delete", "cancel-camera-delete"]) $(id).addEventListener("click", () => closeCameraDelete());
+  $("camera-delete-dialog").addEventListener("cancel", event => { event.preventDefault(); closeCameraDelete(); });
+  $("camera-delete-dialog").addEventListener("close", () => { if (state.cameraDelete.camera) closeCameraDelete(true); });
   $("camera-channel-select").addEventListener("change", () => { $("camera-channel-chat-id").value = $("camera-channel-select").value; changeChannelSelection(); });
   $("camera-channel-chat-id").addEventListener("input", changeChannelSelection);
   $("camera-channel-name").addEventListener("input", () => { $("camera-channel-name").removeAttribute("aria-invalid"); renderChannelOptions(state.knownChannels || []); });

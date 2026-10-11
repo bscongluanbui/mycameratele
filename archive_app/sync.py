@@ -31,6 +31,7 @@ def _statistics():
             'sd_current_file_elapsed_seconds': 0.0,
             'sd_current_file_bytes_per_second': 0.0,
             'sd_download_speed_requested_kbps': 0,
+            'sd_download_threads': 1, 'sd_active_downloads': 0, 'sd_peak_downloads': 0,
             'sd_download_speed_status': 'not_requested',
             'sd_download_speed_error_code': None}
 
@@ -106,9 +107,9 @@ class SyncQueue:
         self.conn.execute('BEGIN IMMEDIATE')
         try:
             if camera is None:
-                cameras = self.conn.execute('SELECT id FROM cameras WHERE enabled=1 ORDER BY name COLLATE NOCASE,id').fetchall()
+                cameras = self.conn.execute('SELECT id FROM cameras WHERE deleted_at IS NULL AND enabled=1 ORDER BY name COLLATE NOCASE,id').fetchall()
             else:
-                selected = self.conn.execute('SELECT id,enabled FROM cameras WHERE id=?', (camera,)).fetchone()
+                selected = self.conn.execute('SELECT id,enabled FROM cameras WHERE id=? AND deleted_at IS NULL', (camera,)).fetchone()
                 if selected is None:
                     raise KeyError('Unknown camera')
                 if not selected['enabled']:
@@ -173,6 +174,12 @@ class SyncQueue:
             if self._stopping():
                 self.conn.commit()
                 return None
+            now=time.time()
+            # Defensive recovery of stale jobs created before camera removal.
+            self.conn.execute("""UPDATE sync_jobs SET state='blocked',phase='finished',code='camera_deleted',
+                message='Camera đã xóa khỏi danh sách; video đã lưu được giữ nguyên',updated_at=?,finished_at=?
+                WHERE state='queued' AND NOT EXISTS (SELECT 1 FROM cameras c
+                    WHERE c.id=sync_jobs.camera_id AND c.deleted_at IS NULL)""",(now,now))
             row = self.conn.execute("SELECT * FROM sync_jobs WHERE state='queued' ORDER BY created_at,id LIMIT 1").fetchone()
             if row is None:
                 self.conn.commit()
@@ -189,7 +196,7 @@ class SyncQueue:
             raise
 
     def _camera(self, slug):
-        return self.conn.execute('SELECT id,enabled,upload_enabled FROM cameras WHERE id=?', (slug,)).fetchone()
+        return self.conn.execute('SELECT id,enabled,upload_enabled FROM cameras WHERE id=? AND deleted_at IS NULL', (slug,)).fetchone()
 
     def _counts(self, slug, statistics):
         now = time.time()
@@ -409,6 +416,9 @@ class SyncQueue:
                               'current_file_bytes','current_file_total_bytes','current_file_elapsed_seconds',
                               'current_file_bytes_per_second','download_speed_requested_kbps'):
                     statistics['sd_'+field]=snapshot.get(field,0)
+                statistics['sd_download_threads']=snapshot.get('download_threads',1)
+                statistics['sd_active_downloads']=snapshot.get('active_downloads',0)
+                statistics['sd_peak_downloads']=snapshot.get('peak_downloads',0)
                 statistics['sd_download_speed_status']=snapshot.get('download_speed_status','not_requested')
                 statistics['sd_download_speed_error_code']=snapshot.get('download_speed_error_code')
                 phase=snapshot.get('phase','sd_download')

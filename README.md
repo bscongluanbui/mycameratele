@@ -1,5 +1,10 @@
 # MyCameraTele — Camera Private Channel Archive
 
+Dashboard hỗ trợ **Xóa camera** (giữ video/channel), điều chỉnh **1–5 camera chạy
+đồng thời** trong **Hệ thống → Luồng tải camera**, và **1–2 file SD song song**
+riêng từng camera. Cấu hình được lưu bền vững, áp dụng từ lượt sync kế tiếp,
+không transcode. Xem [hướng dẫn quản lý camera và luồng tải](docs/CAMERA_CONTROLS.md).
+
 **Mỗi camera một private channel** khi bật multi-channel routing; SQLite giữ
 thời gian ghi hình và đích Telegram đã xác nhận. Mỗi channel chỉ ghim **một
 Trang chủ** ngắn, cố định: **Video mới nhất · Hôm nay/ngày gần nhất · Tháng hiện

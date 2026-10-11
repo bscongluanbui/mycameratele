@@ -117,7 +117,7 @@ class ChannelIndex:
     def _camera(self, camera):
         if not isinstance(camera, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', camera):
             raise ValueError('Invalid camera ID')
-        row = self.conn.execute('SELECT * FROM cameras WHERE id=?', (camera,)).fetchone()
+        row = self.conn.execute('SELECT * FROM cameras WHERE id=? AND deleted_at IS NULL', (camera,)).fetchone()
         if row is None:
             raise KeyError('Unknown camera')
         result = dict(row)
@@ -373,7 +373,7 @@ class ChannelIndex:
                     JOIN channel_index_messages day ON day.camera_id=root.camera_id
                         AND day.channel_chat_id=root.channel_chat_id AND day.index_type='day'
                         AND day.state='ready' AND day.tg_message_id BETWEEN 1 AND 2147483647
-                    WHERE root.index_type='root' AND root.state='ready' AND c.channel_enabled=1
+                    WHERE root.index_type='root' AND root.state='ready' AND c.channel_enabled=1 AND c.deleted_at IS NULL
                         AND root.tg_message_id BETWEEN 1 AND 2147483647
                     GROUP BY root.camera_id,root.channel_chat_id''').fetchall()
                 for row in roots:

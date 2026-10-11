@@ -44,6 +44,20 @@ details[open]>.sync-row-summary .sync-detail-label:after{transform:rotate(90deg)
 
 /* Routed LAN discovery. Results stay editable while bounded scan progress updates. */
 #discovery-dialog{max-width:780px}
+.button.danger{background:#b4232c;color:#fff;border-color:#b4232c}
+.button.danger:hover:not(:disabled){background:#911d25;border-color:#911d25}
+.button.danger.subtle{background:transparent;color:#a0252e;border-color:#efc9cd}
+.button.danger.subtle:hover:not(:disabled){background:#fff0f1;border-color:#d99ba2}
+#camera-delete-dialog{max-width:520px}
+.camera-delete-target{font-size:14px;font-weight:600;overflow-wrap:anywhere;margin-top:20px;color:#263c5d}
+.camera-delete-expected{overflow-wrap:anywhere;font-size:13px;font-weight:600;padding:10px 12px;background:#f5f8fc;border:1px solid var(--line);border-radius:7px;margin-bottom:10px;user-select:all}
+#camera-delete-dialog .dialog-actions{flex-wrap:wrap}
+.pipeline-settings{margin-bottom:20px}
+.pipeline-setting-controls{display:flex;align-items:flex-end;gap:14px;max-width:500px}
+.pipeline-setting-controls .field{flex:1;min-width:160px}
+#pipeline-status{margin-top:12px;line-height:1.7}
+@media(max-width:700px){.pipeline-setting-controls{flex-wrap:wrap}.pipeline-setting-controls select,#camera-sd-download-threads{font-size:16px;min-height:44px}.pipeline-setting-controls .button{min-height:44px}}
+@media(max-width:700px){#camera-delete-name{font-size:16px;min-height:44px}#camera-delete-dialog .button{min-height:44px}.camera-card-bottom .button.danger{min-height:44px}}
 .discovery-dialog-content{padding:26px}
 #discovery-dialog form{padding:0}
 .discovery-network-grid{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:12px}

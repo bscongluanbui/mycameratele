@@ -101,7 +101,7 @@ class TimeMenus:
             begin = datetime.strptime(day, '%Y-%m-%d')
             start = self._local_timestamp(begin)
             end = self._local_timestamp(begin + timedelta(days=1))
-            camera = self.telegram._camera(archive, token)['id']
+            camera = self.telegram._archive_camera(archive, token)['id']
             return {'start_ms': start, 'end_ms': end, 'camera': camera,
                     'order': 'asc' if order == 'a' else 'desc', 'label': begin.strftime('%d/%m/%y')}
         custom = self._CUSTOM_DOWNLOAD.fullmatch(data)
@@ -114,7 +114,7 @@ class TimeMenus:
                 raise ValueError('Invalid bulk-download selection')
             kind, anchor, token, order = selected.groups()
             start, end, label = self._window(kind, int(anchor))
-        camera = None if token == 'all' else self.telegram._camera(archive, token)['id']
+        camera = None if token == 'all' else self.telegram._archive_camera(archive, token)['id']
         return {'start_ms': start, 'end_ms': end, 'camera': camera,
                 'order': 'asc' if order == 'a' else 'desc', 'label': label}
 
@@ -335,7 +335,7 @@ class TimeMenus:
 
     def _clips(self, archive, kind, anchor, token, order, page, camera_page, custom=None):
         start_ms, end_ms, summary = custom if custom is not None else self._window(kind, anchor)
-        camera = self.telegram._camera(archive, token)
+        camera = self.telegram._archive_camera(archive, token)
         result = archive.list_window(start_ms, end_ms, camera=camera['id'],
                                      order='asc' if order == 'a' else 'desc',
                                      offset=page * self.PAGE_SIZE, limit=self.PAGE_SIZE)

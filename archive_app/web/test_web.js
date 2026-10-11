@@ -237,7 +237,7 @@ const context = {document: documentStub, Node: Element, module: {exports: {}}, w
 vm.createContext(context);
 const bootLine = 'switchView(location.hash.slice(1), false); boot();';
 equal(source.includes(bootLine), true);
-vm.runInContext(source.replace(bootLine, 'globalThis.testUi = {state, renderCameras, renderSync, renderLogs, switchView, syncDisclosure, renderDiscoveryJob, renderDiscoveryResults, discoveryControls, closeDiscovery, resetDiscovery, openDiscovery, startDiscovery, pollDiscovery, cancelDiscovery, addDiscoveredCameras, renderChannelOptions, loadCameraChannels, checkCameraChannel, openCameraForm, saveCamera, changeChannelSelection};'), context);
+vm.runInContext(source.replace(bootLine, 'globalThis.testUi = {state, renderCameras, renderSync, renderLogs, switchView, syncDisclosure, renderDiscoveryJob, renderDiscoveryResults, discoveryControls, closeDiscovery, resetDiscovery, openDiscovery, startDiscovery, pollDiscovery, cancelDiscovery, addDiscoveredCameras, renderChannelOptions, loadCameraChannels, checkCameraChannel, openCameraForm, saveCamera, changeChannelSelection, openCameraDelete, closeCameraDelete, deleteCamera, refresh, showLogin, loadPipelineSettings, savePipelineSettings};'), context);
 const ui = context.testUi;
 ui.state.cameras = [{id: 'pn', name: 'PN', enabled: true, host: '192.168.1.2'}, {id: 'door', name: 'Cửa trước', enabled: true}];
 const job = {id: 'job-1', camera_id: 'pn', camera_name: 'PN', state: 'running', phase: 'uploading', message: '<img src=x onerror=alert(1)>', code: 'fixture_code', source: 'dashboard', created_at: 100, started_at: 101, updated_at: 102, finished_at: null, statistics: {sd_searched: 27, sd_downloaded: 27, uploaded: 16, failed: 0, remuxed: 20, sd_error_code: 'fixture_error'}};
@@ -532,5 +532,172 @@ equal(ui.state.discovery.revision, discoveryRevision + 1);
   equal(requests.length, beforeInvalid); equal(elements.get('camera-channel-manual').open, true);
   equal(documentStub.activeElement, elements.get('camera-channel-chat-id'));
   elements.get('camera-dialog').close();
+  // Deletion is explicit, confirmed, CSRF-protected, and never removes media.
+  equal(markup.includes('id="camera-delete-dialog" aria-labelledby="camera-delete-title"'), true);
+  equal(markup.includes('Channel, video trên Telegram và lịch sử video vẫn được giữ nguyên.'), true);
+  equal(stylesheet.includes('.button.danger'), true);
+  const removable = {id: 'cam/name', name: '<b>CAM THÙNG TIỀN</b>', host: '192.168.2.9', enabled: true};
+  const remaining = {id: 'remaining', name: 'Cửa trước', host: '192.168.2.6', enabled: true};
+  ui.state.authenticated = true; ui.state.accountRequired = false; ui.state.csrf = 'delete-csrf';
+  ui.state.sync = {jobs: [], latest: {}, worker_alive: true}; ui.state.cameras = [removable, remaining];
+  elements.get('camera-search').value = ''; elements.get('account-screen').hidden = true;
+  ui.renderCameras();
+  let removeControl = elements.get('camera-grid').querySelectorAll('button').find(control => control.dataset.cameraDelete === removable.id);
+  equal(removeControl.disabled, false); equal(removeControl.getAttribute('aria-label'), `Xóa camera ${removable.name}`);
+  let deleteRequests = 0, deleteMode = 'success', resolveDelete;
+  context.fetch = async (url, options) => {
+    requests.push({url, ...options});
+    if (options.method === 'DELETE') {
+      deleteRequests++;
+      if (deleteMode === 'late') return new Promise(resolve => { resolveDelete = resolve; });
+      if (deleteMode === 'network') throw new Error('synthetic offline');
+      if (deleteMode === 'busy') return {ok: false, status: 409, json: async () => ({code: 'camera_busy', error: 'busy'})};
+      if (deleteMode === 'csrf') return {ok: false, status: 403, json: async () => ({code: 'csrf_failed', error: 'Phiên xác nhận chưa hợp lệ.'})};
+      if (deleteMode === 'expired') return {ok: false, status: 401, json: async () => ({code: 'authentication_required'})};
+      return {ok: true, status: 200, json: async () => deleteMode === 'malformed' ? {deleted: true} : {deleted: true, camera_id: removable.id, recordings_preserved: true}};
+    }
+    const result = url === '/api/cameras' ? {cameras: [remaining]} : url === '/api/status' ? {csrf_token: 'delete-csrf', counts: {recordings: 5, uploaded: 5}} : url === '/api/sync?limit=100' ? {jobs: [], latest: {}, worker_alive: true} : {};
+    return {ok: true, status: 200, json: async () => result};
+  };
+  ui.openCameraDelete(removable, removeControl);
+  equal(elements.get('camera-delete-dialog').open, true);
+  equal(elements.get('camera-delete-target').textContent, '<b>CAM THÙNG TIỀN</b> · 192.168.2.9');
+  equal(elements.get('camera-delete-target').rawHtml, undefined);
+  equal(documentStub.activeElement, elements.get('cancel-camera-delete'));
+  equal(elements.get('confirm-camera-delete').disabled, true);
+  elements.get('camera-delete-name').value = removable.name + ' ';
+  await ui.deleteCamera({preventDefault() {}});
+  equal(deleteRequests, 0); equal(elements.get('camera-delete-name').getAttribute('aria-invalid'), 'true');
+  ui.closeCameraDelete();
+  equal(elements.get('camera-delete-dialog').open, false); equal(documentStub.activeElement, removeControl);
+  equal(deleteRequests, 0); equal(ui.state.cameras.length, 2);
+  ui.openCameraDelete(removable, removeControl);
+  let preventedEscape = false;
+  elements.get('camera-delete-dialog').listeners.cancel[0]({preventDefault() { preventedEscape = true; }});
+  equal(preventedEscape, true); equal(elements.get('camera-delete-dialog').open, false);
+  for (const mode of ['busy', 'csrf', 'network', 'malformed']) {
+    deleteMode = mode; ui.openCameraDelete(removable, removeControl);
+    elements.get('camera-delete-name').value = removable.name; elements.get('camera-delete-name').fire('input');
+    equal(elements.get('confirm-camera-delete').disabled, false);
+    await ui.deleteCamera({preventDefault() {}});
+    equal(elements.get('camera-delete-dialog').open, true); equal(ui.state.cameras.length, 2);
+    equal(elements.get('camera-delete-error').hidden, false); equal(ui.state.cameraDelete.busy, false);
+    equal(elements.get('cancel-camera-delete').disabled, false);
+    if (mode === 'busy') equal(elements.get('camera-delete-error').textContent.includes('đang tải hoặc upload'), true);
+    ui.closeCameraDelete();
+  }
+  deleteMode = 'late'; ui.openCameraDelete(removable, removeControl); elements.get('camera-delete-name').value = removable.name;
+  const staleDelete = ui.deleteCamera({preventDefault() {}});
+  equal(elements.get('confirm-camera-delete').disabled, true); equal(elements.get('cancel-camera-delete').disabled, true);
+  const duplicateCount = deleteRequests; await ui.deleteCamera({preventDefault() {}}); equal(deleteRequests, duplicateCount);
+  ui.closeCameraDelete(); equal(elements.get('camera-delete-dialog').open, true);
+  ui.state.sessionRevision++; ui.closeCameraDelete(true, false);
+  resolveDelete({ok: true, status: 200, json: async () => ({deleted: true, camera_id: removable.id, recordings_preserved: true})}); await staleDelete;
+  equal(ui.state.cameras.length, 2); equal(elements.get('camera-delete-dialog').open, false);
+  deleteMode = 'success'; ui.openCameraDelete(removable, removeControl); elements.get('camera-delete-name').value = removable.name;
+  ui.state.probes.set(removable.id, {host: removable.host}); elements.get('filter-camera').value = removable.id;
+  ui.state.offset = 25; await ui.deleteCamera({preventDefault() {}});
+  const deleteRequest = requests.filter(request => request.method === 'DELETE').at(-1);
+  equal(deleteRequest.url, '/api/cameras/cam%2Fname'); equal(JSON.parse(deleteRequest.body), {confirm_name: removable.name});
+  equal(deleteRequest.headers['X-CSRF-Token'], 'delete-csrf'); equal(deleteRequest.credentials, 'same-origin');
+  equal(ui.state.cameras.map(camera => camera.id), ['remaining']); equal(ui.state.probes.has(removable.id), false);
+  equal(elements.get('filter-camera').value, ''); equal(ui.state.offset, 0);
+  equal(elements.get('camera-delete-dialog').open, false); equal(documentStub.activeElement, elements.get('camera-search'));
+  equal(elements.get('toast').textContent, 'Đã xóa camera. Channel và video đã lưu được giữ nguyên.');
+  equal(ui.state.status.counts.recordings, 5);
+  ui.state.cameras = [removable, remaining]; ui.state.sync.latest[removable.id] = {state: 'running'}; ui.renderCameras();
+  removeControl = elements.get('camera-grid').querySelectorAll('button').find(control => control.dataset.cameraDelete === removable.id);
+  equal(removeControl.disabled, true); ui.openCameraDelete(removable); equal(elements.get('camera-delete-dialog').open, false);
+  ui.state.sync.latest[removable.id] = {state: 'queued'}; ui.renderCameras();
+  removeControl = elements.get('camera-grid').querySelectorAll('button').find(control => control.dataset.cameraDelete === removable.id);
+  equal(removeControl.disabled, false);
+  deleteMode = 'expired'; ui.openCameraDelete(removable, removeControl); elements.get('camera-delete-name').value = removable.name;
+  await ui.deleteCamera({preventDefault() {}});
+  equal(ui.state.authenticated, false); equal(elements.get('camera-delete-dialog').open, false);
+  equal(elements.get('login-screen').hidden, false); equal(ui.state.cameraDelete.camera, null);
+  // An older list refresh cannot resurrect a camera after confirmed deletion.
+  ui.state.authenticated = true; ui.state.accountRequired = false; ui.state.view = 'cameras';
+  ui.state.cameras = [remaining]; elements.get('account-screen').hidden = true;
+  let resolveOldCameras;
+  context.fetch = async url => url === '/api/cameras' ? new Promise(resolve => { resolveOldCameras = resolve; }) : {ok: true, status: 200, json: async () => ({})};
+  const oldRefresh = ui.refresh();
+  for (let tick = 0; tick < 10 && !resolveOldCameras; tick++) await Promise.resolve();
+  equal(typeof resolveOldCameras, 'function'); ui.state.cameraRevision++;
+  resolveOldCameras({ok: true, status: 200, json: async () => ({cameras: [removable, remaining]})}); await oldRefresh;
+  equal(ui.state.cameras.map(camera => camera.id), ['remaining']);
+  // Persistent global camera concurrency is separate from per-camera file threads.
+  equal(markup.includes('id="pipeline-workers"'), true); equal(markup.includes('id="camera-sd-download-threads"'), true);
+  equal(helpers.cameraPatch({}, {sd_download_threads: 1}), {});
+  equal(helpers.cameraPatch({}, {sd_download_threads: 2}), {sd_download_threads: 2});
+  equal(helpers.cameraPatch({sd_download_threads: 2}, {sd_download_threads: 1}), {sd_download_threads: 1});
+  ui.state.authenticated = true; ui.state.accountRequired = false; ui.state.csrf = 'pipeline-csrf'; ui.state.view = 'cameras';
+  elements.get('account-screen').hidden = true;
+  let pipelineValue = 3, pipelineMode = 'success', resolvePipeline, pipelineRequests = 0;
+  context.fetch = async (url, options) => {
+    requests.push({url, ...options});
+    if (url === '/api/pipeline-settings') {
+      pipelineRequests++;
+      if (pipelineMode === 'late') return new Promise(resolve => { resolvePipeline = resolve; });
+      if (pipelineMode === 'network') throw new Error('synthetic offline');
+      if (pipelineMode === 'csrf') return {ok: false, status: 403, json: async () => ({code: 'csrf_failed', error: 'Phiên xác nhận chưa hợp lệ.'})};
+      if (options.method === 'PATCH' && pipelineMode === 'success') pipelineValue = JSON.parse(options.body).sd_download_workers;
+      return {ok: true, status: 200, json: async () => ({sd_download_workers: pipelineMode === 'malformed' ? 6 : pipelineValue, environment_default: 5, applies_to: 'next_jobs'})};
+    }
+    let result;
+    if (url === '/api/telegram/channels') result = {channels: []};
+    else if (url === '/api/cameras/pn' && options.method === 'PATCH') { Object.assign(namedCamera, JSON.parse(options.body)); result = namedCamera; }
+    else if (url === '/api/cameras') result = {cameras: [namedCamera]};
+    else if (url === '/api/status') result = {csrf_token: 'pipeline-csrf', counts: {}, multi_channel_routing: true};
+    else if (url === '/api/sync?limit=100') result = {jobs: [], latest: {}, worker_alive: true};
+    else result = {};
+    return {ok: true, status: 200, json: async () => result};
+  };
+  await ui.loadPipelineSettings();
+  equal(elements.get('pipeline-workers').value, '3'); equal(elements.get('pipeline-workers').disabled, false);
+  equal(elements.get('pipeline-save').disabled, true);
+  for (const workers of ['0', '6', '1.5', 'bad']) {
+    elements.get('pipeline-workers').value = workers;
+    const beforeInvalid = pipelineRequests; await ui.savePipelineSettings({preventDefault() {}});
+    equal(pipelineRequests, beforeInvalid); equal(elements.get('pipeline-workers').getAttribute('aria-invalid'), 'true');
+  }
+  elements.get('pipeline-workers').value = '5'; elements.get('pipeline-workers').fire('change');
+  equal(elements.get('pipeline-save').disabled, false); equal(ui.state.pipeline.dirty, true);
+  await ui.loadPipelineSettings(); equal(elements.get('pipeline-workers').value, '5'); equal(ui.state.pipeline.settings.sd_download_workers, 3);
+  await ui.savePipelineSettings({preventDefault() {}});
+  const pipelineRequest = requests.filter(request => request.url === '/api/pipeline-settings' && request.method === 'PATCH').at(-1);
+  equal(JSON.parse(pipelineRequest.body), {sd_download_workers: 5}); equal(pipelineRequest.headers['X-CSRF-Token'], 'pipeline-csrf');
+  equal(ui.state.pipeline.settings.sd_download_workers, 5); equal(ui.state.pipeline.dirty, false);
+  equal(elements.get('pipeline-save').disabled, true); equal(elements.get('pipeline-status').textContent.includes('không cần khởi động lại'), true);
+  for (const mode of ['csrf', 'network', 'malformed']) {
+    pipelineMode = mode; elements.get('pipeline-workers').value = '2'; elements.get('pipeline-workers').fire('change');
+    await ui.savePipelineSettings({preventDefault() {}});
+    equal(ui.state.pipeline.settings.sd_download_workers, 5); equal(elements.get('pipeline-error').hidden, false);
+    equal(ui.state.pipeline.busy, false); equal(elements.get('pipeline-save').disabled, false);
+  }
+  // A late response after session reset cannot restore prior settings.
+  pipelineMode = 'late'; const lateSettings = ui.loadPipelineSettings();
+  ui.showLogin(); resolvePipeline({ok: true, status: 200, json: async () => ({sd_download_workers: 2, applies_to: 'next_jobs'})}); await lateSettings;
+  equal(ui.state.pipeline.settings, null); equal(elements.get('pipeline-workers').disabled, true);
+  ui.state.authenticated = true; ui.state.accountRequired = false; ui.state.csrf = 'pipeline-csrf'; elements.get('account-screen').hidden = true;
+  pipelineMode = 'success'; await ui.loadPipelineSettings();
+  pipelineMode = 'late'; elements.get('pipeline-workers').value = '1'; elements.get('pipeline-workers').fire('change');
+  const pendingSettings = ui.savePipelineSettings({preventDefault() {}});
+  equal(elements.get('pipeline-save').disabled, true); equal(elements.get('pipeline-workers').disabled, true);
+  const pendingCount = pipelineRequests; await ui.savePipelineSettings({preventDefault() {}}); equal(pipelineRequests, pendingCount);
+  resolvePipeline({ok: true, status: 200, json: async () => ({sd_download_workers: 1, applies_to: 'next_jobs'})}); await pendingSettings;
+  equal(ui.state.pipeline.settings.sd_download_workers, 1); equal(elements.get('pipeline-workers').disabled, false);
+  ui.state.cameras = [namedCamera]; ui.state.view = 'cameras'; pipelineMode = 'success';
+  ui.openCameraForm(namedCamera); await ui.loadCameraChannels();
+  equal(elements.get('camera-sd-download-threads').value, '1');
+  const beforeThreadInvalid = requests.length; elements.get('camera-sd-download-threads').value = '3';
+  await ui.saveCamera({preventDefault() {}}); equal(requests.length, beforeThreadInvalid);
+  equal(elements.get('camera-sd-download-threads').getAttribute('aria-invalid'), 'true');
+  elements.get('camera-sd-download-threads').value = '2'; await ui.saveCamera({preventDefault() {}});
+  const threadRequest = requests.filter(request => request.url === '/api/cameras/pn' && request.method === 'PATCH').at(-1);
+  equal(JSON.parse(threadRequest.body), {sd_download_threads: 2}); equal(threadRequest.headers['X-CSRF-Token'], 'pipeline-csrf');
+  equal(namedCamera.sd_download_threads, 2); equal(ui.state.pipeline.settings.sd_download_workers, 1);
+  ui.openCameraForm(namedCamera); await ui.loadCameraChannels(); equal(elements.get('camera-sd-download-threads').value, '2');
+  elements.get('camera-dialog').close(); ui.renderCameras();
+  equal(elements.get('camera-grid').textContent.includes('2 file / camera'), true);
   console.log(`WEB_HELPERS: checks=${checks} passed=${checks} failed=0`);
 })().catch(error => { console.error(error); process.exitCode = 1; });

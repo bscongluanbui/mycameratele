@@ -115,6 +115,7 @@ class Settings:
     sd_max_files_per_job: int = 10
     sd_download_speed_kbps: int = 0
     sd_download_workers: int = 1
+    sd_download_threads: int = 1
 
     @property
     def effective_owner(self):
@@ -147,6 +148,7 @@ class Settings:
         sd_batch = bounded_int('SD_MAX_FILES_PER_JOB', 10, 1, 100)
         sd_speed = bounded_int('SD_DOWNLOAD_SPEED_KBPS', 0, 256, 32768, allow_zero=True)
         sd_workers = bounded_int('SD_DOWNLOAD_WORKERS', 1, 1, 5)
+        sd_threads = bounded_int('SD_DOWNLOAD_THREADS', 1, 1, 2)
         multi_channel = flag('MULTI_CHANNEL_ROUTING', 'false')
         index_enabled = flag('CHANNEL_INDEX_ENABLED', 'true')
         index_debounce = int(os.environ.get('CHANNEL_INDEX_DEBOUNCE_SECONDS', '60'))
@@ -222,6 +224,7 @@ class Settings:
             media_mode=media_mode,
             sd_max_files_per_job=sd_batch, sd_download_speed_kbps=sd_speed,
             sd_download_workers=sd_workers,
+            sd_download_threads=sd_threads,
             player_public_url=os.environ.get('TELEGRAM_PLAYER_PUBLIC_URL', '').strip().rstrip('/'),
             bot_api_file_root=Path(os.environ.get('TELEGRAM_BOT_API_FILE_ROOT', '/var/lib/telegram-bot-api')),
             bot_api_spool_root=Path(spool_path) if spool_path else None,
@@ -471,6 +474,14 @@ def _confined_path(path, root, *, allow_missing=False):
     return path
 
 
+class CameraBusyError(ValueError):
+    """An active camera worker owns media or credentials; removal must wait."""
+
+
+class CameraIDReservedError(ValueError):
+    """A removed stable ID still identifies preserved historical media."""
+
+
 class Archive:
     def __init__(self, settings):
         if not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', settings.tenant_id):
@@ -542,7 +553,8 @@ class Archive:
                                ('channel_name',"TEXT NOT NULL DEFAULT ''"),
                                ('channel_enabled','INTEGER NOT NULL DEFAULT 1'),
                                ('channel_status',"TEXT NOT NULL DEFAULT 'unconfigured'"),
-                               ('channel_error','TEXT')):
+                               ('channel_error','TEXT'), ('deleted_at','REAL'),
+                               ('sd_download_threads','INTEGER NOT NULL DEFAULT 1')):
                 if name not in camera_columns:
                     self.conn.execute(f'ALTER TABLE cameras ADD COLUMN {name} {kind}')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS recording_audit (
@@ -601,6 +613,7 @@ class Archive:
     def _camera_fields(data, partial=False):
         allowed={'id','name','model','host','device_port','rtsp_port','http_port','enabled','upload_enabled',
                  'sd_backend','sd_username','sd_channel','sd_timezone','sd_lookback_hours','sd_password','sd_password_clear',
+                 'sd_download_threads',
                  'channel_chat_id','channel_name','channel_enabled'}
         if not isinstance(data,dict) or set(data)-allowed:
             raise ValueError('Unknown camera fields')
@@ -609,7 +622,7 @@ class Archive:
             values={'name':data.get('id',''),'model':'','host':'','device_port':8000,
                     'rtsp_port':554,'http_port':80,'enabled':True,'upload_enabled':True,
                     'sd_backend':'auto','sd_username':'admin','sd_channel':1,
-                    'sd_timezone':'Asia/Ho_Chi_Minh','sd_lookback_hours':168,
+                    'sd_timezone':'Asia/Ho_Chi_Minh','sd_lookback_hours':168,'sd_download_threads':1,
                     'channel_chat_id':None,'channel_name':'','channel_enabled':True,**values}
         if 'channel_chat_id' in values:
             value=values['channel_chat_id']
@@ -642,6 +655,8 @@ class Archive:
         for field,maximum in (('sd_channel',256),('sd_lookback_hours',720)):
             if field in values and (type(values[field]) is not int or not 1<=values[field]<=maximum):
                 raise ValueError('Invalid '+field)
+        if 'sd_download_threads' in values and (type(values['sd_download_threads']) is not int or not 1<=values['sd_download_threads']<=2):
+            raise ValueError('SD download threads must be between one and two')
         if 'sd_timezone' in values:
             if not isinstance(values['sd_timezone'],str) or len(values['sd_timezone'])>100:
                 raise ValueError('Invalid SD timezone')
@@ -679,6 +694,7 @@ class Archive:
         rows=self.conn.execute('''SELECT c.*,COUNT(r.key) record_count,
             COALESCE(SUM(r.status='uploaded'),0) uploaded_count FROM cameras c
             LEFT JOIN recordings r ON r.camera=c.id AND r.deleted_at IS NULL
+            WHERE c.deleted_at IS NULL
             GROUP BY c.id ORDER BY c.name COLLATE NOCASE,c.id''')
         results=[]
         for row in rows:
@@ -737,19 +753,62 @@ class Archive:
         return row[0] if row else slug
 
     def add_camera(self,data):
+        if isinstance(data,dict) and 'sd_download_threads' not in data:
+            data={**data,'sd_download_threads':self.settings.sd_download_threads}
         values=self._camera_fields(data)
         if not values.get('id'):raise ValueError('Camera ID is required')
         if values['channel_name'] and values['channel_chat_id'] is None:
             raise ValueError('Channel display name requires a channel ID')
         values['created_at']=time.time()
+        values.update(deleted_at=None,probe_json=None,channel_status='unconfigured',channel_error=None)
         password=values.pop('sd_password',None);clear=values.pop('sd_password_clear',False)
         try:
             with self.conn:
+                self.conn.execute('BEGIN IMMEDIATE')
+                current=self.conn.execute('SELECT deleted_at FROM cameras WHERE id=?',(values['id'],)).fetchone()
+                if current is not None:
+                    if current['deleted_at'] is not None:
+                        raise CameraIDReservedError('Removed camera ID is reserved for its archive; use a new camera ID')
+                    raise ValueError('Camera ID or channel is already assigned')
                 self.conn.execute('INSERT INTO cameras('+','.join(values)+') VALUES('+','.join('?' for _ in values)+')',tuple(values.values()))
                 self._write_camera_password(values['id'],password,clear)
         except sqlite3.IntegrityError:
             raise ValueError('Camera ID or channel is already assigned') from None
         return next(c for c in self.cameras() if c['id']==values['id'])
+
+    def delete_camera(self,slug,confirm_name):
+        """Remove a configured camera without deleting any archived video.
+
+        The writer lock serializes against SD job claims, upload claims and
+        ingest claims. Running work retains its source/cache and must finish
+        before removal; only queued jobs can be cancelled here.
+        """
+        if not isinstance(slug,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',slug):
+            raise ValueError('Invalid camera ID')
+        if not isinstance(confirm_name,str):raise ValueError('Camera name confirmation is required')
+        with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            current=self.conn.execute('SELECT name FROM cameras WHERE id=? AND deleted_at IS NULL',(slug,)).fetchone()
+            if current is None:raise KeyError('Unknown camera')
+            if confirm_name!=current['name']:raise ValueError('Camera name confirmation does not match')
+            has_jobs=self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_jobs'").fetchone() is not None
+            has_index_jobs=self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='channel_index_jobs'").fetchone() is not None
+            if ((has_jobs and self.conn.execute("SELECT 1 FROM sync_jobs WHERE camera_id=? AND state='running' LIMIT 1",(slug,)).fetchone())
+                    or (has_index_jobs and self.conn.execute("SELECT 1 FROM channel_index_jobs WHERE camera_id=? AND status='running' LIMIT 1",(slug,)).fetchone())
+                    or self.conn.execute("SELECT 1 FROM recordings WHERE camera=? AND status IN ('ingesting','uploading') LIMIT 1",(slug,)).fetchone()):
+                raise CameraBusyError('Camera is processing media; wait for the current task to finish')
+            # Confined cleanup must succeed before the tombstone is committed.
+            # A filesystem error leaves the camera and queued jobs unchanged.
+            self._write_camera_password(slug,clear=True)
+            now=time.time()
+            self.conn.execute("""UPDATE cameras SET deleted_at=?,enabled=0,upload_enabled=0,
+                channel_chat_id=NULL,channel_name='',channel_enabled=0,channel_status='disabled',channel_error=NULL,
+                probe_json=NULL WHERE id=?""",(now,slug))
+            if has_jobs:
+                self.conn.execute("""UPDATE sync_jobs SET state='blocked',phase='finished',code='camera_deleted',
+                    message='Camera đã xóa khỏi danh sách; video đã lưu được giữ nguyên',updated_at=?,finished_at=?
+                    WHERE camera_id=? AND state='queued'""",(now,now,slug))
+        return {'deleted':True,'camera_id':slug,'recordings_preserved':True}
 
     def update_camera(self,slug,data):
         if not isinstance(data,dict) or 'id' in data:raise ValueError('Camera ID is immutable')
@@ -761,7 +820,7 @@ class Archive:
             values['channel_status']='unconfigured';values['channel_error']=None
         with self.conn:
             self.conn.execute('BEGIN IMMEDIATE')
-            current=self.conn.execute('SELECT channel_chat_id FROM cameras WHERE id=?',(slug,)).fetchone()
+            current=self.conn.execute('SELECT channel_chat_id FROM cameras WHERE id=? AND deleted_at IS NULL',(slug,)).fetchone()
             if current is None:raise KeyError('Unknown camera')
             channel=values.get('channel_chat_id',current['channel_chat_id'])
             # A local label belongs to this binding, never to its next target.
@@ -790,7 +849,7 @@ class Archive:
         if error_code is not None and (not isinstance(error_code,str) or not re.fullmatch(r'[A-Za-z0-9_]{1,80}',error_code)):
             raise ValueError('Invalid channel error code')
         with self.conn:
-            sql='UPDATE cameras SET channel_status=?,channel_error=? WHERE id=?'
+            sql='UPDATE cameras SET channel_status=?,channel_error=? WHERE id=? AND deleted_at IS NULL'
             parameters=[state,error_code,slug]
             if expected_channel is not None:sql+=' AND channel_chat_id=?';parameters.append(expected_channel)
             changed=self.conn.execute(sql,parameters).rowcount
@@ -799,7 +858,7 @@ class Archive:
             return bool(changed)
 
     def resolve_camera_channel(self, slug):
-        camera=self.conn.execute('SELECT * FROM cameras WHERE id=?',(slug,)).fetchone()
+        camera=self.conn.execute('SELECT * FROM cameras WHERE id=? AND deleted_at IS NULL',(slug,)).fetchone()
         if camera is None:raise KeyError('Unknown camera')
         channel=camera['channel_chat_id']
         if not camera['enabled'] or not camera['channel_enabled'] or type(channel) is not int or not re.fullmatch(r'-100[1-9][0-9]*',str(channel)):
@@ -811,7 +870,7 @@ class Archive:
             raise ValueError('Invalid camera filter')
         sql="""SELECT r.camera,MIN(r.start_ms) first_start FROM recordings r JOIN cameras c ON c.id=r.camera
             WHERE r.status='downloaded' AND r.deleted_at IS NULL AND r.media_expired_at IS NULL
-            AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"""
+            AND c.deleted_at IS NULL AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"""
         parameters=[time.time()]
         if camera is not None:sql+=' AND r.camera=?';parameters.append(camera)
         return [r['camera'] for r in self.conn.execute(sql+' GROUP BY r.camera ORDER BY first_start,r.camera',parameters)]
@@ -1044,6 +1103,10 @@ class Archive:
                 raise ValueError('Cache budget reached; source was retained')
             dest = _confined_path(self._cache_root / (key + '.mp4'), self._cache_root, allow_missing=True)
             with self.conn:
+                self.conn.execute('BEGIN IMMEDIATE')
+                active=self.conn.execute('SELECT enabled,deleted_at FROM cameras WHERE id=?',(entry['camera'],)).fetchone()
+                if active is None or not active['enabled'] or active['deleted_at'] is not None:
+                    return {'key':key,'record_key':key,'status':'camera_disabled'}
                 self.conn.execute('''INSERT INTO recordings(key,camera,record_id,start_ms,end_ms,source_path,status,created_at)
                     VALUES(?,?,?,?,?,?,'ingesting',?) ON CONFLICT(key) DO UPDATE SET status='ingesting',end_ms=excluded.end_ms''',
                     (key, entry['camera'], str(entry['record_id']), start_ms, end_ms, str(source), time.time()))
@@ -1142,7 +1205,7 @@ class Archive:
             raise ValueError('Invalid camera filter')
         self.conn.execute('BEGIN IMMEDIATE')
         try:
-            sql="SELECT r.* FROM recordings r JOIN cameras c ON c.id=r.camera WHERE r.status='downloaded' AND r.media_expired_at IS NULL AND r.deleted_at IS NULL AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"
+            sql="SELECT r.* FROM recordings r JOIN cameras c ON c.id=r.camera WHERE r.status='downloaded' AND r.media_expired_at IS NULL AND r.deleted_at IS NULL AND c.deleted_at IS NULL AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"
             params=[time.time()]
             if camera is not None:sql+=' AND r.camera=?';params.append(camera)
             if channel_chat_id is not None:
@@ -1253,7 +1316,9 @@ class Archive:
             return result
         where = """processing_method='passthrough' AND status IN ('downloaded','failed') AND media_expired_at IS NULL
             AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL
-            AND local_path IS NOT NULL AND local_path!=''"""
+            AND local_path IS NOT NULL AND local_path!=''
+            AND EXISTS (SELECT 1 FROM cameras active_camera WHERE active_camera.id=recordings.camera
+                AND active_camera.deleted_at IS NULL AND active_camera.enabled=1)"""
         values = []
         if camera is not None:
             where += ' AND camera=?'
@@ -1509,6 +1574,24 @@ class Archive:
         with self.conn:
             self.conn.execute('INSERT INTO state(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value', (name,str(value)))
 
+    def pipeline_settings(self):
+        default=self.settings.sd_download_workers
+        if type(default) is not int or not 1<=default<=5:raise ValueError('Invalid SD worker default')
+        raw=self.state('pipeline_sd_download_workers')
+        if raw is None:workers=default
+        elif re.fullmatch(r'[1-5]',raw):workers=int(raw)
+        else:raise ValueError('Invalid stored SD worker setting')
+        return {'sd_download_workers':workers,'environment_default':default,'applies_to':'next_jobs'}
+
+    def update_pipeline_settings(self,data):
+        if not isinstance(data,dict) or set(data)!={'sd_download_workers'}:
+            raise ValueError('Unknown pipeline settings fields')
+        workers=data['sd_download_workers']
+        if type(workers) is not int or not 1<=workers<=5:
+            raise ValueError('SD worker count must be between one and five')
+        self.state('pipeline_sd_download_workers',workers)
+        return self.pipeline_settings()
+
     def status(self):
         camera_sources=[{'camera_id':camera['id'],'enabled':camera['enabled'],
                          'backend':camera['sd_backend'],'configured':bool(camera['host'] and camera['sd_password_configured']),
@@ -1529,7 +1612,7 @@ class Archive:
                   'cache_retention_hours':self.settings.cache_retention_hours,
                   'error_retention_hours':self.settings.error_retention_hours,
                   'bot_api_spool_max_bytes':self.settings.bot_api_spool_max_bytes,'api_mode':self.settings.api_mode,
-                'version':'2.4','counts':{'cameras':self.conn.execute('SELECT COUNT(*) FROM cameras').fetchone()[0],
+                'version':'2.4','counts':{'cameras':self.conn.execute('SELECT COUNT(*) FROM cameras WHERE deleted_at IS NULL').fetchone()[0],
                 'recordings':self.conn.execute('SELECT COUNT(*) FROM recordings WHERE deleted_at IS NULL').fetchone()[0],
                 'uploaded':self.conn.execute("SELECT COUNT(*) FROM recordings WHERE status='uploaded' AND deleted_at IS NULL").fetchone()[0],
                 'deleted':self.conn.execute('SELECT COUNT(*) FROM recordings WHERE deleted_at IS NOT NULL').fetchone()[0]}}

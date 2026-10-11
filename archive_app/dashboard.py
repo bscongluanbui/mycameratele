@@ -12,7 +12,7 @@ import ssl
 import threading
 import time
 
-from .core import Archive,Settings
+from .core import Archive,Settings,CameraBusyError,CameraIDReservedError
 from .dashboard_auth import DashboardAuth
 from .discovery import DiscoveryManager
 from .network_routes import load_subnets
@@ -240,6 +240,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):self.handle_request('HEAD')
     def do_POST(self):self.handle_request('POST')
     def do_PATCH(self):self.handle_request('PATCH')
+    def do_DELETE(self):self.handle_request('DELETE')
 
     def handle_request(self,method):
         parsed=urlsplit(self.path);path=parsed.path
@@ -326,6 +327,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                    'channel_index_enabled':self.server.settings.channel_index_enabled})
                 elif path=='/api/cameras' and method=='POST':
                     response=self.add_camera(archive,self.read_json(),account['username'])
+                elif path=='/api/pipeline-settings' and method in ('GET','PATCH'):
+                    if parsed.query:raise ValueError('Pipeline settings do not accept query fields')
+                    response=(200,archive.pipeline_settings() if method=='GET' else archive.update_pipeline_settings(self.read_json()))
                 elif path=='/api/telegram/channels' and method=='GET':
                     if parsed.query:raise ValueError('Channel directory filters are not supported')
                     response=(200,{'channels':ChannelDirectory(archive).list()})
@@ -350,6 +354,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     if len(pieces)==1 and method=='PATCH':
                         data=self.read_json()
                         with self.server.camera_catalog_lock:response=(200,archive.update_camera(slug,data))
+                    elif len(pieces)==1 and method=='DELETE':
+                        if parsed.query:raise ValueError('Camera deletion does not accept query fields')
+                        data=self.read_json()
+                        if set(data)!={'confirm_name'}:raise ValueError('Camera name confirmation is required')
+                        with self.server.camera_catalog_lock:response=(200,archive.delete_camera(slug,data['confirm_name']))
                     elif len(pieces)==2 and pieces[1]=='probe' and method=='POST':response=(200,archive.probe_camera(slug))
                     elif len(pieces)==2 and pieces[1]=='channel-check' and method=='POST':
                         if parsed.query:raise ValueError('Channel check filters are not supported')
@@ -372,6 +381,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # Release SQLite handles before the client can receive/act on the
             # response (important for Windows teardown and concurrent readers).
             self.send(*response)
+        except CameraBusyError:self.send(409,{'error':'Camera đang xử lý video; đợi công việc hiện tại kết thúc rồi xóa','code':'camera_busy'})
+        except CameraIDReservedError:self.send(409,{'error':'Mã camera đã được giữ cho lịch sử; chọn mã mới khi thêm lại','code':'camera_id_reserved'})
         except (ValueError,TypeError,UnicodeError,json.JSONDecodeError):self.send(400,{'error':'Dữ liệu đầu vào không hợp lệ'})
         except KeyError:self.send(404,{'error':'Không tìm thấy camera'})
         except (BrokenPipeError,ConnectionResetError):pass

@@ -19,6 +19,51 @@ def emit(event, **data):
     print(json.dumps({'tenant':os.environ.get('TENANT_ID','house01'),'event':event,**data},ensure_ascii=False),flush=True)
 
 
+def refresh_pipeline_limit(archive, runtime):
+    count = archive.pipeline_settings()['sd_download_workers']
+    if runtime.set_limit(count):
+        emit('pipeline_limit_updated', sd_download_workers=count, applies_to='next_jobs')
+    return count
+
+
+def discover_manifest_cameras(archive, sync):
+    """Bootstrap Studio exports without competing with camera-owned ingestion.
+
+    Unknown IDs are registered and queued; workers ingest their own entries.
+    Tombstones count as known and can never be revived by an old input file.
+    """
+    from .core import resolve_input
+    known = {row[0] for row in archive.conn.execute('SELECT id FROM cameras')}
+    created = 0
+    for candidate in sorted(archive.settings.input_dir.glob('*.json')):
+        try:
+            path = resolve_input(candidate, archive.settings.input_dir)
+            if path.stat().st_size > 1_000_000:
+                raise ValueError('Manifest too large')
+            document = json.loads(path.read_text(encoding='utf-8-sig'))
+            if not isinstance(document, dict) or not isinstance(document.get('recordings'), list) or len(document['recordings']) > 1000:
+                raise ValueError('Manifest requires a bounded recordings list')
+            for entry in document['recordings']:
+                slug = entry.get('camera') if isinstance(entry, dict) else None
+                if not isinstance(slug, str) or slug in known:
+                    continue
+                try:
+                    archive.ingest_entry(entry, dry_run=True)
+                    try:
+                        archive.add_camera({'id': slug, 'name': slug})
+                    except ValueError:
+                        if not archive.conn.execute('SELECT 1 FROM cameras WHERE id=? AND deleted_at IS NULL', (slug,)).fetchone():
+                            raise
+                    known.add(slug)
+                    sync.enqueue(slug, source='manifest')
+                    created += 1
+                except Exception as exc:
+                    emit('ingest_error', manifest=candidate.name, error_type=type(exc).__name__)
+        except Exception as exc:
+            emit('ingest_error', manifest=candidate.name, error_type=type(exc).__name__)
+    return created
+
+
 @contextmanager
 def mutation_lock(settings):
     settings.state_dir.mkdir(parents=True,exist_ok=True)
@@ -216,34 +261,24 @@ def main():
                 finally:index_archive.close()
             index_thread=threading.Thread(target=channel_indexes,daemon=True)
             index_thread.start()
-        parallel=getattr(settings,'sd_download_workers',1)>1
-        runtime=PipelineRuntime(settings,stop_event=pipeline_stop,emit=emit) if parallel else None
+        runtime=PipelineRuntime(settings,stop_event=pipeline_stop,emit=emit)
+        effective_workers=refresh_pipeline_limit(archive,runtime)
         try:
-            if runtime:runtime.start()
-            emit('started',sd_download_workers=getattr(settings,'sd_download_workers',1),**archive.status())
+            runtime.start()
+            emit('started',sd_download_workers=effective_workers,**archive.status())
             while running and not pipeline_stop.is_set():
+                refresh_pipeline_limit(archive,runtime)
+                if discover_manifest_cameras(archive,sync):runtime.wake()
                 if time.monotonic()>=next_sync:
                     try:
                         queued=sync.enqueue(source='automatic')
                         if queued['jobs']:emit('sync_scheduled',cameras=len(queued['jobs']))
-                        if runtime:runtime.wake()
+                        runtime.wake()
                     except Exception as exc:emit('sync_schedule_error',error_type=type(exc).__name__)
                     next_sync=time.monotonic()+sync_interval
-                if not runtime:
-                    try:
-                        if sync.run_once(telegram):emit('sync_job_finished')
-                    except Exception as exc:emit('sync_error',error_type=type(exc).__name__)
                 try:
                     if archive.backup_daily():emit('backup',result='created',retention_days=7)
                 except Exception as exc:emit('backup_error',error_type=type(exc).__name__)
-                if not runtime:
-                    # Parallel jobs import only their own camera's manifests;
-                    # the legacy unfiltered scan would duplicate ingest owners.
-                    for manifest in sorted(settings.input_dir.glob('*.json')):
-                        try:
-                            for row in archive.ingest_manifest(manifest,continue_on_error=True):
-                                if row['status']=='failed':emit('ingest_error',manifest=manifest.name,error_type=row['error_type'])
-                        except Exception as exc:emit('ingest_error',manifest=manifest.name,error_type=type(exc).__name__)
                 try:
                     result=telegram.upload_one(archive)
                     if result:emit('upload',status=result)
@@ -258,15 +293,13 @@ def main():
                 except Exception as exc:emit('error_media_cleanup_error',error_type=type(exc).__name__)
                 for _ in range(settings.interval):
                     if not running or pipeline_stop.is_set():break
-                    if not runtime and archive.conn.execute("SELECT 1 FROM sync_jobs WHERE state='queued' LIMIT 1").fetchone():break
-                    if runtime:pipeline_stop.wait(1)
-                    else:time.sleep(1)
+                    refresh_pipeline_limit(archive,runtime)
+                    pipeline_stop.wait(1)
         finally:
-            if runtime:
-                runtime.stop();runtime.join()
+            runtime.stop();runtime.join()
             heartbeat_stop.set();heartbeat_thread.join(timeout=11);poll_thread.join(timeout=36);bulk_thread.join(timeout=36)
             if index_thread:index_thread.join(timeout=36)
-        emit('stopped');return 1 if runtime and runtime.failed else 0
+        emit('stopped');return 1 if runtime.failed else 0
     finally:
         archive.close()
         if lock_scope is not None:lock_scope.__exit__(None,None,None)

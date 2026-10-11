@@ -839,7 +839,7 @@ class Telegram:
         expected = {'c':3, 'y':4, 'm':4, 'd':4, 'p':5}
         if kind not in expected or len(pieces) != expected[kind]:
             return self._legacy_menu(archive, data)
-        camera = self._camera(archive, pieces[1])
+        camera = self._archive_camera(archive, pieces[1])
         order = pieces[-2] if kind == 'p' else pieces[-1]
         if order not in ('asc', 'desc'):
             raise ValueError('Invalid archive sort order')
@@ -854,7 +854,8 @@ class Telegram:
                 url=camera.get('channel_index_url')
                 if isinstance(url,str) and re.fullmatch(r'https://t\.me/c/[1-9][0-9]*/[1-9][0-9]*',url):
                     buttons.append([{'text':'📌 Mục lục channel','url':url,'style':'success'}])
-            buttons.extend(self.sync_camera_buttons(camera))
+            if camera.get('deleted_at') is None:
+                buttons.extend(self.sync_camera_buttons(camera))
             self._controls(buttons, f'c:{token}:{{order}}', 'root', order)
             upload='ON' if camera.get('upload_enabled',True) else 'OFF'
             return f'{name} · Upload {upload}\nChọn Năm', buttons
@@ -908,6 +909,17 @@ class Telegram:
         matches = [c for c in archive.cameras() if self.camera_token(c['id']) == token]
         if len(matches) != 1:
             raise ValueError('Invalid camera selection')
+        return matches[0]
+
+    def _archive_camera(self, archive, token):
+        """Resolve retained footage without granting a removed camera controls."""
+        matches = [dict(row) for row in archive.conn.execute(
+            'SELECT id,name,deleted_at,enabled,upload_enabled FROM cameras')
+            if self.camera_token(row['id']) == token]
+        if len(matches) != 1:
+            raise ValueError('Invalid camera selection')
+        if matches[0]['deleted_at'] is None:
+            return self._camera(archive, token)
         return matches[0]
 
     def sync_camera_buttons(self,camera):
