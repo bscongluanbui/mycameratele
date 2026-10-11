@@ -352,7 +352,8 @@ class SyncQueue:
         upload_error_type=None
         def upload_ready():
             nonlocal upload_paused,upload_error_type
-            if upload_paused or statistics['uploaded']>=MAX_UPLOADS_PER_JOB or self._gate(slug):
+            if (self._stopping() or upload_paused
+                    or statistics['uploaded']>=MAX_UPLOADS_PER_JOB or self._gate(slug)):
                 return None
             try:
                 started=time.monotonic()
@@ -418,7 +419,8 @@ class SyncQueue:
                 imported=snapshot.get('imported',0)
                 is_new=imported>last_imported
                 last_imported=max(last_imported,imported)
-                if is_new and not upload_paused and statistics['uploaded']<MAX_UPLOADS_PER_JOB and not self._gate(slug):
+                if (is_new and not self._stopping() and not upload_paused
+                        and statistics['uploaded']<MAX_UPLOADS_PER_JOB and not self._gate(slug)):
                     self._progress(job,statistics,'uploading','Đang upload video vừa tải từ SD')
                     upload_ready()
                     self._progress(job,statistics,phase,'Đã xử lý video; tiếp tục tải recording SD')

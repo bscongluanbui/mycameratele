@@ -20,22 +20,34 @@ _THREAD_RESERVATIONS = threading.local()
 class SerializedUploads:
     """Serialize media claims through response/cleanup, not bot navigation."""
 
-    def __init__(self, telegram, lock=None):
+    def __init__(self, telegram, lock=None, *, stop_event=None):
         self._telegram = telegram
         self._lock = lock if lock is not None else _UPLOAD_LOCK
+        self._stop_event = stop_event
+
+    def _stopping(self):
+        return self._stop_event is not None and self._stop_event.is_set()
 
     def upload_one(self, *args, **kwargs):
+        if self._stopping():
+            return None
         with self._lock:
+            # A worker can have waited behind another camera's active upload
+            # when shutdown began. Only the already-started upload may drain;
+            # a waiter must not claim/send another recording after it acquires.
+            if self._stopping():
+                return None
             return self._telegram.upload_one(*args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._telegram, name)
 
 
-def serialized_uploads(telegram):
-    if isinstance(telegram, SerializedUploads):
+def serialized_uploads(telegram, *, stop_event=None):
+    if isinstance(telegram, SerializedUploads) and (
+            stop_event is None or telegram._stop_event is stop_event):
         return telegram
-    return SerializedUploads(telegram)
+    return SerializedUploads(telegram, stop_event=stop_event)
 
 
 def cache_used_bytes(root):
@@ -133,7 +145,8 @@ class PipelineRuntime:
             # crash recovery were already completed once by the main runner.
             archive = self.archive_factory(self.settings)
             queue = self.queue_factory(archive, stop_event=self.stop_event)
-            telegram = serialized_uploads(self.telegram_factory(self.settings))
+            telegram = serialized_uploads(self.telegram_factory(self.settings),
+                                          stop_event=self.stop_event)
             while not self.stop_event.is_set():
                 try:
                     if queue.run_once(telegram):

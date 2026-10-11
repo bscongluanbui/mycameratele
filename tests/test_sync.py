@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -175,6 +176,29 @@ class SyncTests(unittest.TestCase):
         job=self.run_job();self.assertEqual((job['state'],job['code']),('completed','completed'))
         self.assertEqual(job['statistics']['sd_downloaded'],1);self.assertEqual(job['statistics']['uploaded'],1)
         self.assertEqual(len(self.calls),1)
+
+    def test_single_worker_stop_during_download_does_not_upload_from_progress(self):
+        stop=threading.Event()
+        queue=SyncQueue(self.archive,stop_event=stop)
+        self.assertEqual(self.settings.sd_download_workers,1)
+        def sd_sync(*,progress=None,max_files=100,stop_requested=None):
+            self.archive.ingest_entry(self.entry())
+            stop.set()
+            snapshot={'backend':'hcnetsdk','searched':1,'downloaded':1,'imported':1,
+                      'already_known':0,'deferred':0,'backlog':0,'interrupted':True}
+            progress(dict(snapshot,phase='sd_download'))
+            self.assertTrue(stop_requested())
+            return snapshot
+        self.sd_mock.side_effect=sd_sync
+        queue.enqueue('front')
+        self.assertTrue(queue.run_once(self.telegram))
+        job=queue.status('front')['latest']['front']
+        self.assertEqual((job['state'],job['code']),('blocked','sd_interrupted'))
+        self.assertEqual(job['statistics']['uploaded'],0)
+        self.assertEqual(self.calls,[])
+        row=dict(self.archive.conn.execute('SELECT * FROM recordings').fetchone())
+        self.assertEqual(row['status'],'downloaded')
+        self.assertTrue(Path(row['local_path']).is_file())
 
     def test_sd_failure_still_imports_uploads_exports_but_not_completed_sd(self):
         self.sd_mock.side_effect=SDSourceError('sd_sdk_missing','SDK missing')

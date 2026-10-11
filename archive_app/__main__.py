@@ -165,7 +165,7 @@ def main():
                 heartbeat_stop.wait(10)
         heartbeat_thread=threading.Thread(target=heartbeat,daemon=True)
         heartbeat_thread.start()
-        telegram=serialized_uploads(Telegram(settings))
+        telegram=serialized_uploads(Telegram(settings),stop_event=pipeline_stop)
         def poll_commands():
             # Each thread owns its SQLite connection; ingestion/upload cannot block the menu.
             poll_archive=Archive(settings)

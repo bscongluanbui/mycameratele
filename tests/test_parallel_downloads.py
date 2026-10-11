@@ -13,7 +13,7 @@ import uuid
 
 from archive_app.core import Archive, Settings, record_key
 from archive_app.pipeline_runtime import (PipelineRuntime, cache_used_bytes,
-                                          reserve_cache, serialized_uploads)
+                                          reserve_cache, serialized_uploads, SerializedUploads)
 from archive_app.sync import SyncQueue
 from archive_app.sd_source import SDSource
 from archive_app.telegram import Telegram
@@ -350,6 +350,141 @@ class ParallelDownloadsTests(unittest.TestCase):
         finally:
             release.set()
             thread.join()
+
+    def test_shutdown_finishes_active_upload_but_waiter_never_claims(self):
+        stop = threading.Event()
+        entered = threading.Event()
+        waiting = threading.Event()
+        release = threading.Event()
+        calls = []
+        results = {}
+
+        class ObservedLock:
+            def __init__(self):
+                self.lock = threading.RLock()
+
+            def __enter__(self):
+                if threading.current_thread().name == 'waiting-upload':
+                    waiting.set()
+                self.lock.acquire()
+
+            def __exit__(self, *_):
+                self.lock.release()
+
+        class FakeTelegram:
+            def upload_one(self, number):
+                calls.append(number)
+                entered.set()
+                if not release.wait(10):
+                    raise RuntimeError('Active upload release timed out')
+                return 'uploaded'
+
+        telegram = SerializedUploads(FakeTelegram(), ObservedLock(), stop_event=stop)
+        active = threading.Thread(target=lambda: results.update(active=telegram.upload_one(1)))
+        waiter = threading.Thread(target=lambda: results.update(waiter=telegram.upload_one(2)),
+                                  name='waiting-upload')
+        active.start()
+        try:
+            self.assertTrue(entered.wait(10))
+            waiter.start()
+            self.assertTrue(waiting.wait(10))
+            stop.set()
+            release.set()
+            active.join(10)
+            waiter.join(10)
+            self.assertFalse(active.is_alive())
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(results, {'active': 'uploaded', 'waiter': None})
+            self.assertEqual(calls, [1])
+            self.assertIsNone(telegram.upload_one(3))
+            self.assertEqual(calls, [1])
+        finally:
+            release.set()
+            active.join()
+            if waiter.ident is not None:
+                waiter.join()
+
+    def test_stop_event_can_be_added_to_previously_wrapped_uploads(self):
+        calls = []
+
+        class FakeTelegram:
+            def upload_one(self):
+                calls.append('claimed')
+                return 'uploaded'
+
+        original = serialized_uploads(FakeTelegram())
+        stop = threading.Event()
+        guarded = serialized_uploads(original, stop_event=stop)
+        self.assertIs(serialized_uploads(guarded, stop_event=stop), guarded)
+        self.assertEqual(guarded.upload_one(), 'uploaded')
+        stop.set()
+        self.assertIsNone(guarded.upload_one())
+        self.assertEqual(calls, ['claimed'])
+
+    def test_shutdown_during_five_downloads_keeps_ingested_media_without_new_uploads(self):
+        self.settings.enable_upload = True
+        self.settings.token = 'synthetic-token'
+        self.settings.owner_user_id = 42
+        self.settings.keep_cache = False
+        self.settings.media_mode = 'remux_copy'
+        self.archive.state('telegram_owner_started:42', '1')
+        self.queue.enqueue()
+        entered = threading.Barrier(6)
+        release = threading.Event()
+        now = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+        class Provider:
+            backend = 'hcnetsdk'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def search(self, start, end):
+                return [{'record_id': 'shutdown-closed-file', 'size': 20,
+                         'start_time': now.isoformat(),
+                         'end_time': (now + timedelta(minutes=1)).isoformat()}]
+
+            def download(self, recording, destination):
+                destination.write_bytes(b'x' * 20)
+                entered.wait(15)
+                if not release.wait(15):
+                    raise RuntimeError('Synthetic download release timed out')
+                return 20
+
+        def normalize(source, destination, settings):
+            destination.write_bytes(source.read_bytes())
+            return {'duration': 60, 'bytes': 20, 'processing_method': 'remux_copy',
+                    'container': 'mp4', 'file_extension': '.mp4'}
+
+        runtime = PipelineRuntime(self.settings)
+        try:
+            with patch.object(SDSource, '_provider', lambda source: Provider()), \
+                 patch.object(Archive, 'probe_camera', return_value={'tcp': {'8000': 'open'}}), \
+                 patch('archive_app.core.normalize', normalize), \
+                 patch.object(Telegram, 'upload_one', return_value='uploaded') as upload:
+                runtime.start()
+                entered.wait(15)
+                runtime.stop()
+                release.set()
+                runtime.join()
+                upload.assert_not_called()
+        finally:
+            release.set()
+            runtime.stop()
+            runtime.join()
+        self.assertFalse(runtime.failed)
+        self.assertEqual(self.archive.conn.execute(
+            "SELECT count(*) FROM sync_jobs WHERE state='blocked' AND code='sd_interrupted'"
+        ).fetchone()[0], 5)
+        self.assertEqual(self.archive.conn.execute(
+            "SELECT count(*) FROM recordings WHERE status='downloaded'"
+        ).fetchone()[0], 5)
+        self.assertEqual(len(list(self.settings.cache_dir.glob('*.mp4'))), 5)
+        self.assertEqual(list((self.settings.cache_dir / 'sd-stage').glob('*/*.part')), [])
+        self.assertEqual(list((self.settings.cache_dir / 'sd-stage').glob('*/*.source')), [])
 
     def test_shutdown_gates_new_jobs_and_finishes_active_download(self):
         self.settings.sd_download_workers = 1
