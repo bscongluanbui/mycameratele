@@ -256,11 +256,13 @@ class FairCameraQueueTests(unittest.TestCase):
             progress(snapshot)
             return snapshot
         with patch.object(self.a,'probe_camera',return_value={'tcp':{'8000':'open'}}), \
-             patch('archive_app.sd_source.SDSource.sync',side_effect=source):
+             patch('archive_app.sd_source.SDSource.sync',side_effect=source), \
+             patch('archive_app.error_queue.retry_one',return_value=None):
             self.q.run_once(self.t)
 
     def test_old_unposted_remux_quarantine_does_not_block_healthy_sd_backlog(self):
         key = self.remux_review('old-failure')
+        self.assertTrue(self.a.retained_remux_failure(key))
         before = dict(self.a.conn.execute('SELECT * FROM recordings WHERE key=?',(key,)).fetchone())
         original = self.q.enqueue('front')['jobs'][0]['id']; self.q.enqueue('back')
         self.run_fresh_batch()

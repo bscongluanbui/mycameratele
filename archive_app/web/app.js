@@ -84,7 +84,21 @@
     },
     uploadEnabled(camera) { return camera?.upload_enabled !== false; },
     syncActive(job) { return !!job && ["queued", "running"].includes(job.state); },
+    syncWaiting(job) {
+      if (job?.state !== "blocked" || !["sd_batch_limit", "rate_limited", "upload_spool_budget"].includes(job.code)) return "";
+      const s = job.statistics || {};
+      const count = key => s[key] === undefined || s[key] === null ? 0 : Number.isSafeInteger(s[key]) && s[key] >= 0 ? s[key] : Infinity;
+      // A classified wait is not a camera error. Retained reviews qualify only
+      // when the backend has explicitly proved every review non-blocking.
+      if (["upload_unknown", "failed_records", "failed", "remux_failed"].some(key => count(key) > 0) || s.sd_error_code || count("needs_review") !== count("sd_quarantined_reviews") || !Number.isFinite(count("needs_review"))) return "";
+      return job.code;
+    },
+    syncNeedsAttention(job) { return job?.state === "failed" || (job?.state === "blocked" && !helpers.syncWaiting(job)); },
     syncState(job) {
+      const waiting = helpers.syncWaiting(job);
+      if (waiting === "sd_batch_limit") return job.statistics?.sd_requeued === true ? ["Đang tiếp tục", "blue"] : ["Chờ lượt tiếp", "neutral"];
+      if (waiting === "rate_limited") return ["Chờ Telegram", "neutral"];
+      if (waiting === "upload_spool_budget") return ["Chờ dung lượng", "neutral"];
       const values = { queued: ["Đang chờ", "neutral"], running: ["Đang chạy", "blue"], completed: ["Hoàn tất", "green"], blocked: ["Cần xử lý", "amber"], failed: ["Lỗi", "red"] };
       return values[job?.state] || ["Chưa Start", "neutral"];
     },
@@ -94,6 +108,8 @@
     },
     syncHelp(job) {
       const code = String(job?.code || "");
+      if (code === "needs_review") return "File lỗi: thử lại tối đa 3 lần, sau đó vào hàng lỗi. Cache lỗi tự xóa sau 72 giờ.";
+      if (code === "upload_unknown") return "Upload chưa xác nhận: đối soát trước khi gửi lại.";
       if (code.includes("sdk_missing") || code.includes("sdk_not_configured")) return "Dùng compose.sdk.yaml và HCNETSDK_DIR để gắn SDK đúng kiến trúc vào /opt/hcnetsdk theo README, rồi Start lại. Cổng Device mở không đồng nghĩa SDK đã sẵn sàng.";
       if (code.includes("source_missing") || code.includes("unsupported") || code.includes("isapi_unavailable")) return "Kiểm tra nguồn SD / HCNetSDK và tài khoản thiết bị. C6N có thể mở cổng Device 8000 nhưng không có ISAPI ở HTTP 80.";
       if (code.includes("password") || code.includes("credential") || code.includes("auth")) return "Chỉnh sửa Camera → Nguồn video SD để kiểm tra tên đăng nhập thiết bị và mật khẩu / mã xác thực.";
@@ -114,8 +130,8 @@
     syncSummary(latest) {
       const jobs = Object.values(latest || {});
       const running = jobs.filter(job => job?.state === "running").length;
-      const queued = jobs.filter(job => job?.state === "queued").length;
-      const blocked = jobs.filter(job => ["blocked", "failed"].includes(job?.state)).length;
+      const queued = jobs.filter(job => job?.state === "queued" || helpers.syncWaiting(job)).length;
+      const blocked = jobs.filter(job => helpers.syncNeedsAttention(job)).length;
       return running || queued || blocked ? `${running} đang chạy · ${queued} chờ · ${blocked} cần xử lý` : "Không có sync đang chạy";
     },
     syncLine(job, includeTransfer = true) {
@@ -129,6 +145,10 @@
         if (typeof value === "number" && Number.isFinite(value) && value >= 0) parts.push(`${label} ${value}`);
       }
       if (typeof statistics.sd_media_failed === "number" && Number.isFinite(statistics.sd_media_failed) && statistics.sd_media_failed > 0) parts.push(`Cách ly ${statistics.sd_media_failed}`);
+      if (typeof statistics.sd_quarantined_reviews === "number" && Number.isFinite(statistics.sd_quarantined_reviews) && statistics.sd_quarantined_reviews > 0) parts.push(`File lỗi giữ lại ${statistics.sd_quarantined_reviews}`);
+      for (const [key, label] of [["error_retries", "Thử lại"], ["error_queue", "Hàng lỗi"]]) {
+        if (Number.isSafeInteger(statistics[key]) && statistics[key] > 0) parts.push(`${label} ${statistics[key]}`);
+      }
       return parts.join(" · ");
     },
     syncUploadRate(job) {
@@ -175,6 +195,7 @@
     },
     syncDetailFields(job, now = Date.now()) {
       const labels = { manifests: "Manifest", matched: "Khớp nguồn", imported: "Đã nhập", already_known: "Đã có", uploaded: "Đã upload", failed: "Lỗi", ready: "Sẵn sàng", pending: "Chờ upload", remuxed: "Đã remux", remux_failed: "Lỗi remux", remux_budget_blocked: "Chờ dung lượng cache", needs_review: "Cần kiểm tra", upload_unknown: "Upload chưa xác nhận", deleted: "Đã xóa", failed_records: "Bản ghi lỗi", probe_tcp_open: "Cổng TCP mở", probe_error_type: "Lỗi kết nối", sd_backend: "Bộ tải SD", sd_searched: "Tìm thấy SD", sd_downloaded: "Đã tải SD", sd_imported: "Đã nhập SD", sd_deferred: "SD chờ tải", sd_backlog: "SD tồn đọng", sd_error_code: "Mã lỗi SD", sd_media_failed: "File lỗi đã cách ly", sd_media_error_code: "Mã lỗi media" };
+      Object.assign(labels, {sd_quarantined_reviews: "File lỗi giữ lại (không chặn sync)", sd_requeued: "Đã xếp lượt tiếp", error_retries: "Thử lại trong lượt sync", error_queue: "Hàng lỗi"});
       Object.assign(labels, {sd_current_file_bytes: "File đang tải (byte)", sd_current_file_total_bytes: "Dung lượng file (byte)", sd_current_file_elapsed_seconds: "Thời gian file (giây)", sd_current_file_bytes_per_second: "Tốc độ TB file Camera→VPS (byte/s)", sd_download_bytes: "Tổng byte đã tải xong", sd_download_seconds: "Thời gian tải SD (giây)", sd_ingest_seconds: "Thời gian remux/ingest (giây)", upload_seconds: "Thời gian xử lý upload, gồm chờ lượt (giây)", upload_state: "Trạng thái upload", upload_transport: "Cách gửi đến Bot API", upload_current_file_total_bytes: "File upload hiện tại (byte)", upload_current_file_elapsed_seconds: "Thời gian yêu cầu upload (giây)", upload_last_file_bytes: "File đã xác nhận gần nhất (byte)", upload_last_file_seconds: "Thời gian yêu cầu gần nhất (giây)", upload_last_file_bytes_per_second: "Tốc độ TB file upload gần nhất (byte/s)", upload_last_file_confirmed_at: "Upload gần nhất được xác nhận lúc", upload_confirmed_bytes: "Tổng byte upload đã xác nhận", upload_request_seconds: "Thời gian yêu cầu upload thành công, không gồm chờ lượt (giây)", upload_bytes_per_second: "Tốc độ TB VPS→Telegram đã xác nhận (byte/s)", sd_download_speed_requested_kbps: "Tốc độ SDK yêu cầu (kbps)", sd_download_speed_status: "Trạng thái tăng tốc SDK", sd_download_speed_error_code: "Mã SDK tốc độ", sd_interrupted: "Dừng sau file hiện tại"});
       const values = {...(job?.statistics || {})}, start = values.upload_current_file_started_at;
       if (job?.state === "running" && values.upload_state === "sending" && typeof start === "number" && Number.isFinite(start) && start > 0 && Number.isFinite(now)) values.upload_current_file_elapsed_seconds = Math.max(0, Math.floor(now / 1000 - start));
@@ -186,7 +207,7 @@
       return new Date(milliseconds).toLocaleString("vi-VN", compact ? { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" } : undefined);
     },
     syncLogFilter(jobs, camera = "", status = "") {
-      return (Array.isArray(jobs) ? jobs : []).filter(job => (!camera || job.camera_id === camera) && (!status || (status === "active" ? helpers.syncActive(job) : status === "errors" ? ["blocked", "failed"].includes(job.state) : job.state === status)));
+      return (Array.isArray(jobs) ? jobs : []).filter(job => (!camera || job.camera_id === camera) && (!status || (status === "active" ? helpers.syncActive(job) : status === "errors" ? helpers.syncNeedsAttention(job) : job.state === status)));
     },
     discoveryActive(scan) { return !!scan && scan.state === "running"; },
     discoveryTarget(value, maximum = 1024) {

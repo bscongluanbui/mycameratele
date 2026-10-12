@@ -609,7 +609,12 @@ class Archive:
                                ('media_extension', 'TEXT'),
                                ('storage_kind', "TEXT NOT NULL DEFAULT 'owner_private'"),
                                ('storage_chat_id', 'INTEGER'), ('storage_message_id', 'INTEGER'),
-                               ('upload_target_chat_id', 'INTEGER')):
+                               ('upload_target_chat_id', 'INTEGER'),
+                               ('error_retry_count', 'INTEGER NOT NULL DEFAULT 0'),
+                               ('error_retry_at', 'REAL NOT NULL DEFAULT 0'),
+                               ('error_queue_at', 'REAL'),
+                               ('last_api_error_code', 'INTEGER'),
+                               ('last_api_error_kind', 'TEXT')):
                 if name not in columns:
                     self.conn.execute(f'ALTER TABLE recordings ADD COLUMN {name} {kind}')
             camera_columns = {row[1] for row in self.conn.execute('PRAGMA table_info(cameras)')}
@@ -939,7 +944,7 @@ class Archive:
         if camera is not None and (not isinstance(camera,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',camera)):
             raise ValueError('Invalid camera filter')
         sql="""SELECT r.camera,MIN(r.start_ms) first_start FROM recordings r JOIN cameras c ON c.id=r.camera
-            WHERE r.status='downloaded' AND r.deleted_at IS NULL AND r.media_expired_at IS NULL
+            WHERE r.status='downloaded' AND r.deleted_at IS NULL AND r.media_expired_at IS NULL AND r.error_queue_at IS NULL
             AND c.deleted_at IS NULL AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"""
         parameters=[time.time()]
         if camera is not None:sql+=' AND r.camera=?';parameters.append(camera)
@@ -1259,6 +1264,62 @@ class Archive:
         except (OSError, TypeError, ValueError):
             return False
 
+    def retained_api_rejection(self, key, *, after, camera=None):
+        """Isolate an old explicit refusal only after fresh confirmed delivery.
+
+        Legacy ``api_rejected`` rows represent definitive HTTP 4xx replies,
+        not uncertain sends or 429 backoff. No retry or receipt is fabricated:
+        the MP4 remains in review until its normal retention deadline. A fresh
+        receipt for this camera, current channel and current bot proves that
+        the old refusal is not presently a pipeline-wide delivery outage.
+        """
+        if (not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{64}', key)
+                or isinstance(after, bool) or not isinstance(after, (int, float))
+                or not math.isfinite(after) or after <= 0
+                or not self.settings.multi_channel_routing):
+            return False
+        row = self.conn.execute('''SELECT r.*,c.channel_chat_id,c.channel_enabled,
+                c.enabled,c.upload_enabled,c.deleted_at AS camera_deleted
+            FROM recordings r JOIN cameras c ON c.id=r.camera WHERE r.key=?
+                AND r.status='needs_review' AND r.last_error='api_rejected'
+                AND r.deleted_at IS NULL AND r.media_expired_at IS NULL
+                AND r.processing_method='remux_copy'
+                AND coalesce(r.chat_id,'')='' AND r.message_id IS NULL
+                AND coalesce(r.file_id,'')='' AND coalesce(r.file_unique_id,'')=''
+                AND r.storage_chat_id IS NULL AND r.storage_message_id IS NULL
+                AND r.bot_id IS NULL AND r.uploaded_at IS NULL''', (key,)).fetchone()
+        if (row is None or (camera is not None and row['camera'] != camera)
+                or row['camera_deleted'] is not None or not row['enabled']
+                or not row['upload_enabled'] or not row['channel_enabled']
+                or type(row['channel_chat_id']) is not int or row['channel_chat_id'] >= 0
+                or row['upload_target_chat_id'] != row['channel_chat_id']
+                or row['created_at'] >= after or row['error_started_at'] is None
+                or row['error_started_at'] >= after
+                or (row['last_api_error_code'] is not None and
+                    (row['last_api_error_code'] != 400 or row['last_api_error_kind'] != 'media'))
+                or not re.fullmatch(r'[a-f0-9]{64}', row['attempt_id'] or '')
+                or not re.fullmatch(r'[a-f0-9]{64}', row['sha256'] or '')
+                or not row['local_path'] or not row['file_size']):
+            return False
+        bot = self.state('telegram_bot_id')
+        if not isinstance(bot, str) or not bot.isdecimal() or int(bot) <= 0:
+            return False
+        receipt = self.conn.execute('''SELECT 1 FROM recordings WHERE camera=?
+                AND status='uploaded' AND deleted_at IS NULL AND uploaded_at>=?
+                AND bot_id=? AND storage_kind='channel' AND storage_chat_id=?
+                AND chat_id=? AND message_id>0 AND storage_message_id=message_id
+                AND coalesce(file_id,'')<>'' AND coalesce(file_unique_id,'')<>''
+                LIMIT 1''', (row['camera'], after, int(bot), row['channel_chat_id'],
+                            str(row['channel_chat_id']))).fetchone()
+        if receipt is None:
+            return False
+        try:
+            path = _confined_path(row['local_path'], self._cache_root)
+            return (path.parent == self._cache_root and path.name == key + '.mp4'
+                    and path.stat().st_size == row['file_size'])
+        except (OSError, TypeError, ValueError):
+            return False
+
     def ingest_manifest(self, path, dry_run=False, continue_on_error=False, camera=None):
         if camera is not None and (not isinstance(camera,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',camera)):
             raise ValueError('Invalid camera filter')
@@ -1299,7 +1360,7 @@ class Archive:
             raise ValueError('Invalid camera filter')
         self.conn.execute('BEGIN IMMEDIATE')
         try:
-            sql="SELECT r.* FROM recordings r JOIN cameras c ON c.id=r.camera WHERE r.status='downloaded' AND r.media_expired_at IS NULL AND r.deleted_at IS NULL AND c.deleted_at IS NULL AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"
+            sql="SELECT r.* FROM recordings r JOIN cameras c ON c.id=r.camera WHERE r.status='downloaded' AND r.media_expired_at IS NULL AND r.deleted_at IS NULL AND r.error_queue_at IS NULL AND c.deleted_at IS NULL AND c.enabled=1 AND c.upload_enabled=1 AND r.retry_at<=?"
             params=[time.time()]
             if camera is not None:sql+=' AND r.camera=?';params.append(camera)
             if channel_chat_id is not None:
@@ -1370,7 +1431,17 @@ class Archive:
                 partial=_confined_path(candidate,self._cache_root)
                 partial.unlink()
         with self.conn:
-            return self.conn.execute("UPDATE recordings SET status='failed',last_error='worker_restarted_during_ingest' WHERE status='ingesting' AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL").rowcount
+            return self.conn.execute("""UPDATE recordings SET
+                status=CASE WHEN error_retry_count>0 THEN 'needs_review' ELSE 'failed' END,
+                last_error=CASE WHEN error_retry_count>0 THEN 'failed_remux' ELSE 'worker_restarted_during_ingest' END,
+                error_queue_at=CASE WHEN error_retry_count>=3 THEN coalesce(error_queue_at,?) ELSE error_queue_at END
+                WHERE (status='ingesting' OR (status='failed' AND last_error='failed_remux'
+                    AND processing_method='passthrough' AND error_retry_count>0
+                    AND coalesce(attempt_id,'')='' AND upload_target_chat_id IS NULL
+                    AND bot_id IS NULL AND uploaded_at IS NULL AND storage_chat_id IS NULL
+                    AND storage_message_id IS NULL AND coalesce(file_unique_id,'')=''))
+                AND deleted_at IS NULL AND file_id IS NULL
+                AND message_id IS NULL AND chat_id IS NULL""", (time.time(),)).rowcount
 
     def invalidate_legacy_cache(self, camera=None):
         """Request raw re-ingest only for unposted, unambiguous old media.
@@ -1394,7 +1465,7 @@ class Archive:
         with self.conn:
             return self.conn.execute(sql, values).rowcount
 
-    def remux_pending_cache(self, camera=None, limit=5):
+    def remux_pending_cache(self, camera=None, limit=5, *, key=None):
         """Exclusive-worker migration: reuse unposted raw cache, not the SD card.
 
         Posted/in-flight/uncertain/deleted rows never enter this operation. A
@@ -1406,9 +1477,11 @@ class Archive:
             raise ValueError('Invalid camera filter')
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError('Invalid pending remux batch size')
+        if key is not None and (not isinstance(key,str) or not re.fullmatch(r'[a-f0-9]{64}',key)):
+            raise ValueError('Invalid managed recording key')
         if self.settings.media_mode != 'remux_copy':
             return result
-        where = """processing_method='passthrough' AND status IN ('downloaded','failed') AND media_expired_at IS NULL
+        where = """processing_method='passthrough' AND status IN ('downloaded','failed') AND media_expired_at IS NULL AND error_queue_at IS NULL
             AND deleted_at IS NULL AND file_id IS NULL AND message_id IS NULL AND chat_id IS NULL
             AND local_path IS NOT NULL AND local_path!=''
             AND EXISTS (SELECT 1 FROM cameras active_camera WHERE active_camera.id=recordings.camera
@@ -1417,6 +1490,13 @@ class Archive:
         if camera is not None:
             where += ' AND camera=?'
             values.append(camera)
+        if key is not None:
+            where += ' AND key=?'
+            values.append(key)
+        else:
+            # Bounded retry reservations are admitted only by error_queue;
+            # the regular migration loop must not invent a fourth attempt.
+            where += ' AND error_retry_count<3'
         rows = self.conn.execute('SELECT * FROM recordings WHERE '+where+' ORDER BY start_ms,key LIMIT ?', [*values, limit]).fetchall()
         for row in rows:
             if not re.fullmatch(r'[0-9a-f]{64}', row['key']):

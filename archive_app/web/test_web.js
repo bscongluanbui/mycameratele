@@ -101,6 +101,40 @@ equal(helpers.syncActive(null), false);
 equal(helpers.syncState({state: 'blocked'}), ['Cần xử lý', 'amber']);
 equal(helpers.syncState({state: 'completed'}), ['Hoàn tất', 'green']);
 equal(helpers.syncState(null), ['Chưa Start', 'neutral']);
+const normalContinuation = {state: 'blocked', code: 'sd_batch_limit', statistics: {sd_backlog: 100, sd_requeued: true, needs_review: 10, sd_quarantined_reviews: 10, uploaded: 10, failed: 0, upload_unknown: 0}};
+const normalBatchWait = {state: 'blocked', code: 'sd_batch_limit', statistics: {sd_backlog: 100}};
+const telegramWait = {state: 'blocked', code: 'rate_limited'};
+const spoolWait = {state: 'blocked', code: 'upload_spool_budget', statistics: {spool_blocked: 1}};
+equal(helpers.syncState(normalContinuation), ['Đang tiếp tục', 'blue']);
+equal(helpers.syncState(normalBatchWait), ['Chờ lượt tiếp', 'neutral']);
+equal(helpers.syncState(telegramWait), ['Chờ Telegram', 'neutral']);
+equal(helpers.syncState(spoolWait), ['Chờ dung lượng', 'neutral']);
+equal(helpers.syncState({...normalContinuation, state: 'completed'}), ['Hoàn tất', 'green']);
+equal(helpers.syncNeedsAttention(normalContinuation), false);
+equal(helpers.syncNeedsAttention(telegramWait), false);
+equal(helpers.syncNeedsAttention(spoolWait), false);
+equal(helpers.syncNeedsAttention({state: 'blocked', code: 'needs_review'}), true);
+equal(helpers.syncNeedsAttention({state: 'failed', code: 'sd_batch_limit'}), true);
+equal(helpers.syncNeedsAttention({...normalContinuation, state: 'completed'}), false);
+equal(helpers.syncNeedsAttention(null), false);
+for (const statistics of [
+  {...normalContinuation.statistics, needs_review: 11},
+  {...normalContinuation.statistics, needs_review: 9},
+  {...normalContinuation.statistics, upload_unknown: 1},
+  {...normalContinuation.statistics, failed_records: 1},
+  {...normalContinuation.statistics, failed: 1},
+  {...normalContinuation.statistics, remux_failed: 1},
+  {...normalContinuation.statistics, sd_error_code: 'sd_download_incomplete'},
+  {...normalContinuation.statistics, needs_review: '10'},
+  {...normalContinuation.statistics, needs_review: 0.5, sd_quarantined_reviews: 0.5},
+  {...normalContinuation.statistics, sd_quarantined_reviews: NaN},
+  {...normalContinuation.statistics, sd_quarantined_reviews: -1}
+]) {
+  const job = {...normalContinuation, statistics};
+  equal(helpers.syncState(job), ['Cần xử lý', 'amber']);
+  equal(helpers.syncNeedsAttention(job), true);
+}
+for (const code of ['needs_review', 'upload_unknown', 'sd_network_error', 'storage_blocked', 'sd_download_incomplete']) equal(helpers.syncState({...normalContinuation, code}), ['Cần xử lý', 'amber']);
 equal(helpers.syncPhase({phase: 'sd_download'}), 'Tải SD');
 equal(helpers.syncPhase({phase: 'uploading'}), 'Upload Telegram');
 equal(helpers.syncStatistics({statistics: {sd_searched: 3, sd_downloaded: 2, uploaded: 1, pending: 0, secret: 'notshown'}}), 'Tìm thấy SD: 3 · Đã tải SD: 2 · Đã upload: 1 · Chờ upload: 0');
@@ -110,6 +144,8 @@ equal(helpers.syncHelp({code: 'sd_network_error'}).includes('Tailscale'), true);
 equal(helpers.syncHelp({code: 'sd_source_missing'}).includes('8000'), true);
 equal(helpers.syncHelp({code: 'sd_credentials_missing'}).includes('mã xác thực'), true);
 equal(helpers.syncHelp({code: 'complete'}), '');
+equal(helpers.syncHelp({code: 'needs_review'}), 'File lỗi: thử lại tối đa 3 lần, sau đó vào hàng lỗi. Cache lỗi tự xóa sau 72 giờ.');
+equal(helpers.syncHelp({code: 'upload_unknown'}), 'Upload chưa xác nhận: đối soát trước khi gửi lại.');
 equal(helpers.cameraPatch(original, {...original, upload_enabled: false}), {upload_enabled: false});
 equal(helpers.cameraPatch(original, {...original, sd_password: ''}), {});
 equal(helpers.cameraPatch(original, {...original, sd_password: 'fixture-password'}), {sd_password: 'fixture-password'});
@@ -159,6 +195,8 @@ equal(helpers.syncTransfer({statistics: {upload_confirmed_bytes: 50000000, uploa
 equal(helpers.syncTransfer(null), '');
 equal(helpers.syncSummary({a: {state: 'running'}, b: {state: 'queued'}, c: {state: 'blocked'}, d: {state: 'failed'}, e: {state: 'completed'}}), '1 đang chạy · 1 chờ · 2 cần xử lý');
 equal(helpers.syncSummary({a: null, b: {state: 'completed'}}), 'Không có sync đang chạy');
+equal(helpers.syncSummary({a: normalContinuation, b: telegramWait, c: spoolWait, d: normalBatchWait}), '0 đang chạy · 4 chờ · 0 cần xử lý');
+equal(helpers.syncSummary({a: normalContinuation, b: {state: 'blocked', code: 'needs_review'}, c: {state: 'running'}}), '1 đang chạy · 1 chờ · 1 cần xử lý');
 equal(helpers.syncLine(null), 'Bấm Start sync để bắt đầu');
 equal(helpers.syncLine({phase: 'uploading', statistics: {sd_searched: 27, sd_downloaded: 27, uploaded: 16, failed: 0}}), 'Upload Telegram · SD 27 · Tải 27 · Upload 16 · Lỗi 0');
 equal(helpers.syncLine({phase: 'sd_search', statistics: {sd_searched: 0, uploaded: '4', failed: -1, sd_downloaded: NaN}}), 'Tìm recording SD · SD 0');
@@ -166,6 +204,27 @@ equal(helpers.syncLine({phase: 'queued'}), 'Hàng đợi');
 equal(helpers.syncLine({state: 'completed', phase: 'finished', statistics: {...uploadConfirmed, uploaded: 1}}), 'TB VPS→Telegram 1.25 MB/s · Kết thúc · Upload 1');
 equal(helpers.syncLine({phase: 'finished', statistics: {failed: 0, sd_media_failed: 2}}), 'Kết thúc · Lỗi 0 · Cách ly 2');
 for (const invalid of [0, -1, NaN, Infinity, '2', null]) equal(helpers.syncLine({phase: 'finished', statistics: {sd_media_failed: invalid}}), 'Kết thúc');
+equal(helpers.syncLine({...normalContinuation, phase: 'finished'}), 'Kết thúc · Upload 10 · Lỗi 0 · File lỗi giữ lại 10');
+equal(helpers.syncLine({state: 'completed', phase: 'finished', statistics: {sd_quarantined_reviews: 7, sd_media_failed: 2}}), 'Kết thúc · Cách ly 2 · File lỗi giữ lại 7');
+for (const invalid of [0, -1, NaN, Infinity, '2', null]) equal(helpers.syncLine({phase: 'finished', statistics: {sd_quarantined_reviews: invalid}}), 'Kết thúc');
+equal(helpers.syncDetailFields({statistics: {sd_quarantined_reviews: 10, sd_requeued: true}}), [['File lỗi giữ lại (không chặn sync)', '10'], ['Đã xếp lượt tiếp', 'true']]);
+equal(helpers.syncLogFilter([normalContinuation, telegramWait, spoolWait, {state: 'blocked', code: 'needs_review'}, {state: 'failed'}], '', 'errors'), [{state: 'blocked', code: 'needs_review'}, {state: 'failed'}]);
+equal(helpers.syncLogFilter([normalContinuation, telegramWait, spoolWait], '', ''), [normalContinuation, telegramWait, spoolWait]);
+const queuedErrors = {state: 'completed', phase: 'finished', statistics: {error_retries: 3, error_queue: 8}};
+equal(helpers.syncLine(queuedErrors), 'Kết thúc · Thử lại 3 · Hàng lỗi 8');
+equal(helpers.syncDetailFields(queuedErrors), [['Thử lại trong lượt sync', '3'], ['Hàng lỗi', '8']]);
+equal(helpers.syncState(queuedErrors), ['Hoàn tất', 'green']);
+equal(helpers.syncNeedsAttention(queuedErrors), false);
+equal(helpers.syncSummary({a: queuedErrors}), 'Không có sync đang chạy');
+equal(helpers.syncLogFilter([queuedErrors], '', 'errors'), []);
+equal(helpers.syncState({...normalContinuation, statistics: {...normalContinuation.statistics, error_queue: 8, error_retries: 3}}), ['Đang tiếp tục', 'blue']);
+equal(helpers.syncNeedsAttention({...normalContinuation, statistics: {...normalContinuation.statistics, error_queue: 8, upload_unknown: 1}}), true);
+equal(helpers.syncLine({...queuedErrors, statistics: {error_retries: 0, error_queue: 8}}), 'Kết thúc · Hàng lỗi 8');
+equal(helpers.syncDetailFields({statistics: {error_retries: 0, error_queue: 0}}), [['Thử lại trong lượt sync', '0'], ['Hàng lỗi', '0']]);
+for (const invalid of [0, -1, 0.5, NaN, Infinity, '2', null]) {
+  equal(helpers.syncLine({phase: 'finished', statistics: {error_retries: invalid}}), 'Kết thúc');
+  equal(helpers.syncLine({phase: 'finished', statistics: {error_queue: invalid}}), 'Kết thúc');
+}
 equal(helpers.syncDetailFields({statistics: {sd_backend: 'hcnetsdk', sd_downloaded: 0, remuxed: 5, sd_error_code: null}}), [['Bộ tải SD', 'hcnetsdk'], ['Đã tải SD', '0'], ['Đã remux', '5'], ['Mã lỗi SD', '—']]);
 equal(helpers.syncDetailFields({statistics: {unknown_count: 4, bad: Infinity, negative: -1, object: {}, empty: '', flag: false}}), []);
 equal(helpers.syncDetailFields({statistics: {uploaded: 1, secret: 'synthetic-token', token: 'synthetic-token', source_path: '/synthetic/private', sd_backend: 'hcnetsdk', sd_imported: 2}}), [['Đã upload', '1'], ['Bộ tải SD', 'hcnetsdk'], ['Đã nhập SD', '2']]);

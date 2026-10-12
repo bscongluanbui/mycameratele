@@ -24,6 +24,15 @@ class ApiRejected(Exception):
             'bad request: message to copy not found', 'bad request: message not found',
             'bad request: message_id_invalid')
         normalized=description.lower() if isinstance(description,str) else ''
+        # Fixed allowlist only. Access/request/rate/server failures must never
+        # become file-level quarantine merely because an earlier upload worked.
+        media_errors = ('bad request: video_content_type_invalid',
+                        'bad request: media_empty', 'bad request: media_invalid',
+                        'bad request: file_parts_invalid',
+                        'bad request: video_file_invalid',
+                        'bad request: image_process_failed')
+        self.upload_kind = ('media' if code == 400 and normalized in media_errors
+                            else 'access' if code in (401,403) else 'unclassified')
         self.index_message_missing=code==400 and normalized in (
             'bad request: message to edit not found','bad request: message not found','bad request: message_id_invalid')
         self.not_modified=code==400 and normalized.startswith('bad request: message is not modified')
@@ -557,7 +566,11 @@ class Telegram:
                 return 'api_rejected'
             with archive.conn:
                 if 400 <= exc.code < 500:
-                    archive.conn.execute("UPDATE recordings SET status='needs_review',last_error='api_rejected' WHERE key=?", (row['key'],))
+                    archive.conn.execute("""UPDATE recordings SET status='needs_review',last_error='api_rejected',
+                        last_api_error_code=?,last_api_error_kind=?,
+                        error_queue_at=CASE WHEN error_retry_count>=3 AND ?='media'
+                            THEN coalesce(error_queue_at,?) ELSE error_queue_at END
+                        WHERE key=?""", (exc.code,exc.upload_kind,exc.upload_kind,time.time(),row['key']))
                 else:
                     archive.conn.execute("UPDATE recordings SET status='upload_unknown',last_error='server_error_after_send' WHERE key=?", (row['key'],))
             return 'api_rejected'

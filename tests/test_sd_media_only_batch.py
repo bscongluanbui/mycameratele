@@ -55,7 +55,8 @@ class SDMediaOnlyBatchTests(unittest.TestCase):
         with (patch.object(self.archive, 'camera_sd_config', return_value=self.config),
               patch.object(self.archive, 'probe_camera', return_value={'tcp': {'8000': 'open'}}),
               patch.object(SDSource, '_provider', side_effect=self.provider),
-              patch.object(SDSource, 'sync', autospec=True, side_effect=fixed_time)):
+              patch.object(SDSource, 'sync', autospec=True, side_effect=fixed_time),
+              patch('archive_app.error_queue.retry_one', return_value=None)):
             self.assertTrue(self.queue.run_once(self.telegram))
 
     def exercise_all_bad_prefix(self, threads):

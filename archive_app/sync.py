@@ -22,6 +22,7 @@ def _statistics():
             'uploaded': 0, 'failed': 0, 'ready': 0, 'pending': 0, 'remuxed': 0, 'remux_failed': 0,
             'remux_budget_blocked': 0,
             'needs_review': 0, 'upload_unknown': 0, 'deleted': 0,
+            'error_retries': 0, 'error_queue': 0,
             'failed_records': 0, 'expired': 0, 'spool_blocked': 0, 'probe_tcp_open': 0, 'probe_error_type': None,
             'sd_backend': None, 'sd_searched': 0, 'sd_downloaded': 0, 'sd_imported': 0, 'sd_deferred': 0,
             'sd_backlog': 0, 'sd_error_code': None, 'sd_requeued': False, 'sd_quarantined_reviews': 0,
@@ -233,16 +234,17 @@ class SyncQueue:
     def _counts(self, slug, statistics):
         now = time.time()
         row = self.conn.execute('''SELECT count(*) AS total,
-            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status='downloaded' AND coalesce(retry_at,0)<=? THEN 1 END) AS ready,
-            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status!='uploaded' THEN 1 END) AS pending,
-            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status='needs_review' THEN 1 END) AS needs_review,
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND error_queue_at IS NULL AND status='downloaded' AND coalesce(retry_at,0)<=? THEN 1 END) AS ready,
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND (error_queue_at IS NULL OR status IN ('upload_unknown','uploading')) AND status!='uploaded' THEN 1 END) AS pending,
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND error_queue_at IS NULL AND status='needs_review' THEN 1 END) AS needs_review,
             count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status IN ('upload_unknown','uploading') THEN 1 END) AS upload_unknown,
             count(CASE WHEN deleted_at IS NOT NULL THEN 1 END) AS deleted,
-            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status IN ('failed','ingesting') THEN 1 END) AS failed_records,
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND error_queue_at IS NULL AND status IN ('failed','ingesting') THEN 1 END) AS failed_records,
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND error_queue_at IS NOT NULL AND status!='uploaded' THEN 1 END) AS error_queue,
             count(CASE WHEN media_expired_at IS NOT NULL AND status!='uploaded' THEN 1 END) AS expired,
-            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND status='downloaded' AND coalesce(retry_at,0)>? THEN 1 END) AS delayed
+            count(CASE WHEN deleted_at IS NULL AND media_expired_at IS NULL AND error_queue_at IS NULL AND status='downloaded' AND coalesce(retry_at,0)>? THEN 1 END) AS delayed
             FROM recordings WHERE camera=?''', (now,now,slug)).fetchone()
-        for field in ('ready','pending','needs_review','upload_unknown','deleted','failed_records','expired'):
+        for field in ('ready','pending','needs_review','upload_unknown','deleted','failed_records','error_queue','expired'):
             statistics[field] = row[field]
         return row['total'], row['delayed']
 
@@ -275,11 +277,13 @@ class SyncQueue:
                 and all(self.archive.retained_remux_failure(key) for key in keys))
 
     def _quarantined_reviews(self, job, statistics):
-        """Retained unposted media failures need not stall healthy history.
+        """Retained, isolated old failures need not stall healthy history.
 
         This is not an automatic retry or reconciliation. Every uncertain send,
-        unclassified new error, generic review and incomplete recording still blocks the
-        continuation. The failed row and its retained media remain untouched.
+        new API refusal, generic review and incomplete recording still blocks
+        continuation. An old explicit refusal also needs a later confirmed
+        delivery by the current bot to this camera's current channel. The failed
+        row and its retained media remain untouched.
         """
         started = job.get('started_at')
         if (not started or not statistics['sd_backlog'] or not statistics['sd_downloaded']
@@ -294,21 +298,26 @@ class SyncQueue:
         if (not (statistics.get('sd_imported') and statistics['uploaded'])
                 and not self._all_bad_media_batch(statistics)):
             return 0
-        rows = self.conn.execute('''SELECT key,created_at,error_started_at FROM recordings
+        rows = self.conn.execute('''SELECT key,created_at,error_started_at,last_error FROM recordings
             WHERE camera=? AND status='needs_review' AND deleted_at IS NULL
-                AND media_expired_at IS NULL AND last_error='failed_remux'
-                AND coalesce(chat_id,'')='' AND message_id IS NULL
-                AND coalesce(file_id,'')='' AND coalesce(file_unique_id,'')=''
-                AND storage_chat_id IS NULL AND storage_message_id IS NULL
-                AND upload_target_chat_id IS NULL AND bot_id IS NULL
-                AND coalesce(attempt_id,'')='' AND uploaded_at IS NULL''',
+                AND media_expired_at IS NULL AND error_queue_at IS NULL
+                AND last_error IN ('failed_remux','api_rejected')''',
             (job['camera_id'],)).fetchall()
-        # Old failures keep their legacy quarantine behavior. New failures
-        # must additionally be the exact source-verified keys from this job;
-        # recheck durable media and all no-send guards atomically at finish.
-        count = sum(1 for row in rows if (
-            row['created_at'] < started and row['error_started_at'] is not None and row['error_started_at'] < started
-            or row['key'] in keys and self.archive.retained_remux_failure(row['key'])))
+        # Recheck retained media and every receipt/attempt guard for both old
+        # and source-verified new remux failures. A refused API attempt is a
+        # different state: it has a definite refusal but must not be resent or
+        # called malformed media. Its helper requires healthy current delivery.
+        count = 0
+        for row in rows:
+            old = (row['created_at'] < started and row['error_started_at'] is not None
+                   and row['error_started_at'] < started)
+            if row['last_error'] == 'failed_remux':
+                eligible = ((old or row['key'] in keys)
+                            and self.archive.retained_remux_failure(row['key']))
+            else:
+                eligible = (old and self.archive.retained_api_rejection(
+                    row['key'], after=started, camera=job['camera_id']))
+            count += bool(eligible)
         return count if count == statistics['needs_review'] else 0
 
     def _finish(self, job, statistics, state, code, message, *, requeue_backlog=False, telegram=None):
@@ -445,7 +454,7 @@ class SyncQueue:
                     self.archive.state('upload_telemetry_v1:'+slug,json.dumps({field:statistics[field]
                         for field in ('upload_last_file_bytes','upload_last_file_seconds','upload_last_file_confirmed_at')}))
                 except Exception:pass
-        def upload_ready():
+        def upload_ready(*, retry_key=None):
             nonlocal upload_paused,upload_error_type
             if (self._stopping() or upload_paused
                     or statistics['uploaded']>=MAX_UPLOADS_PER_JOB or self._gate(slug)):
@@ -465,7 +474,17 @@ class SyncQueue:
             elif result=='upload_spool_budget':
                 statistics['spool_blocked']=1
                 upload_paused=True
-            elif result is not None:upload_paused=True
+            elif result is not None:
+                upload_paused=True
+                # Only a deliberately admitted OLD retry may yield after its
+                # exact, retained explicit refusal. A current-file failure,
+                # 429 pause, permission change or uncertain send still blocks.
+                if (retry_key is not None and result == 'api_rejected'
+                        and not self._stopping() and not self._gate(slug)
+                        and telegram.upload_retry_until(self.archive) <= time.time()
+                        and self.archive.retained_api_rejection(
+                            retry_key, after=job['started_at'], camera=slug)):
+                    upload_paused=False
             return result
         if self.archive.settings.media_mode=='remux_copy':
             # Migrate only confirmed unposted raw cache, one file at a time.
@@ -618,6 +637,23 @@ class SyncQueue:
             else:
                 break
         _, delayed = self._counts(slug, statistics)
+        # Retry at most one old isolated file after the healthy current SD
+        # batch. Do not slow initial ingestion or create a tight retry loop;
+        # persistent counters/due times and the three-attempt error queue are
+        # owned by error_queue. Ambiguous sends and backpressure remain gates.
+        if (not upload_paused and not self._stopping() and not self._gate(slug)
+                and statistics['sd_imported'] and statistics['uploaded']
+                and not statistics['ready'] and not statistics['upload_unknown']
+                and not statistics['failed_records'] and not statistics['sd_error_code']
+                and not delayed and statistics['uploaded'] < MAX_UPLOADS_PER_JOB):
+            from .error_queue import retry_one
+            retried = retry_one(self.archive, slug, after=job['started_at'])
+            if retried is not None:
+                statistics['error_retries'] += int(bool(retried['attempted']))
+                if retried['ready']:
+                    self._progress(job, statistics, 'uploading', 'Đang thử lại một file lỗi cũ')
+                    upload_ready(retry_key=retried['key'])
+        _, delayed = self._counts(slug, statistics)
         quarantined = self._quarantined_reviews(job, statistics)
         statistics['sd_quarantined_reviews'] = quarantined
         gate = self._gate(slug) if statistics['pending'] else None
@@ -634,7 +670,7 @@ class SyncQueue:
             self._finish(job, statistics, 'blocked', 'remux_cache_budget', 'Cache cần thêm dung lượng để chuyển container MP4; file nguồn vẫn được giữ')
         elif statistics['failed_records']:
             self._finish(job, statistics, 'blocked', 'needs_review', 'Có video cần kiểm tra nguồn hoặc trạng thái Telegram trước khi xử lý tiếp')
-        elif statistics['spool_blocked'] or self.conn.execute("SELECT 1 FROM recordings WHERE camera=? AND status='downloaded' AND deleted_at IS NULL AND media_expired_at IS NULL AND last_error='upload_spool_budget' AND retry_at>? LIMIT 1",(slug,time.time())).fetchone():
+        elif statistics['spool_blocked'] or self.conn.execute("SELECT 1 FROM recordings WHERE camera=? AND status='downloaded' AND deleted_at IS NULL AND media_expired_at IS NULL AND error_queue_at IS NULL AND last_error='upload_spool_budget' AND retry_at>? LIMIT 1",(slug,time.time())).fetchone():
             self._finish(job, statistics, 'blocked', 'upload_spool_budget', 'Vùng tạm upload cần dung lượng; giữ video và thử lại sau')
         elif delayed:
             self._finish(job, statistics, 'blocked', 'rate_limited', 'Telegram đang giới hạn tốc độ; video được giữ để thử sau thời gian retry')
