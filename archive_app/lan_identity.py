@@ -218,25 +218,46 @@ def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lo
             future.cancel()
     if stop.is_set():
         return None
-    rows = (neighbors or collect_neighbors)(config.interface, config.subnet, max_age=120)
-    if not isinstance(rows, list) or len(rows) > 1024:
-        raise ValueError('Invalid neighbour snapshot')
-    validated = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        try:
-            host = ipaddress.IPv4Address(row.get('host', ''))
-            mac = _mac(row.get('mac'))
-        except (TypeError, ValueError):
-            continue
-        age = row.get('confirmed_age')
-        if host not in network or host in (network.network_address, network.broadcast_address):
-            continue
-        if isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age) or not 0 <= age <= 120:
-            continue
-        validated.append({'host': str(host), 'mac': mac, 'confirmed_age': age})
-    rows = validated
+
+    def read_rows():
+        remaining = started + config.scan_timeout - monotonic()
+        if remaining <= 0.05:
+            return []
+        values = (neighbors or collect_neighbors)(config.interface, config.subnet, max_age=120, timeout=min(2, remaining))
+        if not isinstance(values, list) or len(values) > 1024:
+            raise ValueError('Invalid neighbour snapshot')
+        validated = []
+        for row in values:
+            if not isinstance(row, dict):
+                continue
+            try:
+                host = ipaddress.IPv4Address(row.get('host', ''))
+                mac = _mac(row.get('mac'))
+            except (TypeError, ValueError):
+                continue
+            age = row.get('confirmed_age')
+            if host not in network or host in (network.network_address, network.broadcast_address):
+                continue
+            if isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age) or not 0 <= age <= 120:
+                continue
+            validated.append({'host': str(host), 'mac': mac, 'confirmed_age': age})
+        return validated
+
+    rows = read_rows()
+    # Early successes can become STALE while the rest of the /24 is scanned.
+    # Refresh only missing, already-connected candidates, never the whole LAN.
+    missing = sorted(set(connected) - {row['host'] for row in rows}, key=ipaddress.IPv4Address)[:config.workers]
+    if missing and not stop.is_set() and monotonic() - started < config.scan_timeout - 2 - config.probe_timeout:
+        with ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix='lan-identity-refresh') as pool:
+            refreshed = {pool.submit(probe or _probe, host, local_address, config.probe_timeout): host for host in missing}
+            for future, host in refreshed.items():
+                connected.pop(host, None)
+                if future.result() is True:
+                    connected[host] = clock()
+        # Retain earlier rows as well so an observed MAC change stays a conflict.
+        rows.extend(read_rows())
+    if stop.is_set():
+        return None
     observed = clock()
     records, by_host, by_mac = [], {}, {}
     for row in rows:

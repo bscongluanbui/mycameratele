@@ -219,8 +219,69 @@ class ScanTests(unittest.TestCase):
 
     def test_scan_deadline_stops_scheduling_new_hosts(self):
         probe = Mock(return_value=True)
-        self.scan([], probe=probe, monotonic=Mock(side_effect=[0, 14, 14]))
+        ticks = iter([0, 14])
+        self.scan([], probe=probe, monotonic=lambda: next(ticks, 14))
         probe.assert_not_called()
+
+    def test_missing_connected_host_is_reprobed_then_fresh_delay_is_included(self):
+        calls = []
+        def probe(host, *_):
+            calls.append(host)
+            return host == '192.168.2.3'
+        rows = [{'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 20}]
+        dump = Mock(side_effect=[[], rows])
+        config = ObserverConfig(TOKEN, subnet='192.168.2.0/29')
+        result = scan_identity(config, probe=probe, neighbors=dump,
+                               interface_lookup=lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24')),
+                               clock=Mock(side_effect=[1000, 1001, 1002]))
+        self.assertEqual(result['records'], [{'host': '192.168.2.3', 'mac': MAC, 'observed_at': 1001, 'evidence': 'tcp+netlink'}])
+        self.assertEqual(calls.count('192.168.2.3'), 2)
+        self.assertEqual(calls.count('192.168.2.2'), 1)
+        self.assertEqual(dump.call_count, 2)
+
+    def test_missing_candidate_refresh_is_limited_to_sixteen_hosts(self):
+        calls = []
+        def probe(host, *_):
+            calls.append(host)
+            return True
+        result = self.scan([], config=ObserverConfig(TOKEN), probe=probe)
+        self.assertEqual(result['records'], [])
+        self.assertEqual(len(set(calls)), 253)
+        self.assertEqual(len(calls), 253 + 16)
+        self.assertLessEqual(max(calls.count(host) for host in calls), 2)
+
+    def test_reprobe_is_skipped_when_original_scan_deadline_is_near(self):
+        now, calls = [0], []
+        def probe(host, *_):
+            calls.append(host)
+            return host == '192.168.2.3'
+        def dump(*args, **kwargs):
+            now[0] = 14.9
+            return []
+        result = scan_identity(ObserverConfig(TOKEN, subnet='192.168.2.0/29'), probe=probe, neighbors=dump,
+                               interface_lookup=lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24')),
+                               monotonic=lambda: now[0])
+        self.assertEqual(result['records'], [])
+        self.assertEqual(calls.count('192.168.2.3'), 1)
+
+    def test_no_tcp_success_never_triggers_reprobe_or_publishes(self):
+        dump = Mock(return_value=[{'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 20}])
+        result = scan_identity(ObserverConfig(TOKEN, subnet='192.168.2.0/29'), probe=lambda *_: False, neighbors=dump,
+                               interface_lookup=lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24')))
+        self.assertEqual(result['records'], [])
+        self.assertEqual(dump.call_count, 1)
+
+    def test_reprobe_failure_discards_previous_tcp_success(self):
+        calls = [0]
+        def probe(host, *_):
+            if host != '192.168.2.3':
+                return False
+            calls[0] += 1
+            return calls[0] == 1
+        dump = Mock(side_effect=[[], [{'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 20}]])
+        result = scan_identity(ObserverConfig(TOKEN, subnet='192.168.2.0/29'), probe=probe, neighbors=dump,
+                               interface_lookup=lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24')))
+        self.assertEqual(result['records'], [])
 
     def test_stopped_scan_does_not_publish_snapshot(self):
         stop = threading.Event()
