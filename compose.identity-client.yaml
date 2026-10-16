@@ -1,0 +1,17 @@
+# Add to the VPS compose stack only when MAC auto-IP is wanted.
+# This is metadata, not SD_COLLECTOR_URL. Video still goes directly to the VPS.
+services:
+  archive:
+    environment:
+      LAN_IDENTITY_URL: ${LAN_IDENTITY_URL:?Set the LAN observer Tailscale URL}
+      LAN_IDENTITY_TOKEN_FILE: /run/secrets/lan-identity-token
+    secrets: [lan-identity-token]
+  dashboard:
+    environment:
+      LAN_IDENTITY_URL: ${LAN_IDENTITY_URL:?Set the LAN observer Tailscale URL}
+      LAN_IDENTITY_TOKEN_FILE: /run/secrets/lan-identity-token
+    secrets: [lan-identity-token]
+
+secrets:
+  lan-identity-token:
+    file: ${LAN_IDENTITY_TOKEN_PATH:-./secrets/lan-identity-token}

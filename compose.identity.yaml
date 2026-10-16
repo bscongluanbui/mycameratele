@@ -1,0 +1,38 @@
+# Standalone metadata observer on the physical camera LAN (not on the VPS).
+# Never combine with compose.collector.yaml; this service transfers no media.
+name: mycameratele-lan-identity
+services:
+  lan-identity:
+    image: ${ARCHIVE_IMAGE:-ghcr.io/bscongluanbui/mycameratele:latest}
+    command: [lan-identity]
+    user: "10001:10001"
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    environment:
+      LAN_IDENTITY_BIND: ${LAN_IDENTITY_BIND:?Set this box Tailscale IPv4}
+      LAN_IDENTITY_PORT: ${LAN_IDENTITY_PORT:-8790}
+      LAN_IDENTITY_SUBNET: ${LAN_IDENTITY_SUBNET:?Set the directly attached camera LAN /24 to /30}
+      LAN_IDENTITY_INTERFACE: ${LAN_IDENTITY_INTERFACE:-eth0}
+      LAN_IDENTITY_TOKEN_FILE: /run/secrets/lan-identity-token
+    secrets: [lan-identity-token]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 96m
+    cpus: 0.15
+    pids_limit: 64
+    stop_grace_period: 20s
+    healthcheck:
+      test: [CMD, python, -c, "import os,urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://'+os.environ['LAN_IDENTITY_BIND']+':'+os.environ['LAN_IDENTITY_PORT']+'/health',timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: 1m, max-file: "2"}
+
+secrets:
+  lan-identity-token:
+    file: ${LAN_IDENTITY_TOKEN_PATH:-./secrets/lan-identity-token}

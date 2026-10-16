@@ -887,13 +887,28 @@ class SDSource:
     def __init__(self, archive, camera, credentials=None):
         self.archive = archive
         self.camera = camera
+        if credentials is None:
+            from .camera_identity import CameraIdentityError, resolve_camera
+            try:resolve_camera(archive, camera if isinstance(camera,str) else camera.get('id'))
+            except CameraIdentityError as error:
+                raise SDSourceError(error.code, 'Camera MAC identity is not verified; no SD credentials were sent.') from None
         config = credentials if credentials is not None else archive.camera_sd_config(camera)
         self.config = config
         self.camera_id = config.get('id', camera if isinstance(camera, str) else camera.get('id'))
         if not isinstance(self.camera_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', self.camera_id):
             raise SDSourceError('sd_config_invalid', 'Invalid SD camera ID.')
 
+    def _verify_bound_identity(self):
+        # Download threads may call this guard, so it must never touch SQLite.
+        # The immutable per-job host is checked again, not silently retargeted
+        # underneath recording metadata searched on a different device.
+        from .camera_identity import CameraIdentityError, guard_camera
+        try:guard_camera(self.config, settings=self.archive.settings)
+        except CameraIdentityError as error:
+            raise SDSourceError(error.code, 'Camera MAC identity changed or is unverified; SD access was stopped.') from None
+
     def _provider(self):
+        self._verify_bound_identity()
         config = self.config
         password = config.get('sd_password', config.get('password', ''))
         username = config.get('sd_username', config.get('username', 'admin'))
@@ -975,6 +990,7 @@ class SDSource:
         skipped = {'searched': 0, 'already_known': 0, 'deferred': 0, 'backlog': 0}
         channel = self.config.get('sd_channel', self.config.get('channel', 1))
         for _ in range(MAX_KNOWN_SEARCH_PREFIXES):
+            self._verify_bound_identity()
             raw = sorted(provider.search(cursor, end), key=lambda row: (parse_time(row['start_time']), row['record_id']))
             recordings = []
             for item in raw:
@@ -1150,6 +1166,7 @@ class SDSource:
                         statistics['active_downloads'] = statistics['peak_downloads'] = 1
                         notify('sd_download')
                         started = time.monotonic()
+                        self._verify_bound_identity()
                         provider.download(recording, partial)
                         statistics['download_seconds'] += round(time.monotonic()-started, 6)
                         statistics['download_bytes'] += partial.stat().st_size
@@ -1321,6 +1338,7 @@ class SDSource:
                             activity['peak'] = max(activity['peak'], activity['active'])
                         downloaded_at = time.monotonic()
                         try:
+                            self._verify_bound_identity()
                             session.download(recording, partial)
                             size = partial.stat().st_size
                             if not 0 < size <= maximum:

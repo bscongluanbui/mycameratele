@@ -16,6 +16,7 @@ from .core import Archive,CameraBusyError,CameraIDReservedError
 from .dashboard_auth import DashboardAuth
 from .discovery import DiscoveryManager
 from .network_routes import load_subnets
+from .camera_identity import CameraIdentityError, public_snapshot
 from .sync import SyncQueue
 from .telegram import Telegram,ApiRejected,ChannelCheckError
 from .channel_directory import ChannelDirectory
@@ -122,7 +123,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return True
 
     def discovery_snapshot(self,snapshot):
-        """Mark known devices using IP identity, never camera credentials."""
+        """Enrich import candidates with observed MACs, never credentials."""
         archive=Archive(self.server.settings)
         try:cameras=archive.cameras()
         finally:archive.close()
@@ -132,10 +133,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except ValueError:continue  # Do not resolve arbitrary saved hostnames during a scan.
             existing.setdefault((address,camera['device_port']),camera['id'])
         result={**snapshot,'results':[]}
+        metadata={}
+        try:
+            identity=public_snapshot(self.server.settings)
+            metadata={row['host']:row['mac'] for row in identity.get('records',[])}
+        except CameraIdentityError:
+            pass  # Manual IP import remains usable when the observer is offline.
         for candidate in snapshot['results']:
             try:address=str(ipaddress.ip_address(candidate['host']))
             except ValueError:continue
-            result['results'].append({**candidate,'existing_camera_id':existing.get((address,candidate['device_port']))})
+            result['results'].append({**candidate,'mac_address':metadata.get(address,''),
+                'existing_camera_id':existing.get((address,candidate['device_port']))})
         return result
 
     def add_camera(self,archive,data,actor):
@@ -327,6 +335,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                    'channel_index_enabled':self.server.settings.channel_index_enabled})
                 elif path=='/api/cameras' and method=='POST':
                     response=self.add_camera(archive,self.read_json(),account['username'])
+                elif path=='/api/identity/snapshot' and method=='GET':
+                    if parsed.query:raise ValueError('Identity snapshot does not accept filters')
+                    try:response=(200,public_snapshot(self.server.settings))
+                    except CameraIdentityError as error:
+                        response=(503,{'configured':bool(self.server.settings.lan_identity_url),
+                            'records':[],'code':error.code,'error':'Chưa xác minh được MAC từ LAN'})
                 elif path=='/api/pipeline-settings' and method in ('GET','PATCH'):
                     if parsed.query:raise ValueError('Pipeline settings do not accept query fields')
                     response=(200,archive.pipeline_settings() if method=='GET' else archive.update_pipeline_settings(self.read_json()))

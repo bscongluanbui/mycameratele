@@ -557,7 +557,8 @@ class SyncQueue:
             # still proceed, but SD failure never becomes a successful sync.
             code=getattr(error,'code',None)
             if isinstance(code,str) and re.fullmatch(r'sd_[a-z0-9_]{1,48}',code):
-                sd_error=(code, 'Nguồn SD chưa hoàn tất ('+code+'); kiểm tra cấu hình camera, SDK và tuyến mạng')
+                sd_error=(code, ('Chưa xác minh được IP theo MAC ('+code+'); kiểm tra MAC, subnet và kết nối bộ nhận diện LAN'
+                    if code.startswith('sd_identity_') else 'Nguồn SD chưa hoàn tất ('+code+'); kiểm tra cấu hình camera, SDK và tuyến mạng'))
             else:
                 sd_error=('sd_source_failed', 'Nguồn SD gặp lỗi ('+self._error_type(error)+'); chưa có xác nhận tải recording')
             statistics['sd_error_code']=sd_error[0]

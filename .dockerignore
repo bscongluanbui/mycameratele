@@ -2,6 +2,7 @@
 *.pem
 *.key
 *.token
+secrets
 artifacts
 backups
 .verification

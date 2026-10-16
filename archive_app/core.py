@@ -138,6 +138,9 @@ class Settings:
     sd_download_threads: int = 1
     sd_collector_url: str = ''
     sd_collector_token: str = ''
+    # LAN metadata only: camera media still travels directly to this worker.
+    lan_identity_url: str = ''
+    lan_identity_token_file: str = ''
 
     @property
     def effective_owner(self):
@@ -171,6 +174,11 @@ class Settings:
         sd_speed = bounded_int('SD_DOWNLOAD_SPEED_KBPS', 0, 256, 32768, allow_zero=True)
         sd_workers = bounded_int('SD_DOWNLOAD_WORKERS', 1, 1, 5)
         sd_threads = bounded_int('SD_DOWNLOAD_THREADS', 1, 1, 2)
+        from .camera_identity import validate_url
+        identity_url=validate_url(os.environ.get('LAN_IDENTITY_URL','').strip())
+        identity_token_file=os.environ.get('LAN_IDENTITY_TOKEN_FILE','').strip()
+        if identity_url and not identity_token_file:
+            raise ValueError('LAN_IDENTITY_URL requires LAN_IDENTITY_TOKEN_FILE')
         collector_url = validate_sd_collector_url(os.environ.get('SD_COLLECTOR_URL', '').strip())
         collector_token = secret('SD_COLLECTOR_TOKEN')
         if collector_url and (not 32 <= len(collector_token) <= 512 or
@@ -253,6 +261,8 @@ class Settings:
             sd_download_workers=sd_workers,
             sd_download_threads=sd_threads,
             sd_collector_url=collector_url, sd_collector_token=collector_token,
+            lan_identity_url=identity_url,
+            lan_identity_token_file=identity_token_file,
             player_public_url=os.environ.get('TELEGRAM_PLAYER_PUBLIC_URL', '').strip().rstrip('/'),
             bot_api_file_root=Path(os.environ.get('TELEGRAM_BOT_API_FILE_ROOT', '/var/lib/telegram-bot-api')),
             bot_api_spool_root=Path(spool_path) if spool_path else None,
@@ -628,7 +638,12 @@ class Archive:
                                ('channel_enabled','INTEGER NOT NULL DEFAULT 1'),
                                ('channel_status',"TEXT NOT NULL DEFAULT 'unconfigured'"),
                                ('channel_error','TEXT'), ('deleted_at','REAL'),
-                               ('sd_download_threads','INTEGER NOT NULL DEFAULT 1')):
+                               ('sd_download_threads','INTEGER NOT NULL DEFAULT 1'),
+                               ('mac_address',"TEXT NOT NULL DEFAULT ''"),
+                               ('auto_ip','INTEGER NOT NULL DEFAULT 0'),
+                               ('identity_subnet',"TEXT NOT NULL DEFAULT ''"),
+                               ('identity_status',"TEXT NOT NULL DEFAULT 'manual'"),
+                               ('identity_error','TEXT'), ('identity_checked_at','REAL')):
                 if name not in camera_columns:
                     self.conn.execute(f'ALTER TABLE cameras ADD COLUMN {name} {kind}')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS recording_audit (
@@ -645,6 +660,9 @@ class Archive:
                 ON recordings(status,media_expired_at,error_started_at)''')
             self.conn.execute('''CREATE UNIQUE INDEX IF NOT EXISTS unique_camera_channel
                 ON cameras(channel_chat_id) WHERE channel_chat_id IS NOT NULL''')
+            self.conn.execute('''CREATE UNIQUE INDEX IF NOT EXISTS unique_active_camera_mac
+                ON cameras(identity_subnet,mac_address)
+                WHERE deleted_at IS NULL AND mac_address<>'' AND identity_subnet<>'' ''')
             self.conn.execute('''CREATE INDEX IF NOT EXISTS by_channel_recording
                 ON recordings(camera,storage_chat_id,status,deleted_at,start_ms,end_ms)''')
             # Historical errors have no reliable first-failure timestamp.
@@ -687,7 +705,7 @@ class Archive:
     def _camera_fields(data, partial=False):
         allowed={'id','name','model','host','device_port','rtsp_port','http_port','enabled','upload_enabled',
                  'sd_backend','sd_username','sd_channel','sd_timezone','sd_lookback_hours','sd_password','sd_password_clear',
-                 'sd_download_threads',
+                 'sd_download_threads','mac_address','auto_ip','identity_subnet',
                  'channel_chat_id','channel_name','channel_enabled'}
         if not isinstance(data,dict) or set(data)-allowed:
             raise ValueError('Unknown camera fields')
@@ -697,7 +715,12 @@ class Archive:
                     'rtsp_port':554,'http_port':80,'enabled':True,'upload_enabled':True,
                     'sd_backend':'auto','sd_username':'admin','sd_channel':1,
                     'sd_timezone':'Asia/Ho_Chi_Minh','sd_lookback_hours':168,'sd_download_threads':1,
-                    'channel_chat_id':None,'channel_name':'','channel_enabled':True,**values}
+                    'channel_chat_id':None,'channel_name':'','channel_enabled':True,
+                    'mac_address':'','auto_ip':False,'identity_subnet':'',**values}
+        if 'mac_address' in values or 'identity_subnet' in values:
+            from .camera_identity import normalize_mac, normalize_subnet
+            if 'mac_address' in values:values['mac_address']=normalize_mac(values['mac_address'])
+            if 'identity_subnet' in values:values['identity_subnet']=normalize_subnet(values['identity_subnet'])
         if 'channel_chat_id' in values:
             value=values['channel_chat_id']
             if value in (None, ''):value=None
@@ -758,11 +781,23 @@ class Archive:
             if field in values:
                 port=values[field]
                 if type(port) is not int or not 1<=port<=65535:raise ValueError('Invalid camera port')
-        for field in ('enabled','upload_enabled','channel_enabled'):
+        for field in ('enabled','upload_enabled','channel_enabled','auto_ip'):
             if field in values:
                 if type(values[field]) is not bool:raise ValueError(field+' must be boolean')
                 values[field]=int(values[field])
         return values
+
+    @staticmethod
+    def _validate_camera_identity(values):
+        if not values.get('auto_ip'):return
+        if not values.get('mac_address') or not values.get('identity_subnet'):
+            raise ValueError('Automatic camera IP requires a MAC address and LAN subnet')
+        try:
+            host=ipaddress.IPv4Address(values.get('host',''))
+            subnet=ipaddress.IPv4Network(values['identity_subnet'])
+            if host not in subnet or host in (subnet.network_address,subnet.broadcast_address):raise ValueError
+        except (ValueError,TypeError):
+            raise ValueError('Automatic camera IP must belong to its LAN subnet') from None
 
     def cameras(self):
         rows=self.conn.execute('''SELECT c.*,COUNT(r.key) record_count,
@@ -774,6 +809,7 @@ class Archive:
         for row in rows:
             item=dict(row);item['enabled']=bool(item['enabled']);item['upload_enabled']=bool(item['upload_enabled'])
             item['channel_enabled']=bool(item['channel_enabled'])
+            item['auto_ip']=bool(item['auto_ip'])
             item['channel_index_url']=None
             if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='channel_index_messages'").fetchone():
                 index=self.conn.execute("SELECT tg_message_url FROM channel_index_messages WHERE camera_id=? AND channel_chat_id=? AND index_type='root' AND state='ready'",(item['id'],item['channel_chat_id'])).fetchone()
@@ -831,10 +867,12 @@ class Archive:
             data={**data,'sd_download_threads':self.settings.sd_download_threads}
         values=self._camera_fields(data)
         if not values.get('id'):raise ValueError('Camera ID is required')
+        self._validate_camera_identity(values)
         if values['channel_name'] and values['channel_chat_id'] is None:
             raise ValueError('Channel display name requires a channel ID')
         values['created_at']=time.time()
-        values.update(deleted_at=None,probe_json=None,channel_status='unconfigured',channel_error=None)
+        values.update(deleted_at=None,probe_json=None,channel_status='unconfigured',channel_error=None,
+                      identity_status='pending' if values['auto_ip'] else 'manual')
         password=values.pop('sd_password',None);clear=values.pop('sd_password_clear',False)
         try:
             with self.conn:
@@ -847,7 +885,7 @@ class Archive:
                 self.conn.execute('INSERT INTO cameras('+','.join(values)+') VALUES('+','.join('?' for _ in values)+')',tuple(values.values()))
                 self._write_camera_password(values['id'],password,clear)
         except sqlite3.IntegrityError:
-            raise ValueError('Camera ID or channel is already assigned') from None
+            raise ValueError('Camera ID, channel or MAC is already assigned') from None
         return next(c for c in self.cameras() if c['id']==values['id'])
 
     def delete_camera(self,slug,confirm_name):
@@ -894,8 +932,17 @@ class Archive:
             values['channel_status']='unconfigured';values['channel_error']=None
         with self.conn:
             self.conn.execute('BEGIN IMMEDIATE')
-            current=self.conn.execute('SELECT channel_chat_id FROM cameras WHERE id=? AND deleted_at IS NULL',(slug,)).fetchone()
+            current=self.conn.execute('SELECT * FROM cameras WHERE id=? AND deleted_at IS NULL',(slug,)).fetchone()
             if current is None:raise KeyError('Unknown camera')
+            self._validate_camera_identity({**dict(current),**values})
+            identity_changed=any(field in values and values[field]!=current[field]
+                                 for field in ('host','mac_address','auto_ip','identity_subnet'))
+            if identity_changed:
+                has_jobs=self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_jobs'").fetchone()
+                if has_jobs and self.conn.execute("SELECT 1 FROM sync_jobs WHERE camera_id=? AND state='running' LIMIT 1",(slug,)).fetchone():
+                    raise ValueError('Camera has an active SD job; wait before changing its network identity')
+                values.update(identity_status='pending' if values.get('auto_ip',current['auto_ip']) else 'manual',
+                              identity_error=None,identity_checked_at=None,probe_json=None)
             channel=values.get('channel_chat_id',current['channel_chat_id'])
             # A local label belongs to this binding, never to its next target.
             if channel!=current['channel_chat_id'] and 'channel_name' not in values:
@@ -907,7 +954,7 @@ class Archive:
             if values:
                 try:
                     changed=self.conn.execute('UPDATE cameras SET '+','.join(k+'=?' for k in values)+' WHERE id=?',(*values.values(),slug)).rowcount
-                except sqlite3.IntegrityError:raise ValueError('Channel is already assigned to another camera') from None
+                except sqlite3.IntegrityError:raise ValueError('Channel or MAC is already assigned to another camera') from None
             else:
                 changed=self.conn.execute('SELECT 1 FROM cameras WHERE id=?',(slug,)).fetchone() is not None
             if not changed:raise KeyError('Unknown camera')
@@ -948,6 +995,72 @@ class Archive:
         parameters=[time.time()]
         if camera is not None:sql+=' AND r.camera=?';parameters.append(camera)
         return [r['camera'] for r in self.conn.execute(sql+' GROUP BY r.camera ORDER BY first_start,r.camera',parameters)]
+
+    def apply_camera_identity(self, subnet, mappings, observed_at):
+        """Apply one fresh LAN observation without changing archive identities.
+
+        All eligible cameras move in one writer transaction, so a DHCP swap
+        does not deadlock against another camera's old IP. A manual camera or
+        an unresolved bound camera still reserves its configured address.
+        """
+        from .camera_identity import normalize_mac, normalize_subnet
+        subnet=normalize_subnet(subnet)
+        if not subnet or not isinstance(mappings,dict) or len(mappings)>254:
+            raise ValueError('Invalid camera identity observation')
+        now=time.time()
+        if (type(observed_at) not in (int,float) or not math.isfinite(observed_at)
+                or observed_at>now+5 or now-observed_at>120 or observed_at<=0):
+            raise ValueError('Camera identity observation must be fresh')
+        network=ipaddress.IPv4Network(subnet)
+        normalized={}
+        for mac,host in mappings.items():
+            mac=normalize_mac(mac)
+            if not isinstance(host,str):raise ValueError('Invalid observed camera address')
+            try:address=ipaddress.IPv4Address(host)
+            except (ValueError,TypeError):raise ValueError('Invalid observed camera address') from None
+            if not mac or mac in normalized or address not in network or address in (network.network_address,network.broadcast_address):
+                raise ValueError('Invalid or duplicate camera identity')
+            normalized[mac]=str(address)
+        if len(set(normalized.values()))!=len(normalized):
+            raise ValueError('Multiple MAC addresses claim the same camera IP')
+        result={'updated':[],'verified':[],'unresolved':[],'conflicts':[]}
+        with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            rows=[dict(row) for row in self.conn.execute('SELECT * FROM cameras WHERE deleted_at IS NULL')]
+            selected={row['id']:row for row in rows if row['auto_ip'] and row['identity_subnet']==subnet}
+            if any(row['identity_checked_at'] is not None and row['identity_checked_at']>observed_at
+                   for row in selected.values()):
+                raise ValueError('Identity observation older than stored camera identity')
+            plans={slug:normalized[row['mac_address']] for slug,row in selected.items()
+                   if row['mac_address'] in normalized}
+            conflicts=set()
+            # A failed move keeps its old host reserved. Iterate until this
+            # dependency graph stabilizes; only complete DHCP cycles can move.
+            while True:
+                blocked={slug for slug,target in plans.items() if any(
+                    other['id']!=slug and other['host']==target
+                    and (other['id'] not in plans or plans[other['id']]==target)
+                    for other in rows)}
+                if not blocked:break
+                conflicts.update(blocked)
+                for slug in blocked:plans.pop(slug)
+            for slug,row in selected.items():
+                if slug in plans:
+                    target=plans[slug]
+                    if target!=row['host']:result['updated'].append(slug)
+                    result['verified'].append(slug)
+                    self.conn.execute('''UPDATE cameras SET host=?,
+                        probe_json=CASE WHEN host<>? THEN NULL ELSE probe_json END,
+                        identity_status='verified',identity_error=NULL,identity_checked_at=? WHERE id=?''',
+                        (target,target,observed_at,slug))
+                else:
+                    category='conflicts' if slug in conflicts else 'unresolved'
+                    state='conflict' if slug in conflicts else 'not_found'
+                    code='sd_identity_conflict' if slug in conflicts else 'sd_identity_not_found'
+                    result[category].append(slug)
+                    self.conn.execute('''UPDATE cameras SET identity_status=?,identity_error=?,
+                        identity_checked_at=?,probe_json=NULL WHERE id=?''',(state,code,observed_at,slug))
+        return result
 
     def probe_camera(self,slug):
         camera=next((c for c in self.cameras() if c['id']==slug),None)

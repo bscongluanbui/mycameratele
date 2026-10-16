@@ -89,6 +89,7 @@ def main():
     collector.add_argument('--port',type=int,default=int(os.environ.get('COLLECTOR_PORT','8787')))
     ingest=subs.add_parser('ingest');ingest.add_argument('--manifest',required=True);ingest.add_argument('--dry-run',action='store_true')
     subs.add_parser('run');subs.add_parser('health');subs.add_parser('backup')
+    subs.add_parser('lan-identity',help='LAN MAC/IP metadata only; no camera credentials or video transport.')
     routes=subs.add_parser('network-routes',help='Publish host LAN/Tailscale subnet routes; no camera scan or credentials.')
     routes.add_argument('--output',default='/network/subnets.json')
     routes.add_argument('--interval',type=float,default=30)
@@ -106,6 +107,13 @@ def main():
     index_reconcile.add_argument('--type',choices=('root','years','year','month','day','hour'),required=True)
     index_reconcile.add_argument('--period',required=True);index_reconcile.add_argument('--message-id',type=int,required=True)
     args=parser.parse_args()
+    if args.command=='lan-identity':
+        from .lan_identity import serve_identity
+        stop_event=threading.Event()
+        signal.signal(signal.SIGTERM,lambda *_:stop_event.set())
+        signal.signal(signal.SIGINT,lambda *_:stop_event.set())
+        serve_identity(stop=stop_event)
+        return 0
     if args.command=='collector':
         from .sd_collector import serve
         serve(args.host,args.port)

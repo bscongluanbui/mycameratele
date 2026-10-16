@@ -5,6 +5,7 @@
 *.pem
 *.key
 *.token
+secrets/
 
 # Runtime storage / private recordings
 input/*

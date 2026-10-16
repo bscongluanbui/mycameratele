@@ -35,6 +35,58 @@
       if (/^\d+(\.\d+){3}$/.test(value)) return value.split(".").every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255);
       return value.split(".").every(label => label.length > 0 && label.length <= 63 && /^[a-z\d](?:[a-z\d-]*[a-z\d])?$/i.test(label));
     },
+    macAddress(value) {
+      if (typeof value !== "string") throw new Error("Nhập MAC gồm 6 cặp ký tự, ví dụ a0:ff:0c:52:72:f0.");
+      const text = value.trim().toLowerCase();
+      if (!text) return "";
+      if (!/^(?:[a-f0-9]{12}|(?:[a-f0-9]{2}:){5}[a-f0-9]{2}|(?:[a-f0-9]{2}-){5}[a-f0-9]{2})$/.test(text)) throw new Error("MAC cần đủ 6 cặp ký tự, ngăn bằng : hoặc -.");
+      const compact = text.replaceAll(":", "").replaceAll("-", "");
+      if (compact === "000000000000" || (parseInt(compact.slice(0, 2), 16) & 1)) throw new Error("Nhập MAC thiết bị hợp lệ, không dùng MAC multicast hoặc broadcast.");
+      return compact.match(/.{2}/g).join(":");
+    },
+    identityBinding(values) {
+      let mac;
+      try { mac = helpers.macAddress(values.mac_address ?? ""); }
+      catch (error) { return {field: "mac-address", message: error.message}; }
+      const subnet = String(values.identity_subnet ?? "").trim();
+      if (values.auto_ip && !mac) return {field: "mac-address", message: "Nhập MAC camera trước khi bật tự tìm IP."};
+      if (!subnet && !values.auto_ip) return {mac_address: mac, auto_ip: false, identity_subnet: ""};
+      const parts = subnet.split("/"), prefix = Number(parts[1]);
+      if (parts.length !== 2 || !/^\d{2}$/.test(parts[1]) || prefix < 24 || prefix > 30 || !/^\d+(\.\d+){3}$/.test(parts[0]) || !helpers.validHost(parts[0])) return {field: "identity-subnet", message: "Nhập subnet LAN từ /24 đến /30, ví dụ 192.168.2.0/24."};
+      const octets = parts[0].split(".").map(Number), size = 2 ** (32 - prefix);
+      const address = octets.reduce((total, part) => total * 256 + part, 0);
+      const network = Math.floor(address / size) * size;
+      const isPrivate = octets[0] === 10 || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) || (octets[0] === 192 && octets[1] === 168);
+      if (!isPrivate || network !== address || parts[0] !== octets.join(".")) return {field: "identity-subnet", message: "Dùng địa chỉ mạng LAN riêng đúng CIDR, ví dụ 192.168.2.0/24."};
+      if (values.auto_ip) {
+        if (!/^\d+(\.\d+){3}$/.test(values.host || "") || !helpers.validHost(values.host) || values.host !== values.host.split(".").map(Number).join(".")) return {field: "host", message: "Tự tìm IP cần địa chỉ IPv4 hiện tại trong subnet đã chọn."};
+        const host = values.host.split(".").reduce((total, part) => total * 256 + Number(part), 0);
+        if (host <= network || host >= network + size - 1) return {field: "host", message: "IP camera phải nằm trong subnet nhận diện đã chọn."};
+      }
+      return {mac_address: mac, auto_ip: values.auto_ip === true, identity_subnet: subnet};
+    },
+    identityState(camera, now = Date.now()) {
+      if (camera?.auto_ip !== true) return ["IP thủ công", "neutral"];
+      if (camera.identity_status === "verified") {
+        const checked = helpers.checkedMillis(camera.identity_checked_at);
+        if (checked === null) return ["Chờ xác minh MAC", "amber"];
+        if (!Number.isFinite(now) || now - checked > 120000 || now - checked < -5000) return ["MAC cần xác minh lại", "amber"];
+        return ["Đã xác minh MAC", "green"];
+      }
+      const statuses = {not_found: ["Chưa tìm thấy MAC", "amber"], conflict: ["MAC trùng / nhiều IP", "amber"], stale: ["Chờ dữ liệu LAN mới", "amber"], unavailable: ["Chưa xác minh MAC", "amber"], mismatch: ["MAC không khớp", "red"]};
+      return statuses[camera.identity_status] || ["Chờ xác minh MAC", "amber"];
+    },
+    cameraProbe(camera, manual) {
+      const matches = probe => {
+        if (!probe || probe.host !== camera.host) return false;
+        const ports = [camera.device_port || 8000, camera.rtsp_port || 554, camera.http_port || 80];
+        return ports.every(port => Object.hasOwn(probe.tcp || {}, String(port)));
+      };
+      const saved = matches(camera.probe) ? camera.probe : null;
+      if (!matches(manual)) return saved;
+      const manualTime = helpers.checkedMillis(manual.checked_at), savedTime = helpers.checkedMillis(saved?.checked_at);
+      return manualTime !== null && (savedTime === null || manualTime > savedTime) ? manual : saved;
+    },
     status(value) { return STATUS[String(value).toLowerCase()] || [value ? String(value) : "Chưa rõ", "neutral"]; },
     probeState(value) {
       if (value === true || value === "open" || value === "connected") return ["Mở", "green"];
@@ -54,9 +106,9 @@
       return null;
     },
     cameraPatch(original, edited) {
-      const patch = {};
-      for (const key of ["name", "model", "host", "device_port", "rtsp_port", "http_port", "enabled", "upload_enabled", "channel_chat_id", "channel_name", "channel_enabled", "sd_backend", "sd_username", "sd_channel", "sd_timezone", "sd_lookback_hours", "sd_download_threads"]) {
-        if (edited[key] !== undefined && edited[key] !== (key === "sd_download_threads" ? original[key] ?? 1 : original[key])) patch[key] = edited[key];
+      const patch = {}, fallback = {sd_download_threads: 1, mac_address: "", auto_ip: false, identity_subnet: ""};
+      for (const key of ["name", "model", "host", "mac_address", "auto_ip", "identity_subnet", "device_port", "rtsp_port", "http_port", "enabled", "upload_enabled", "channel_chat_id", "channel_name", "channel_enabled", "sd_backend", "sd_username", "sd_channel", "sd_timezone", "sd_lookback_hours", "sd_download_threads"]) {
+        if (edited[key] !== undefined && edited[key] !== (Object.hasOwn(fallback, key) ? original[key] ?? fallback[key] : original[key])) patch[key] = edited[key];
       }
       if (typeof edited.sd_password === "string" && edited.sd_password) patch.sd_password = edited.sd_password;
       if (edited.sd_password_clear === true) patch.sd_password_clear = true;
@@ -226,7 +278,7 @@
     discoveryKnown(result, cameras) {
       return result.existing_camera_id || (Array.isArray(cameras) ? cameras : []).find(camera => String(camera.host || "").toLowerCase() === String(result.host || "").toLowerCase() && Number(camera.device_port || 8000) === Number(result.device_port || 8000))?.id || "";
     },
-    discoveryPayload(result, name, cameras, username = "admin", password = "") {
+    discoveryPayload(result, name, cameras, username = "admin", password = "", binding = {}) {
       if (!helpers.validHost(result.host) || !/^\d+(\.\d+){3}$/.test(result.host)) throw new Error("IP camera chưa hợp lệ. Quét lại dải IP.");
       if (helpers.discoveryKnown(result, cameras)) throw new Error("Camera này đã có trong danh sách.");
       if (!String(name).trim() || String(name).trim().length > 120) throw new Error("Tên camera cần có 1–120 ký tự.");
@@ -236,6 +288,9 @@
       let id = base, suffix = 2;
       while (ids.has(id)) id = `${base}-${suffix++}`;
       const payload = {id, name: String(name).trim(), model: String(result.model || "").slice(0, 100), host: result.host, device_port: result.device_port || 8000, rtsp_port: result.rtsp_port || 554, http_port: result.http_port || 80, enabled: !!password, upload_enabled: true, sd_backend: "auto", sd_username: String(username).trim() || "admin"};
+      const identity = helpers.identityBinding({...binding, host: result.host});
+      if (identity.message) throw Object.assign(new Error(identity.message), {field: identity.field});
+      if (identity.mac_address || identity.auto_ip || identity.identity_subnet) Object.assign(payload, identity);
       if (password) payload.sd_password = password;
       return payload;
     },
@@ -475,8 +530,10 @@
       const top = node("div", "camera-card-top"), symbol = node("div", "camera-symbol"), title = node("div", "camera-card-title"); symbol.append(icon("camera"));
       title.append(node("h3", "", camera.name || camera.id), node("p", "camera-model", camera.model || "Chưa khai báo model"));
       const indicator = node("span", `camera-enabled-indicator${camera.enabled === false ? " off" : ""}`); indicator.setAttribute("aria-hidden", "true"); top.append(symbol, title, indicator);
-      const info = node("div", "camera-info"), summary = probeSummary(state.probes.get(camera.id) || camera.probe);
+      const info = node("div", "camera-info"), summary = probeSummary(helpers.cameraProbe(camera, state.probes.get(camera.id)));
       info.append(infoRow("Địa chỉ LAN", camera.host || "Chưa khai báo", true), infoRow("Mã camera", camera.id, true), infoRow("Kết nối", chip(...summary)), infoRow("Cấu hình", chip(camera.enabled === false ? "Đã tạm dừng" : "Đang bật", camera.enabled === false ? "neutral" : "green")));
+      if (camera.mac_address) info.append(infoRow("MAC", camera.mac_address, true));
+      if (camera.auto_ip) info.append(infoRow("Nhận diện IP", chip(...helpers.identityState(camera))));
       const total = helpers.cameraCount(camera, "total"), uploaded = helpers.cameraCount(camera, "uploaded");
       info.append(infoRow("Video / Đã lưu", `${displayCount(total)} / ${displayCount(uploaded)}`));
       info.append(infoRow("Luồng tải SD", `${camera.sd_download_threads ?? 1} file / camera`));
@@ -765,15 +822,27 @@
         const nameField = node("div", "field"), nameLabel = node("label", "", `Tên camera · ${result.host}`), nameInput = node("input");
         nameInput.id = `discovery-name-${result.host.replaceAll(".", "-")}`; nameInput.value = choice.name; nameInput.maxLength = 120; nameLabel.htmlFor = nameInput.id;
         nameField.append(nameLabel, nameInput);
+        const bindingGrid = node("div", "form-grid"), macField = node("div", "field"), macLabel = node("label", "", "MAC camera (tùy chọn)"), macInput = node("input");
+        macInput.id = `discovery-mac-${result.host.replaceAll(".", "-")}`; macInput.value = choice.mac_address; macInput.maxLength = 17; macInput.placeholder = "a0:ff:0c:52:72:f0"; macInput.autocomplete = "off"; macInput.spellcheck = false; macLabel.htmlFor = macInput.id;
+        const subnetField = node("div", "field"), subnetLabel = node("label", "", "Subnet nhận diện"), subnetInput = node("input");
+        subnetInput.id = `discovery-identity-subnet-${result.host.replaceAll(".", "-")}`; subnetInput.value = choice.identity_subnet; subnetInput.maxLength = 18; subnetInput.placeholder = "192.168.2.0/24"; subnetInput.spellcheck = false; subnetLabel.htmlFor = subnetInput.id;
+        macField.append(macLabel, macInput); subnetField.append(subnetLabel, subnetInput); bindingGrid.append(macField, subnetField);
+        const autoLabel = node("label", "checkbox-control"), autoInput = node("input"); autoInput.type = "checkbox"; autoInput.checked = choice.auto_ip;
+        autoInput.setAttribute("aria-label", `Tự tìm IP theo MAC cho ${result.host}`); autoLabel.append(autoInput, node("span", "", "Tự tìm IP theo MAC sau khi đổi IP"));
         const ports = node("p", "field-hint", `Cổng mở: ${(Array.isArray(result.ports) ? result.ports : []).join(", ") || "—"}`), status = node("p", "discovery-result-status small"); status.setAttribute("role", "status");
-        row.append(top, identity, ports, nameField, status); target.append(row);
+        status.id = `discovery-binding-status-${result.host.replaceAll(".", "-")}`; macInput.setAttribute("aria-describedby", status.id); subnetInput.setAttribute("aria-describedby", status.id);
+        row.append(top, identity, ports, nameField, bindingGrid, autoLabel, status); target.append(row);
         check.addEventListener("change", () => { choice.selected = check.checked; discoveryControls(); });
         nameInput.addEventListener("input", () => { choice.name = nameInput.value; });
-        choice.element = row; choice.check = check; choice.nameInput = nameInput; choice.status = status;
+        macInput.addEventListener("input", () => { choice.mac_address = macInput.value; choice.macEdited = true; macInput.removeAttribute("aria-invalid"); });
+        subnetInput.addEventListener("input", () => { choice.identity_subnet = subnetInput.value; subnetInput.removeAttribute("aria-invalid"); });
+        autoInput.addEventListener("change", () => { choice.auto_ip = autoInput.checked; });
+        choice.element = row; choice.check = check; choice.nameInput = nameInput; choice.macInput = macInput; choice.subnetInput = subnetInput; choice.autoInput = autoInput; choice.status = status;
       }
       choice.check.checked = !!choice.selected && !known && !choice.added;
       choice.check.disabled = !!known || choice.added || state.discovery.adding;
       choice.nameInput.disabled = !!known || choice.added || state.discovery.adding;
+      for (const input of [choice.macInput, choice.subnetInput, choice.autoInput]) input.disabled = !!known || choice.added || state.discovery.adding;
       choice.status.textContent = choice.error || (choice.added ? "Đã thêm" : known ? `Đã cấu hình · ${cameraName(known)}` : "");
       choice.status.classList.toggle("error-text", !!choice.error);
       choice.status.hidden = !choice.status.textContent;
@@ -792,8 +861,19 @@
     for (const result of Array.isArray(scan.results) ? scan.results : []) {
       if (!result?.host) continue;
       const previous = state.discovery.choices.get(result.host);
-      if (previous) previous.result = result;
-      else state.discovery.choices.set(result.host, {result, name: `${result.model || "Camera"} ${result.host}`, selected: false, added: false, error: ""});
+      if (previous) {
+        previous.result = result;
+        if (!previous.macEdited && !previous.mac_address && result.mac_address) {
+          try { previous.mac_address = helpers.macAddress(result.mac_address); if (previous.macInput) previous.macInput.value = previous.mac_address; }
+          catch (_) { /* Invalid observer metadata never becomes a saved binding. */ }
+        }
+      }
+      else {
+        let mac = ""; try { mac = helpers.macAddress(result.mac_address || ""); } catch (_) { /* Keep manual entry available. */ }
+        const candidateSubnet = String(scan.target || "").includes("/") ? String(scan.target) : "";
+        const binding = helpers.identityBinding({host: result.host, identity_subnet: candidateSubnet});
+        state.discovery.choices.set(result.host, {result, name: `${result.model || "Camera"} ${result.host}`, mac_address: mac, macEdited: false, auto_ip: false, identity_subnet: binding.message ? "" : candidateSubnet, selected: false, added: false, error: ""});
+      }
     }
     $("discovery-progress-label").textContent = `${scanned.toLocaleString("vi-VN")} / ${total.toLocaleString("vi-VN")} IP · ${state.discovery.choices.size} camera / ứng viên · ${scan.target || ""}`;
     $("discovery-empty").textContent = scan.state === "cancelled" ? "Đã dừng quét. Bạn có thể quét lại hoặc đổi dải IP." : "Chưa phát hiện camera. Kiểm tra subnet route và dải IP.";
@@ -875,11 +955,14 @@
     const username = $("discovery-sd-username").value.trim() || "admin", password = $("discovery-sd-password").value;
     discoveryError("");
     for (const choice of selected) {
-      try { helpers.discoveryPayload(choice.result, choice.name, state.cameras, username, password); }
+      try { helpers.discoveryPayload(choice.result, choice.name, state.cameras, username, password, choice); }
       catch (error) {
+        choice.error = error.message; renderDiscoveryResults();
         discoveryError(error.message);
         if (!String(choice.name).trim() || String(choice.name).trim().length > 120) choice.nameInput.focus();
         else if (!helpers.validSdPassword(password)) $("discovery-sd-password").focus();
+        else if (error.field === "mac-address") { choice.macInput.setAttribute("aria-invalid", "true"); choice.macInput.focus(); }
+        else if (error.field === "identity-subnet" || error.field === "host") { choice.subnetInput.setAttribute("aria-invalid", "true"); choice.subnetInput.focus(); }
         else $("discovery-error").focus();
         return;
       }
@@ -891,7 +974,7 @@
       if (!state.authenticated || revision !== d.revision || session !== state.sessionRevision) break;
       $("discovery-add-status").textContent = `Đang thêm ${added + failed + existing + 1} / ${selected.length} camera…`;
       try {
-        const payload = helpers.discoveryPayload(choice.result, choice.name, state.cameras, username, password);
+        const payload = helpers.discoveryPayload(choice.result, choice.name, state.cameras, username, password, choice);
         await api("/api/cameras", {method: "POST", body: {...payload, discovery_scan_id: d.scan.id}});
         if (revision !== d.revision || session !== state.sessionRevision) break;
         // Retain only non-secret camera metadata in browser state.
@@ -972,6 +1055,7 @@
     if (camera) $("camera-id").removeAttribute("pattern");
     else $("camera-id").setAttribute("pattern", "[a-z0-9][a-z0-9_\\-]{0,63}");
     $("camera-name").value = camera?.name || ""; $("camera-model").value = camera?.model || ""; $("camera-host").value = camera?.host || "";
+    $("camera-mac-address").value = camera?.mac_address || ""; $("camera-auto-ip").checked = camera?.auto_ip === true; $("camera-identity-subnet").value = camera?.identity_subnet || "";
     for (const [name, fallback] of [["device_port", 8000], ["rtsp_port", 554], ["http_port", 80]]) $("camera-" + name.replaceAll("_", "-")).value = camera?.[name] || fallback;
     $("camera-enabled").checked = camera?.enabled !== false;
     $("camera-upload-enabled").checked = helpers.uploadEnabled(camera);
@@ -999,6 +1083,9 @@
     if ($("camera-sd-password-clear").checked) data.sd_password_clear = true;
     for (const name of ["device_port", "rtsp_port", "http_port"]) data[name] = Number(values.get(name));
     const errorBox = $("camera-form-error"); clearFormError($("camera-form"), errorBox);
+    const binding = helpers.identityBinding({host: data.host, mac_address: $("camera-mac-address").value, auto_ip: $("camera-auto-ip").checked, identity_subnet: $("camera-identity-subnet").value});
+    if (binding.message) { formError($("camera-form"), errorBox, binding.message, "camera-" + binding.field); return; }
+    Object.assign(data, binding);
     if (![1, 2].includes(data.sd_download_threads)) { formError($("camera-form"), errorBox, "Chọn 1 hoặc 2 file tải SD cùng lúc cho camera.", "camera-sd-download-threads"); return; }
     try { data.channel_chat_id = helpers.channelId($("camera-channel-chat-id").value); }
     catch (error) { formError($("camera-form"), errorBox, error.message, "camera-channel-chat-id"); return; }
@@ -1018,7 +1105,7 @@
         const patch = helpers.cameraPatch(original, data);
         if (!Object.keys(patch).length) { $("camera-dialog").close(); toast("Không có thay đổi để lưu."); return; }
         await api(`/api/cameras/${encodeURIComponent(state.editing)}`, { method: "PATCH", body: patch });
-        if (["host", "device_port", "rtsp_port", "http_port"].some(key => key in patch)) state.probes.delete(state.editing);
+        if (["host", "device_port", "rtsp_port", "http_port", "mac_address", "auto_ip", "identity_subnet"].some(key => key in patch)) state.probes.delete(state.editing);
       }
       else await api("/api/cameras", { method: "POST", body: data });
       $("camera-sd-password").value = ""; $("camera-dialog").close(); await refresh(); toast(wasEditing ? "Đã cập nhật camera. Mã và lịch sử video được giữ nguyên." : data.enabled ? "Đã thêm camera và gửi Start vào hàng đợi. Theo dõi tiến trình đồng bộ." : "Đã thêm camera ở trạng thái tạm dừng. Bật camera trước khi Start.");
