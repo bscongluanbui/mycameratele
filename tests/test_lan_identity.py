@@ -111,11 +111,15 @@ class NetlinkTests(unittest.TestCase):
         self.assertEqual(rows, [{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 0.5}])
 
     def test_filters_stale_failed_permanent_proxy_and_wrong_scope(self):
-        payloads = [neighbor(state=value) for value in (1, 4, 8, 16, 32, 64, 128)]
+        payloads = [neighbor(state=value) for value in (1, 4, 16, 32, 64, 128)]
         payloads += [neighbor(index=3), neighbor(flags=8), neighbor(kind=2), neighbor(family=socket.AF_INET6),
                      neighbor(host='192.168.3.7'), neighbor(host='192.168.2.0'), neighbor(host='192.168.2.255'),
-                     neighbor(age=20), neighbor(mac='00:00:00:00:00:00'), neighbor(mac='ff:ff:ff:ff:ff:ff')]
+                     neighbor(age=121), neighbor(mac='00:00:00:00:00:00'), neighbor(mac='ff:ff:ff:ff:ff:ff')]
         self.assertEqual(self.collect([(28, raw, 2, 0) for raw in payloads] + [(3, b'\0' * 4, 2, 0)]), [])
+
+    def test_delay_with_older_confirmed_counter_is_candidate_not_proof(self):
+        rows = self.collect([(28, neighbor(state=8, age=20), 2, 0), (3, b'\0' * 4, 2, 0)])
+        self.assertEqual(rows, [{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 20}])
 
     def test_other_sequence_is_ignored(self):
         self.assertEqual(self.collect([(28, neighbor(), 2, 1), (3, b'\0' * 4, 2, 0)]), [])
@@ -157,7 +161,7 @@ class ScanTests(unittest.TestCase):
     def test_successful_tcp_and_fresh_netlink_are_both_required(self):
         result = self.scan([{'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 0.01},
                             {'host': '192.168.2.4', 'mac': '02:ab:cd:ef:01:08', 'confirmed_age': 0.01}])
-        self.assertEqual(result['records'], [{'host': '192.168.2.3', 'mac': MAC, 'observed_at': 999.99, 'evidence': 'tcp+netlink'}])
+        self.assertEqual(result['records'], [{'host': '192.168.2.3', 'mac': MAC, 'observed_at': 1000, 'evidence': 'tcp+netlink'}])
         self.assertEqual((result['version'], result['subnet'], result['interface'], result['observed_at']),
                          (1, '192.168.2.0/29', 'eth0', 1000))
         self.assertEqual(len(result['scan_id']), 32)
@@ -179,7 +183,7 @@ class ScanTests(unittest.TestCase):
     def test_invalid_old_overscope_or_multicast_identity_is_ignored(self):
         rows = [None, {}, {'host': '192.168.3.3', 'mac': MAC, 'confirmed_age': 0},
                 {'host': '192.168.2.3', 'mac': 'ff:ff:ff:ff:ff:ff', 'confirmed_age': 0},
-                {'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 100},
+                {'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 121},
                 {'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': float('nan')},
                 {'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': True}]
         self.assertEqual(self.scan(rows)['records'], [])
@@ -187,6 +191,12 @@ class ScanTests(unittest.TestCase):
     def test_routed_subnet_is_not_treated_as_directly_attached(self):
         with self.assertRaisesRegex(ValueError, 'directly attached'):
             self.scan([], config=ObserverConfig(TOKEN, subnet='192.168.3.0/24'))
+
+    def test_old_delay_counter_uses_current_tcp_timestamp(self):
+        row = {'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 20}
+        result = self.scan([row])
+        self.assertEqual(result['records'][0]['observed_at'], 1000)
+        self.assertEqual(self.scan([row], probe=lambda *_: False)['records'], [])
 
     def test_workers_and_scope_are_bounded(self):
         lock, active, peak, calls = threading.Lock(), [0], [0], []
@@ -361,7 +371,23 @@ class VerificationTests(unittest.TestCase):
         stop.wait = Mock(return_value=False)
         with patch('archive_app.lan_identity.threading.Event', return_value=stop):
             self.assertFalse(self.verify(probe=lambda *_: False)['verified'])
-            self.assertFalse(self.verify(rows=[{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 6}])['verified'])
+            self.assertFalse(self.verify(rows=[{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 121}])['verified'])
+
+    def test_confirmed_age_twenty_seconds_is_valid_with_current_tcp(self):
+        result = self.verify(rows=[{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 20}])
+        self.assertTrue(result['verified'])
+        self.assertEqual(result['observed_at'], 1000)
+
+    def test_mac_change_between_before_and_after_dump_fails_closed(self):
+        before = [{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 20}]
+        after = [{'host': '192.168.2.7', 'mac': '02:ab:cd:ef:01:08', 'confirmed_age': 0}]
+        lookup = lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24'))
+        dump = Mock(side_effect=[before, after])
+        result = verify_identity(ObserverConfig(TOKEN), '192.168.2.7', MAC,
+                                 probe=lambda *_: True, neighbors=dump, interface_lookup=lookup)
+        self.assertFalse(result['verified'])
+        self.assertEqual(result['mac'], '')
+        self.assertEqual(dump.call_count, 2)
 
 
 class StateTests(unittest.TestCase):

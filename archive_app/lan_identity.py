@@ -1,8 +1,8 @@
 """Small, read-only LAN identity observer; it never opens or transfers media.
 
 Run in the LAN host network namespace without Linux capabilities.  A successful
-TCP connection and a freshly confirmed neighbour entry must agree before an
-IP/MAC pair is published.  Cached ARP rows alone are deliberately insufficient.
+TCP connection and a bounded-age neighbour entry must agree before an IP/MAC
+pair is published.  Cached ARP rows alone are deliberately insufficient.
 """
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -96,7 +96,7 @@ def _parse_neighbor(payload, index, network, max_age, ticks):
     if len(payload) < _NEIGH_HEADER.size:
         raise ValueError('Malformed neighbour message')
     family, _, _, ifindex, state, flags, kind = _NEIGH_HEADER.unpack_from(payload)
-    if family != socket.AF_INET or ifindex != index or state != 2 or flags & 8 or kind != 1:
+    if family != socket.AF_INET or ifindex != index or state not in (2, 8) or flags & 8 or kind != 1:
         return None
     attrs = dict(_attributes(payload[_NEIGH_HEADER.size:]))
     address, hardware, cache = attrs.get(1), attrs.get(2), attrs.get(3)
@@ -117,8 +117,12 @@ def _parse_neighbor(payload, index, network, max_age, ticks):
     return {'host': str(host), 'mac': mac, 'confirmed_age': age}
 
 
-def collect_neighbors(interface, subnet, *, max_age=16, timeout=2, socket_factory=None, if_index=None, ticks=None, monotonic=None):
-    """Bounded RTM_GETNEIGH dump; no raw Ethernet socket or net-admin is used."""
+def collect_neighbors(interface, subnet, *, max_age=120, timeout=2, socket_factory=None, if_index=None, ticks=None, monotonic=None):
+    """Read bounded-age candidates; callers still require a current TCP proof.
+
+    DELAY follows use of a stale-but-valid cache entry.  A short TCP handshake
+    does not necessarily refresh its confirmed counter before the ARP timer.
+    """
     if not hasattr(socket, 'AF_NETLINK'):
         raise OSError('Linux neighbour discovery is unavailable')
     network = ipaddress.IPv4Network(subnet, strict=False)
@@ -194,7 +198,7 @@ def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lo
     if not network.subnet_of(attached) or ipaddress.IPv4Address(local_address) not in attached:
         raise ValueError('Configured subnet is not directly attached to the LAN interface')
     hosts = iter(str(host) for host in network.hosts() if str(host) != local_address)
-    connected, pending, exhausted = set(), {}, False
+    connected, pending, exhausted = {}, {}, False
     with ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix='lan-identity-probe') as pool:
         while not stop.is_set() and monotonic() - started < config.scan_timeout - 2 - config.probe_timeout:
             while not exhausted and len(pending) < config.workers:
@@ -209,13 +213,12 @@ def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lo
             for future in completed:
                 host = pending.pop(future)
                 if future.result() is True:
-                    connected.add(host)
+                    connected[host] = clock()
         for future in pending:
             future.cancel()
     if stop.is_set():
         return None
-    elapsed = monotonic() - started
-    rows = (neighbors or collect_neighbors)(config.interface, config.subnet, max_age=elapsed + 1)
+    rows = (neighbors or collect_neighbors)(config.interface, config.subnet, max_age=120)
     if not isinstance(rows, list) or len(rows) > 1024:
         raise ValueError('Invalid neighbour snapshot')
     validated = []
@@ -230,7 +233,7 @@ def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lo
         age = row.get('confirmed_age')
         if host not in network or host in (network.network_address, network.broadcast_address):
             continue
-        if isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age) or not 0 <= age <= elapsed + 1:
+        if isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age) or not 0 <= age <= 120:
             continue
         validated.append({'host': str(host), 'mac': mac, 'confirmed_age': age})
     rows = validated
@@ -243,11 +246,11 @@ def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lo
     conflicting_hosts = {host for host, values in by_host.items() if len(values) != 1}
     conflicting_macs = {mac for mac, values in by_mac.items() if len(values) != 1}
     for row in rows:
-        host, mac, age = row['host'], row['mac'], row['confirmed_age']
+        host, mac = row['host'], row['mac']
         if host not in connected or host in conflicting_hosts or mac in conflicting_macs:
             continue
         if not any(item['host'] == host for item in records):
-            records.append({'host': host, 'mac': mac, 'observed_at': observed - age, 'evidence': 'tcp+netlink'})
+            records.append({'host': host, 'mac': mac, 'observed_at': connected[host], 'evidence': 'tcp+netlink'})
     return {'version': 1, 'subnet': config.subnet, 'interface': config.interface,
             'observed_at': observed, 'scan_id': uuid.uuid4().hex,
             'records': sorted(records, key=lambda item: int(ipaddress.IPv4Address(item['host']))),
@@ -266,16 +269,13 @@ def verify_identity(config, host, mac, *, stop=None, probe=None, neighbors=None,
     if not network.subnet_of(attached) or ipaddress.IPv4Address(local_address) not in attached or str(address) == local_address:
         raise ValueError('Verification requires a directly attached LAN host')
     stop, clock, monotonic = stop or threading.Event(), clock or time.time, monotonic or time.monotonic
-    deadline, actual, verified = monotonic() + 3, '', False
-    for _ in range(4):
+    deadline, actual, verified, proof_at = monotonic() + 3, '', False, None
+
+    def proof():
         remaining = deadline - monotonic()
-        if stop.is_set() or remaining <= 0.1:
-            break
-        connected = (probe or _probe)(str(address), local_address, min(0.5, remaining)) is True
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            break
-        rows = (neighbors or collect_neighbors)(config.interface, config.subnet, max_age=5, timeout=min(1, remaining))
+        if remaining <= 0.05:
+            return None
+        rows = (neighbors or collect_neighbors)(config.interface, config.subnet, max_age=120, timeout=min(0.5, remaining))
         found, mac_hosts = set(), {}
         if not isinstance(rows, list) or len(rows) > 1024:
             raise ValueError('Invalid neighbour snapshot')
@@ -283,7 +283,7 @@ def verify_identity(config, host, mac, *, stop=None, probe=None, neighbors=None,
             if not isinstance(row, dict):
                 continue
             age = row.get('confirmed_age')
-            if isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age) or not 0 <= age <= 5:
+            if isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age) or not 0 <= age <= 120:
                 continue
             try:
                 row_host = ipaddress.IPv4Address(row.get('host', ''))
@@ -295,15 +295,35 @@ def verify_identity(config, host, mac, *, stop=None, probe=None, neighbors=None,
             mac_hosts.setdefault(row_mac, set()).add(str(row_host))
             if row_host == address:
                 found.add(row_mac)
-        if len(found) == 1 and connected:
-            actual = found.pop()
-            verified = actual == expected and len(mac_hosts[actual]) == 1
-            if len(mac_hosts[actual]) != 1:
-                actual = ''
+        return found, mac_hosts
+
+    for _ in range(4):
+        if stop.is_set() or deadline - monotonic() <= 0.1:
             break
-        if len(found) > 1 or stop.wait(min(0.2, max(0, deadline - monotonic()))):
+        before = proof()
+        remaining = deadline - monotonic()
+        if before is None or remaining <= 0.05:
             break
-    return {'version': 1, 'host': str(address), 'mac': actual, 'verified': verified, 'observed_at': clock()}
+        connected = (probe or _probe)(str(address), local_address, min(0.5, remaining)) is True
+        if connected:
+            proof_at = clock()
+        after = proof()
+        if after is None:
+            break
+        old_macs, old_hosts = before
+        new_macs, new_hosts = after
+        if len(old_macs) > 1 or len(new_macs) > 1 or (old_macs and new_macs and old_macs != new_macs):
+            break
+        if len(old_macs) == len(new_macs) == 1 and connected:
+            candidate = next(iter(new_macs))
+            if len(old_hosts[candidate]) != 1 or len(new_hosts[candidate]) != 1:
+                break
+            actual, verified = candidate, candidate == expected
+            break
+        if stop.wait(min(0.2, max(0, deadline - monotonic()))):
+            break
+    return {'version': 1, 'host': str(address), 'mac': actual, 'verified': verified,
+            'observed_at': proof_at if proof_at is not None else clock()}
 
 
 class IdentityState:
