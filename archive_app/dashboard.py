@@ -16,7 +16,7 @@ from .core import Archive,CameraBusyError,CameraIDReservedError
 from .dashboard_auth import DashboardAuth
 from .discovery import DiscoveryManager
 from .network_routes import load_subnets
-from .camera_identity import CameraIdentityError, public_snapshot
+from .camera_identity import CameraIdentityError, normalize_mac, public_snapshot
 from .sync import SyncQueue
 from .telegram import Telegram,ApiRejected,ChannelCheckError
 from .channel_directory import ChannelDirectory
@@ -145,6 +145,44 @@ class DashboardHandler(BaseHTTPRequestHandler):
             result['results'].append({**candidate,'mac_address':metadata.get(address,''),
                 'existing_camera_id':existing.get((address,candidate['device_port']))})
         return result
+
+    def camera_identity_overlay(self,cameras):
+        """Present fresh LAN metadata without rewriting bindings on a GET.
+
+        SD login/download retain their independent strict identity guards.
+        In particular, a fresh observer does not erase a catalog IP conflict.
+        """
+        if not any(camera.get('auto_ip') for camera in cameras):return cameras
+        try:
+            snapshot=public_snapshot(self.server.settings)
+            if not snapshot.get('configured'):
+                raise CameraIdentityError('sd_identity_unconfigured')
+            observed={row['mac']:row for row in snapshot['records']}
+            error=None
+        except Exception:
+            snapshot={};observed={};error='sd_identity_unavailable'
+        results=[]
+        for camera in cameras:
+            item=dict(camera)
+            if not item.get('auto_ip') or item.get('identity_status')=='conflict':
+                results.append(item);continue
+            if error:
+                item.update(identity_status='unavailable',identity_error=error)
+            elif item.get('identity_subnet')!=snapshot.get('subnet'):
+                item.update(identity_status='unavailable',identity_error='sd_identity_subnet')
+            else:
+                try:proof=observed.get(normalize_mac(item.get('mac_address','')))
+                except ValueError:proof=None
+                if proof is None:
+                    item.update(identity_status='not_found',identity_error='sd_identity_not_found')
+                elif proof['host']!=item.get('host'):
+                    item.update(identity_status='stale',identity_error='sd_identity_changed',
+                                identity_checked_at=proof['observed_at'])
+                else:
+                    item.update(identity_status='verified',identity_error=None,
+                                identity_checked_at=proof['observed_at'])
+            results.append(item)
+        return results
 
     def add_camera(self,archive,data,actor):
         """Normal manual adds remain unchanged; discovered selections deduplicate."""
@@ -329,7 +367,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     response=(200,status)
                 elif path=='/api/cameras' and method=='GET':
                     sync=SyncQueue(archive).status()
-                    response=(200,{'cameras':[{**camera,'sync':sync['latest'].get(camera['id'])} for camera in archive.cameras()],
+                    cameras=self.camera_identity_overlay(archive.cameras())
+                    response=(200,{'cameras':[{**camera,'sync':sync['latest'].get(camera['id'])} for camera in cameras],
                                    'worker_alive':sync['worker_alive'],
                                    'multi_channel_routing':self.server.settings.multi_channel_routing,
                                    'channel_index_enabled':self.server.settings.channel_index_enabled})

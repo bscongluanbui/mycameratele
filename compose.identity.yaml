@@ -24,10 +24,10 @@ services:
     pids_limit: 64
     stop_grace_period: 20s
     healthcheck:
-      test: [CMD, python, -c, "import os,urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://'+os.environ['LAN_IDENTITY_BIND']+':'+os.environ['LAN_IDENTITY_PORT']+'/health',timeout=3).read()"]
+      test: [CMD, python, -S, -c, "import os,socket; s=socket.create_connection((os.environ['LAN_IDENTITY_BIND'],int(os.environ['LAN_IDENTITY_PORT'])),3); n=bytes([13,10]); s.sendall(b'GET /health HTTP/1.0'+n+b'Host: localhost'+n+n); assert s.recv(128).split(b' ',2)[1]==b'200'; s.close()"]
       interval: 30s
-      timeout: 5s
-      start_period: 20s
+      timeout: 15s
+      start_period: 40s
       retries: 3
     logging:
       driver: json-file
