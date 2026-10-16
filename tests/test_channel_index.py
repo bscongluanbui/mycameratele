@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import unittest
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
 

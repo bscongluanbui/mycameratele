@@ -116,17 +116,6 @@
       if (code.includes("unreachable") || code.includes("connect") || code.includes("timeout") || code.includes("network")) return "Kiểm tra VPS nhận subnet route Tailscale từ Armbian và truy cập được IP LAN của camera. Camera không có HTTP / ISAPI cần SDK tương thích qua cổng Device.";
       return "";
     },
-    syncStatistics(job) {
-      const labels = { sd_searched: "Tìm thấy SD", sd_found: "Tìm thấy SD", sd_downloaded: "Đã tải SD", sd_imported: "Đã nhập SD", imported: "Đã nhập", uploaded: "Đã upload", pending: "Chờ upload", failed: "Lỗi", already_known: "Đã có" };
-      return Object.entries(job?.statistics || {}).filter(([key, value]) => labels[key] && typeof value === "number" && Number.isFinite(value) && value >= 0).map(([key, value]) => `${labels[key]}: ${value}`).join(" · ");
-    },
-    syncUpdated(job, now = Date.now()) {
-      const updated = helpers.checkedMillis(job?.updated_at);
-      if (updated === null || !Number.isFinite(now) || !Number.isFinite(new Date(updated).getTime())) return "";
-      const seconds = Math.max(0, Math.floor((now - updated) / 1000));
-      const age = seconds < 60 ? `${seconds} giây` : seconds < 3600 ? `${Math.floor(seconds / 60)} phút` : `${Math.floor(seconds / 3600)} giờ`;
-      return `Cập nhật ${age} trước · ${new Date(updated).toLocaleString("vi-VN")}`;
-    },
     syncSummary(latest) {
       const jobs = Object.values(latest || {});
       const running = jobs.filter(job => job?.state === "running").length;

@@ -297,7 +297,7 @@ class RemuxCopyTests(unittest.TestCase):
         before=dict(self.archive.conn.execute('SELECT * FROM recordings WHERE key=?',(row['key'],)).fetchone())
         self.settings.min_free_bytes=1024
         low=SimpleNamespace(free=raw.stat().st_size*2+1023)
-        with patch('archive_app.core.shutil.disk_usage',return_value=low), patch('archive_app.core.subprocess.run',side_effect=AssertionError('No remux when disk headroom is low')):
+        with patch('archive_app.pipeline_runtime.shutil.disk_usage',return_value=low), patch('archive_app.core.subprocess.run',side_effect=AssertionError('No remux when disk headroom is low')):
             self.assertEqual(self.archive.remux_pending_cache(),{'converted':0,'failed':0,'budget_blocked':1})
         after=dict(self.archive.conn.execute('SELECT * FROM recordings WHERE key=?',(row['key'],)).fetchone())
         self.assertEqual(before,after)

@@ -2,7 +2,6 @@
 
 Fixtures are synthetic. No Telegram or camera network calls are performed.
 """
-import json
 import os
 from pathlib import Path
 import shutil

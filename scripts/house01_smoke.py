@@ -1,5 +1,5 @@
 """Synthetic House01 stream-copy/channel lifecycle; never real Telegram posts."""
-import hashlib,json,os,platform,subprocess,tempfile
+import hashlib,json,platform,subprocess,tempfile
 from pathlib import Path
 from unittest.mock import patch
 from archive_app.core import Archive,Settings

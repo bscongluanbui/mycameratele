@@ -11,7 +11,7 @@ import urllib.parse
 import uuid
 
 from archive_app.core import Archive, Settings
-from archive_app.telegram_player import (PlayerDenied, PlayerUnavailable,
+from archive_app.telegram_player import (PlayerDenied,
                                         RangeRejected, TelegramPlayer, byte_range)
 
 

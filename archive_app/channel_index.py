@@ -334,20 +334,6 @@ class ChannelIndex:
             return self._link('🤖 Bot quản lý', f'https://t.me/{username}')
         return None
 
-    def _recent_periods(self, camera, channel, kind, limit):
-        """Ready, nonempty periods only; the full history stays in the tree."""
-        rows = self.conn.execute('''SELECT period_key FROM channel_index_messages
-            WHERE camera_id=? AND channel_chat_id=? AND index_type=? AND state='ready'
-            AND tg_message_id BETWEEN 1 AND 2147483647 ORDER BY period_key DESC''',
-            (camera, channel, kind))
-        result = []
-        for row in rows:
-            if self._count(camera, channel, kind, row[0]):
-                result.append(row[0])
-                if len(result) == limit:
-                    break
-        return result
-
     def refresh_navigation(self):
         """Queue existing indexes once per upgrade/local day, including paused cameras.
 

@@ -1,9 +1,7 @@
 """House01 storage channels, safe copy fallback and multipart Local API."""
-import io
 from dataclasses import replace
 from contextlib import closing
 import json
-import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tempfile

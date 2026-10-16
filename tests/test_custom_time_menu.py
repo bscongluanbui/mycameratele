@@ -1,5 +1,4 @@
 """Custom date ranges are viewer-bound, frozen, and require no media I/O."""
-import json
 from datetime import datetime
 import unittest
 from unittest.mock import patch

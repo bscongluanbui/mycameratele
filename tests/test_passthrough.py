@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from archive_app.core import Archive, Settings, normalize, record_key
+from archive_app.core import Archive, Settings, normalize
 from archive_app.sd_source import SDSource
 
 

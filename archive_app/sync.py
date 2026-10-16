@@ -510,7 +510,7 @@ class SyncQueue:
                 return
         self._progress(job, statistics, 'sd_search', 'Đang tìm và tải recording SD của camera')
         try:
-            from .sd_source import SDSource, SDSourceError
+            from .sd_source import SDSource
             last_imported=0
             def sd_progress(snapshot):
                 nonlocal last_imported

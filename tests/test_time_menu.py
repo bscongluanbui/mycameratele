@@ -3,7 +3,6 @@ from datetime import datetime
 import hashlib
 import os
 from pathlib import Path
-import re
 import shutil
 import tempfile
 import unittest

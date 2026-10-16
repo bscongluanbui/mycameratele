@@ -1,6 +1,5 @@
 """Download bandwidth controls and live bytes never change recording contents."""
 import ctypes as C
-from datetime import timedelta
 import io
 import json
 import os
@@ -8,7 +7,6 @@ from pathlib import Path
 import queue
 import sys
 import tempfile
-import time
 import unittest
 from unittest.mock import Mock, patch
 

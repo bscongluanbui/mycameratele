@@ -1,7 +1,6 @@
 """Bot integration: direct player buttons, day ranges and queued all-page sends."""
 import json
 import unittest
-from unittest.mock import patch
 
 import test_bot_controls as fixtures
 from archive_app.telegram_menu import TimeMenus

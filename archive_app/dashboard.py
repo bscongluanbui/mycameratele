@@ -12,7 +12,7 @@ import ssl
 import threading
 import time
 
-from .core import Archive,Settings,CameraBusyError,CameraIDReservedError
+from .core import Archive,CameraBusyError,CameraIDReservedError
 from .dashboard_auth import DashboardAuth
 from .discovery import DiscoveryManager
 from .network_routes import load_subnets

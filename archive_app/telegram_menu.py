@@ -255,8 +255,6 @@ class TimeMenus:
             start_ms, end_ms = (anchor - 6 * 3600) * 1000, anchor * 1000
             if start_ms < 0:
                 raise ValueError('Invalid time-menu window')
-            start = from_epoch_ms(start_ms, zone)
-            end = selected
         else:
             # Construct local calendar midnights rather than assume all days
             # have 86,400 elapsed seconds in zones with daylight saving time.

@@ -89,7 +89,7 @@ class Telegram:
     def _keyboard_state_key(self,actor):
         return f'telegram_keyboard_removed_v1:{actor}:'+hashlib.sha256(self.settings.token.encode()).hexdigest()[:12]
 
-    def ensure_keyboard(self, archive, actor, *, force=False):
+    def ensure_keyboard(self, archive, actor):
         """Retire the old persistent mother keyboard once per viewer/token."""
         archive._archive_actor(actor)
         name=self._keyboard_state_key(actor)
@@ -227,10 +227,6 @@ class Telegram:
     def viewers(self):
         return {value for value in (*self.settings.allowed_users,self.owner)
                 if type(value) is int and value > 0}
-
-    @staticmethod
-    def play_callback(row):
-        return 'v:'+row['key'][:32]
 
     def caption(self, archive, row):
         zone = get_zone(self.settings.timezone)
@@ -1271,7 +1267,6 @@ class Telegram:
                 self._advance_poll(archive,update['update_id'],backend)
                 continue
             chat_id=message['chat']['id']
-            refresh_keyboard=False
             menu_message_id=message.get('message_id') if callback else None
             menu_route=None
             previous=self._guarded_attempt(archive,update['update_id'])
@@ -1377,7 +1372,6 @@ class Telegram:
                                 continue
                             text,buttons=self.menu(archive,'home')
                             menu_route='home'
-                            refresh_keyboard=True
                         elif command in ('/cancel','/huy') or raw_text == 'Hủy':
                             TimeMenus(self).cancel(archive,actor)
                             text,buttons=self.menu(archive,'home')
@@ -1405,7 +1399,7 @@ class Telegram:
                     # removed with one migration message, never reinstalled.
                     self.present_menu(archive,chat_id,actor,text,buttons,message_id=menu_message_id)
                     self.remember_menu_route(archive,actor,menu_route)
-                    try:self.ensure_keyboard(archive,actor,force=refresh_keyboard)
+                    try:self.ensure_keyboard(archive,actor)
                     except Exception:pass
                 except (ValueError,KeyError,IndexError):
                     self.present_menu(archive,chat_id,actor,'Mục này đã thay đổi.',

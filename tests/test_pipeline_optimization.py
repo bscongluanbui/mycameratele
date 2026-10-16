@@ -7,7 +7,7 @@ from unittest.mock import Mock,patch
 
 from tests import test_sd_source as fixtures
 from archive_app.core import record_key
-from archive_app.sd_source import HCNetSDKSource,SDSource,SDSourceError,_utc
+from archive_app.sd_source import HCNetSDKSource,SDSourceError,_utc
 from archive_app.sync import SyncQueue,_statistics
 
 

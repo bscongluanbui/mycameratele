@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import queue
 import re
-import sqlite3
 import sys
 import tempfile
 import threading
@@ -20,7 +19,6 @@ import time
 import unittest
 from unittest.mock import patch
 from unittest.mock import Mock
-from urllib.error import HTTPError
 import xml.etree.ElementTree as ET
 
 from archive_app.core import Archive, Settings, record_key

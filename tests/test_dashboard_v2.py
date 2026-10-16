@@ -2,7 +2,7 @@
 from pathlib import Path
 import http.client,json,os,shutil,tempfile,threading,unittest,uuid
 from unittest.mock import patch
-from archive_app.core import Archive,Settings,record_key
+from archive_app.core import Archive,Settings
 from archive_app.dashboard import DashboardServer
 
 
