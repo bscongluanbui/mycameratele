@@ -492,5 +492,97 @@ class StateTests(unittest.TestCase):
         server_type.return_value.handle_request.assert_not_called()
 
 
+class ProofCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 1000
+        self.state = IdentityState(ObserverConfig(TOKEN), clock=lambda: self.now)
+
+    def tearDown(self):
+        self.state.close()
+
+    def proof(self, host='192.168.2.7', mac=MAC, stamp=None, verified=True):
+        return {'version': 1, 'host': host, 'mac': mac, 'verified': verified,
+                'observed_at': self.now if stamp is None else stamp}
+
+    def scan(self, records=None, conflicts=None):
+        return {'version': 1, 'subnet': '192.168.2.0/24', 'interface': 'eth0',
+                'observed_at': self.now, 'scan_id': 'synthetic', 'error': None,
+                'records': records or [], 'conflicts': conflicts or []}
+
+    def test_successful_post_proof_seeds_fresh_directory_before_first_scan(self):
+        self.state.remember_proof(self.proof(), MAC)
+        result = self.state.snapshot()
+        self.assertEqual(result['records'], [{'host': '192.168.2.7', 'mac': MAC, 'observed_at': 1000, 'evidence': 'tcp+netlink'}])
+        self.assertIsNone(result['error'])
+        self.assertEqual(result['observed_at'], 1000)
+
+    def test_missing_broad_scan_pair_is_refreshed_by_targeted_guard(self):
+        self.state.remember_proof(self.proof(), MAC)
+        self.now = 1060
+        with patch('archive_app.lan_identity.verify_identity', return_value=self.proof()) as verify:
+            self.state._apply_scan(self.scan())
+        verify.assert_called_once_with(self.state.config, '192.168.2.7', MAC, stop=self.state.stop)
+        self.assertEqual(self.state.snapshot()['records'][0]['observed_at'], 1060)
+
+    def test_cached_proof_expires_after_one_hundred_twenty_seconds(self):
+        self.state.remember_proof(self.proof(), MAC)
+        self.now = 1120
+        self.assertEqual(len(self.state.snapshot()['records']), 1)
+        self.now = 1120.01
+        self.assertEqual(self.state.snapshot()['records'], [])
+
+    def test_failed_targeted_proof_does_not_reuse_old_pair(self):
+        self.state.remember_proof(self.proof(), MAC)
+        with patch('archive_app.lan_identity.verify_identity', return_value=self.proof(verified=False)):
+            self.state._apply_scan(self.scan())
+        self.assertEqual(self.state.snapshot()['records'], [])
+
+    def test_newer_proven_owner_replaces_old_mac_on_same_host(self):
+        replacement = '02:ab:cd:ef:01:08'
+        self.state.remember_proof(self.proof(), MAC)
+        self.now = 1001
+        self.state.remember_proof(self.proof(mac=replacement), replacement)
+        self.assertEqual([row['mac'] for row in self.state.snapshot()['records']], [replacement])
+
+    def test_late_older_scan_cannot_evict_newer_post_proven_owner(self):
+        replacement = '02:ab:cd:ef:01:08'
+        self.state.remember_proof(self.proof(mac=replacement, stamp=1000), replacement)
+        self.now = 1001
+        self.state.remember_proof(self.proof(), MAC)
+        old_row = {'host': '192.168.2.7', 'mac': replacement, 'observed_at': 1000, 'evidence': 'tcp+netlink'}
+        with patch('archive_app.lan_identity.verify_identity', return_value=self.proof()):
+            self.state._apply_scan(self.scan([old_row]))
+        result = self.state.snapshot()['records']
+        self.assertEqual([(row['host'], row['mac'], row['observed_at']) for row in result], [('192.168.2.7', MAC, 1001)])
+
+    def test_reported_mac_conflict_removes_cache_instead_of_masking_it(self):
+        self.state.remember_proof(self.proof(), MAC)
+        self.state._apply_scan(self.scan(conflicts=[MAC]))
+        self.assertEqual(self.state.snapshot()['records'], [])
+        self.assertEqual(self.state.snapshot()['conflicts'], [MAC])
+
+    def test_missing_known_pair_refresh_is_limited_to_sixteen(self):
+        for index in range(20):
+            mac = f'02:ab:cd:ef:01:{index:02x}'
+            self.state.remember_proof(self.proof(host=f'192.168.2.{index + 2}', mac=mac), mac)
+        def verify(config, host, mac, **kwargs):
+            return self.proof(host, mac)
+        with patch('archive_app.lan_identity.verify_identity', side_effect=verify) as callback:
+            self.state._apply_scan(self.scan())
+        self.assertEqual(callback.call_count, 16)
+        self.assertEqual(len(self.state.snapshot()['records']), 20)
+
+    def test_failed_old_host_proof_does_not_remove_new_host_for_same_mac(self):
+        self.state.remember_proof(self.proof(host='192.168.2.17'), MAC)
+        self.state.remember_proof(self.proof(verified=False), MAC)
+        self.assertEqual(self.state.snapshot()['records'][0]['host'], '192.168.2.17')
+
+    def test_invalid_or_expired_proofs_do_not_populate_cache(self):
+        for proof in (self.proof(host='8.8.8.8'), self.proof(stamp=0), self.proof(stamp=1010),
+                      self.proof(mac='ff:ff:ff:ff:ff:ff')):
+            self.state.remember_proof(proof, proof['mac'])
+        self.assertEqual(self.state.snapshot()['records'], [])
+
+
 if __name__ == '__main__':
     unittest.main()

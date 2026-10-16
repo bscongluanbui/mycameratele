@@ -348,8 +348,9 @@ def verify_identity(config, host, mac, *, stop=None, probe=None, neighbors=None,
 
 
 class IdentityState:
-    def __init__(self, config, *, scanner=None):
+    def __init__(self, config, *, scanner=None, clock=None):
         self.config, self.scanner = config, scanner or scan_identity
+        self.clock, self.proven = clock or time.time, {}
         self.stop = threading.Event()
         self.lock, self.thread = threading.Lock(), None
         self.data = {'version': 1, 'subnet': config.subnet, 'interface': config.interface,
@@ -357,7 +358,78 @@ class IdentityState:
 
     def snapshot(self):
         with self.lock:
-            return copy.deepcopy(self.data)
+            self._prune_proofs()
+            result = copy.deepcopy(self.data)
+            result['records'] = sorted(copy.deepcopy(list(self.proven.values())), key=lambda row: ipaddress.IPv4Address(row['host']))
+            if result['records'] and not result.get('conflicts'):
+                result['observed_at'] = max(row['observed_at'] for row in result['records'])
+                result['error'] = None
+            return result
+
+    def _prune_proofs(self):
+        now = self.clock()
+        self.proven = {mac: row for mac, row in self.proven.items() if -5 <= now - row['observed_at'] <= 120}
+
+    def _remember_records(self, records):
+        self._prune_proofs()
+        network = ipaddress.IPv4Network(self.config.subnet)
+        if not isinstance(records, list) or len(records) > 254:
+            return
+        for row in records:
+            try:
+                host = ipaddress.IPv4Address(row['host'])
+                mac, stamp = _mac(row['mac']), row['observed_at']
+                if host not in network or host in (network.network_address, network.broadcast_address):
+                    continue
+                if type(stamp) not in (int, float) or not math.isfinite(stamp) or not -5 <= self.clock() - stamp <= 120 or row.get('evidence') != 'tcp+netlink':
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            if any(old['host'] == str(host) and old_mac != mac and old['observed_at'] > stamp
+                   for old_mac, old in self.proven.items()):
+                continue
+            # A newer proved owner of an address replaces its older association.
+            for old_mac, old in list(self.proven.items()):
+                if old['host'] == str(host) and old_mac != mac:
+                    self.proven.pop(old_mac)
+            previous = self.proven.get(mac)
+            if previous is None or stamp >= previous['observed_at']:
+                self.proven[mac] = {'host': str(host), 'mac': mac, 'observed_at': stamp, 'evidence': 'tcp+netlink'}
+
+    def remember_proof(self, proof, expected_mac):
+        with self.lock:
+            if not isinstance(proof, dict) or proof.get('version') != 1:
+                return
+            if proof.get('verified') is True:
+                if proof.get('mac') != expected_mac:
+                    return
+                self._remember_records([{**proof, 'evidence': 'tcp+netlink'}])
+            else:
+                previous = self.proven.get(expected_mac)
+                if previous is not None and previous['host'] == proof.get('host'):
+                    self.proven.pop(expected_mac)
+
+    def _apply_scan(self, result):
+        with self.lock:
+            self._remember_records(result.get('records', []))
+            conflicts = result.get('conflicts', [])
+            for mac in conflicts:
+                self.proven.pop(mac, None)
+            seen = {row.get('mac') for row in result.get('records', []) if isinstance(row, dict)}
+            missing = [dict(row) for mac, row in self.proven.items() if mac not in seen][:16]
+        # Directory scans may miss a short-lived neighbour-state transition.
+        # Refresh only previously proved missing pairs using the strict guard.
+        if missing and not self.stop.is_set():
+            with ThreadPoolExecutor(max_workers=self.config.workers, thread_name_prefix='lan-identity-known') as pool:
+                pending = {pool.submit(verify_identity, self.config, row['host'], row['mac'], stop=self.stop): row for row in missing}
+                for future, row in pending.items():
+                    try:
+                        proof = future.result()
+                    except Exception:
+                        continue
+                    self.remember_proof(proof, row['mac'])
+        with self.lock:
+            self.data = result
 
     def _run(self):
         while not self.stop.is_set():
@@ -368,8 +440,7 @@ class IdentityState:
                           'observed_at': time.time(), 'scan_id': uuid.uuid4().hex,
                           'records': [], 'conflicts': [], 'error': 'observer_scan_failed'}
             if result is not None:
-                with self.lock:
-                    self.data = result
+                self._apply_scan(result)
             self.stop.wait(self.config.interval)
 
     def start(self):
@@ -488,6 +559,7 @@ class IdentityHandler(BaseHTTPRequestHandler):
         except OSError:
             self._json(503, {'error': 'observer_verification_unavailable'})
         else:
+            self.server.state.remember_proof(result, body['mac'])
             self._json(200, result)
 
 
