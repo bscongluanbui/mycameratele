@@ -363,7 +363,7 @@ const context = {document: documentStub, Node: Element, module: {exports: {}}, w
 vm.createContext(context);
 const bootLine = 'switchView(location.hash.slice(1), false); boot();';
 equal(source.includes(bootLine), true);
-vm.runInContext(source.replace(bootLine, 'globalThis.testUi = {state, renderCameras, renderSync, renderLogs, switchView, syncDisclosure, renderDiscoveryJob, renderDiscoveryResults, discoveryControls, closeDiscovery, resetDiscovery, openDiscovery, startDiscovery, pollDiscovery, cancelDiscovery, addDiscoveredCameras, renderChannelOptions, loadCameraChannels, checkCameraChannel, openCameraForm, saveCamera, changeChannelSelection, openCameraDelete, closeCameraDelete, deleteCamera, refresh, showLogin, loadPipelineSettings, savePipelineSettings};'), context);
+vm.runInContext(source.replace(bootLine, 'globalThis.testUi = {state, renderCameras, renderSync, renderLogs, switchView, syncDisclosure, renderDiscoveryJob, renderDiscoveryResults, discoveryControls, closeDiscovery, resetDiscovery, openDiscovery, startDiscovery, pollDiscovery, cancelDiscovery, addDiscoveredCameras, renderChannelOptions, loadCameraChannels, checkCameraChannel, openCameraForm, saveCamera, changeChannelSelection, openCameraDelete, closeCameraDelete, deleteCamera, refresh, showLogin, loadPipelineSettings, savePipelineSettings, loadSync, pollCameraMetadata};'), context);
 const ui = context.testUi;
 ui.state.cameras = [{id: 'pn', name: 'PN', enabled: true, host: '192.168.1.2'}, {id: 'door', name: 'Cửa trước', enabled: true}];
 const job = {id: 'job-1', camera_id: 'pn', camera_name: 'PN', state: 'running', phase: 'uploading', message: '<img src=x onerror=alert(1)>', code: 'fixture_code', source: 'dashboard', created_at: 100, started_at: 101, updated_at: 102, finished_at: null, statistics: {sd_searched: 27, sd_downloaded: 27, uploaded: 16, failed: 0, remuxed: 20, sd_error_code: 'fixture_error'}};
@@ -898,5 +898,52 @@ equal(ui.state.discovery.revision, discoveryRevision + 1);
   equal(importedMac.mac_address, 'a0:ff:0c:52:72:20'); equal(importedMac.auto_ip, true); equal(importedMac.identity_subnet, '192.168.5.0/24');
   equal(importedMac.discovery_scan_id, 'mac-import'); equal(importedMac.enabled, false); equal('sd_password' in importedMac, false);
   ui.resetDiscovery();
+  // Active jobs must not prevent fresh MAC proofs from reaching cached cards.
+  const realDate = context.Date; let fakeNow = 2000000, cameraGets = 0, metadataMode = 'ok', resolveMetadata;
+  context.Date = class extends Date { static now() { return fakeNow; } };
+  const macCamera = {id: 'mac-live', name: 'MAC live', host: '192.168.2.7', auto_ip: true, mac_address: '94:ec:13:14:d2:a0', identity_subnet: '192.168.2.0/24', identity_status: 'verified', identity_checked_at: fakeNow / 1000};
+  const activeReply = {jobs: [{id: 'always-active', camera_id: 'mac-live', state: 'running', statistics: {}}], latest: {'mac-live': {id: 'always-active', camera_id: 'mac-live', state: 'running', statistics: {}}}, worker_alive: true};
+  const ok = result => ({ok: true, status: 200, json: async () => result});
+  ui.state.authenticated = true; ui.state.accountRequired = false; ui.state.view = 'cameras'; ui.state.cameras = [macCamera];
+  ui.state.cameraListAttemptAt = null; ui.state.cameraPollBusy = false; elements.get('account-screen').hidden = true;
+  context.fetch = async url => {
+    if (url === '/api/sync?limit=100') return ok(activeReply);
+    if (url === '/api/status') return ok({csrf_token: 'fixture-csrf', counts: {}});
+    if (url === '/api/cameras') {
+      cameraGets++;
+      if (metadataMode === 'outage') throw new Error('temporary outage');
+      if (metadataMode === 'late') return new Promise(resolve => { resolveMetadata = resolve; });
+      return ok({cameras: [{...macCamera, identity_checked_at: fakeNow / 1000}]});
+    }
+    throw new Error('Unexpected MAC poll fixture: ' + url);
+  };
+  await ui.refresh(); equal(cameraGets, 1); // Initial refresh suppresses a duplicate polling GET.
+  for (let seconds = 2.5; seconds <= 180; seconds += 2.5) {
+    fakeNow = 2000000 + seconds * 1000; await ui.loadSync();
+    equal(elements.get('camera-grid').textContent.includes('Đã xác minh MAC'), true);
+    equal(elements.get('camera-grid').textContent.includes('MAC cần xác minh lại'), false);
+  }
+  equal(cameraGets, 7); equal(ui.state.sync.latest['mac-live'].state, 'running');
+  const lastProof = ui.state.cameras[0].identity_checked_at;
+  metadataMode = 'outage'; fakeNow += 121000; await ui.loadSync();
+  equal(ui.state.cameras.length, 1); equal(ui.state.cameras[0].identity_checked_at, lastProof);
+  equal(elements.get('camera-grid').textContent.includes('MAC cần xác minh lại'), true);
+  const outageGets = cameraGets; fakeNow += 2500; await ui.loadSync(); equal(cameraGets, outageGets);
+  metadataMode = 'late'; fakeNow += 30000;
+  const stalePoll = ui.pollCameraMetadata(); equal(ui.state.cameraPollBusy, true);
+  const beforeBusy = cameraGets; await ui.pollCameraMetadata(); equal(cameraGets, beforeBusy);
+  ui.state.cameraRevision++; ui.state.cameras = [];
+  resolveMetadata(ok({cameras: [macCamera]})); await stalePoll;
+  equal(ui.state.cameras.length, 0); equal(ui.state.cameraPollBusy, false); // No resurrection after deletion.
+  fakeNow += 30000; const logoutPoll = ui.pollCameraMetadata();
+  ui.showLogin(); resolveMetadata(ok({cameras: [macCamera]})); await logoutPoll;
+  equal(ui.state.cameras.length, 0); equal(ui.state.authenticated, false);
+  equal(ui.state.cameraListAttemptAt, null); equal(ui.state.cameraPollBusy, false);
+  ui.state.authenticated = true; ui.state.accountRequired = false; elements.get('account-screen').hidden = true;
+  fakeNow += 30000; const olderPoll = ui.pollCameraMetadata();
+  metadataMode = 'ok'; await ui.refresh(); const freshProof = ui.state.cameras[0].identity_checked_at;
+  resolveMetadata(ok({cameras: [{...macCamera, identity_checked_at: 1}]})); await olderPoll;
+  equal(ui.state.cameras[0].identity_checked_at, freshProof); // An older polling response cannot replace a newer refresh.
+  context.Date = realDate; ui.showLogin();
   console.log(`WEB_HELPERS: checks=${checks} passed=${checks} failed=0`);
 })().catch(error => { console.error(error); process.exitCode = 1; });

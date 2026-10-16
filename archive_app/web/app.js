@@ -311,6 +311,7 @@
   const $ = id => document.getElementById(id);
   const state = { cameras: [], status: {}, csrf: "", probes: new Map(), calendar: [], offset: 0, limit: 25, total: 0, archiveRequest: 0, calendarRequest: 0, editing: null, view: "cameras", authenticated: false, sessionRevision: 0, account: null, accountRequired: false, loginBusy: false, accountBusy: false, logoutBusy: false, sync: {jobs: [], latest: {}, worker_alive: false}, syncRequest: 0, syncTimer: null, syncBusy: new Set(), syncSummary: "", expandedSync: new Set(), discovery: {scan: null, choices: new Map(), timer: null, revision: 0, starting: false, adding: false, cancelling: false} };
   state.cameraRevision = 0;
+  state.cameraListRequest = 0; state.cameraListAttemptAt = null; state.cameraPollRequest = 0; state.cameraPollBusy = false;
   state.cameraDelete = {camera: null, busy: false, revision: 0, returnFocus: null};
   state.pipeline = {settings: null, busy: false, loading: false, dirty: false, request: 0};
   let toastTimer;
@@ -368,6 +369,7 @@
     resetDiscovery();
     stopSyncPolling(); state.syncRequest++; state.sync = {jobs: [], latest: {}, worker_alive: false}; state.syncBusy.clear(); state.expandedSync.clear();
     state.authenticated = false; state.sessionRevision++; state.archiveRequest++; state.calendarRequest++;
+    state.cameraListRequest++; state.cameraListAttemptAt = null; state.cameraPollRequest++; state.cameraPollBusy = false;
     state.account = null; state.accountRequired = false; state.csrf = ""; state.cameras = []; state.status = {}; state.calendar = []; state.probes.clear();
     $("app-shell").hidden = true; $("account-screen").hidden = true; $("boot-loading").hidden = true; $("login-screen").hidden = false;
     if ($("camera-dialog").open) $("camera-dialog").close();
@@ -605,6 +607,24 @@
     $("logs-count").textContent = `${jobs.length} / ${allJobs.length} lượt gần nhất`;
     restoreSyncFocus(target, focusKey);
   }
+  async function pollCameraMetadata() {
+    if (!state.authenticated || state.accountRequired || !$('account-screen').hidden || state.cameraPollBusy) return;
+    const now = Date.now();
+    if (state.cameraListAttemptAt !== null && now >= state.cameraListAttemptAt && now - state.cameraListAttemptAt < 30000) return;
+    const session = state.sessionRevision, cameraRevision = state.cameraRevision;
+    const request = ++state.cameraListRequest, poll = ++state.cameraPollRequest;
+    state.cameraListAttemptAt = now; state.cameraPollBusy = true;
+    try {
+      const response = await api('/api/cameras');
+      if (!state.authenticated || state.accountRequired || !$('account-screen').hidden || session !== state.sessionRevision || cameraRevision !== state.cameraRevision || request !== state.cameraListRequest) return;
+      if (!Array.isArray(response.cameras)) throw new Error('Danh sách camera chưa hợp lệ.');
+      state.cameras = response.cameras;
+      renderCameras(); refreshCameraOptions();
+    } catch (_) {
+      // Keep the last list on temporary errors. Its original proof timestamp
+      // still expires normally; neither a failed GET nor a retry marks it fresh.
+    } finally { if (poll === state.cameraPollRequest) state.cameraPollBusy = false; }
+  }
   async function loadSync() {
     if (!state.authenticated || state.accountRequired || !$("account-screen").hidden) return;
     const revision = state.sessionRevision, request = ++state.syncRequest;
@@ -613,6 +633,8 @@
       if (!state.authenticated || state.accountRequired || revision !== state.sessionRevision || request !== state.syncRequest || !$("account-screen").hidden) return;
       const previous = JSON.stringify(Object.values(state.sync.latest || {}).map(job => [job.id, job.state, job.statistics]));
       state.sync = { jobs: Array.isArray(result.jobs) ? result.jobs : [], latest: result.latest || {}, worker_alive: result.worker_alive === true };
+      await pollCameraMetadata();
+      if (!state.authenticated || state.accountRequired || revision !== state.sessionRevision || request !== state.syncRequest || !$('account-screen').hidden) return;
       $("sync-error").hidden = true; $("logs-error").hidden = true; renderSync(); renderCameras();
       const next = JSON.stringify(Object.values(state.sync.latest).map(job => [job.id, job.state, job.statistics]));
       if (previous !== next && state.sync.jobs.length && !Object.values(state.sync.latest).some(helpers.syncActive)) await refresh();
@@ -744,9 +766,10 @@
     try {
       const status = await api("/api/status");
       if (!state.authenticated || state.accountRequired || revision !== state.sessionRevision) return;
+      const cameraRequest = ++state.cameraListRequest; state.cameraListAttemptAt = Date.now();
       const response = await api("/api/cameras");
       if (!state.authenticated || state.accountRequired || revision !== state.sessionRevision) return;
-      if (cameraRevision !== state.cameraRevision) return;
+      if (cameraRevision !== state.cameraRevision || cameraRequest !== state.cameraListRequest) return;
       state.status = status; state.csrf = status.csrf_token || state.csrf; state.cameras = Array.isArray(response.cameras) ? response.cameras : [];
       $("boot-loading").hidden = true; $("login-screen").hidden = true; if ($("account-screen").hidden) $("app-shell").hidden = false;
       renderCameras(); refreshCameraOptions(); renderSystem();
