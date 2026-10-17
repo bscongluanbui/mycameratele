@@ -45,6 +45,14 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(data['mappings'],{MAC:'192.168.2.17'})
         self.assertEqual(validate_snapshot(data,1002)['records'],data['records'])
 
+    def test_icmp_neighbor_proof_retained_and_revalidated(self):
+        data=snapshot(1000);data['records'][0]['evidence']='icmp+netlink'
+        verified=validate_snapshot(data,1001)
+        self.assertEqual(verified['mappings'],{MAC:'192.168.2.17'})
+        self.assertEqual(verified['records'][0]['evidence'],'icmp+netlink')
+        self.assertEqual(validate_snapshot(verified,1002)['records'],verified['records'])
+        with self.assertRaises(CameraIdentityError):validate_snapshot(verified,1121)
+
     def test_reject_stale_or_future_timestamps(self):
         for value in (0,879,1006,float('nan'),float('inf'),True,'1000'):
             data=snapshot(1000);data['observed_at']=value

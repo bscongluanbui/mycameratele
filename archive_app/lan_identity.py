@@ -1,8 +1,9 @@
 """Small, read-only LAN identity observer; it never opens or transfers media.
 
 Run in the LAN host network namespace without Linux capabilities.  A successful
-TCP connection and a bounded-age neighbour entry must agree before an IP/MAC
+ICMP echo reply and a bounded-age neighbour entry must agree before an IP/MAC
 pair is published.  Cached ARP rows alone are deliberately insufficient.
+The observer never opens the camera's SDK or media ports.
 """
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ import time
 import uuid
 
 from .network_routes import _aligned, _attributes
+from .lan_echo import echo_probe
 
 
 _NL_HEADER = struct.Struct('=IHHII')
@@ -118,9 +120,9 @@ def _parse_neighbor(payload, index, network, max_age, ticks):
 
 
 def collect_neighbors(interface, subnet, *, max_age=120, timeout=2, socket_factory=None, if_index=None, ticks=None, monotonic=None):
-    """Read bounded-age candidates; callers still require a current TCP proof.
+    """Read bounded-age candidates; callers still require a current echo proof.
 
-    DELAY follows use of a stale-but-valid cache entry.  A short TCP handshake
+    DELAY follows use of a stale-but-valid cache entry.  A short echo exchange
     does not necessarily refresh its confirmed counter before the ARP timer.
     """
     if not hasattr(socket, 'AF_NETLINK'):
@@ -179,14 +181,7 @@ def collect_neighbors(interface, subnet, *, max_age=120, timeout=2, socket_facto
 
 
 def _probe(host, local_address, timeout):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
-            connection.settimeout(timeout)
-            connection.bind((local_address, 0))
-            connection.connect((host, 8000))
-            return True
-    except OSError:
-        return False
+    return echo_probe(host, local_address, timeout)
 
 
 def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lookup=None, clock=None, monotonic=None):
@@ -271,7 +266,7 @@ def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lo
         if host not in connected or host in conflicting_hosts or mac in conflicting_macs:
             continue
         if not any(item['host'] == host for item in records):
-            records.append({'host': host, 'mac': mac, 'observed_at': connected[host], 'evidence': 'tcp+netlink'})
+            records.append({'host': host, 'mac': mac, 'observed_at': connected[host], 'evidence': 'icmp+netlink'})
     return {'version': 1, 'subnet': config.subnet, 'interface': config.interface,
             'observed_at': observed, 'scan_id': uuid.uuid4().hex,
             'records': sorted(records, key=lambda item: int(ipaddress.IPv4Address(item['host']))),
@@ -351,6 +346,9 @@ class IdentityState:
     def __init__(self, config, *, scanner=None, clock=None):
         self.config, self.scanner = config, scanner or scan_identity
         self.clock, self.proven = clock or time.time, {}
+        # Retry hints are not identity evidence.  A temporary disconnect must
+        # revoke the published proof without forgetting which pair to recheck.
+        self.known_targets, self.known_attempted = {}, {}
         self.stop = threading.Event()
         self.lock, self.thread = threading.Lock(), None
         self.data = {'version': 1, 'subnet': config.subnet, 'interface': config.interface,
@@ -369,6 +367,9 @@ class IdentityState:
     def _prune_proofs(self):
         now = self.clock()
         self.proven = {mac: row for mac, row in self.proven.items() if -5 <= now - row['observed_at'] <= 120}
+        self.known_targets = {mac: row for mac, row in self.known_targets.items()
+                              if -5 <= now - row['observed_at'] <= 86400}
+        self.known_attempted = {mac: stamp for mac, stamp in self.known_attempted.items() if mac in self.known_targets}
 
     def _remember_records(self, records):
         self._prune_proofs()
@@ -381,33 +382,53 @@ class IdentityState:
                 mac, stamp = _mac(row['mac']), row['observed_at']
                 if host not in network or host in (network.network_address, network.broadcast_address):
                     continue
-                if type(stamp) not in (int, float) or not math.isfinite(stamp) or not -5 <= self.clock() - stamp <= 120 or row.get('evidence') != 'tcp+netlink':
+                if type(stamp) not in (int, float) or not math.isfinite(stamp) or not -5 <= self.clock() - stamp <= 120 or row.get('evidence') != 'icmp+netlink':
                     continue
             except (KeyError, TypeError, ValueError):
                 continue
             if any(old['host'] == str(host) and old_mac != mac and old['observed_at'] > stamp
-                   for old_mac, old in self.proven.items()):
+                   for old_mac, old in self.known_targets.items()):
+                continue
+            previous = self.known_targets.get(mac)
+            if previous is not None and previous['observed_at'] > stamp:
                 continue
             # A newer proved owner of an address replaces its older association.
-            for old_mac, old in list(self.proven.items()):
+            for old_mac, old in list(self.known_targets.items()):
                 if old['host'] == str(host) and old_mac != mac:
-                    self.proven.pop(old_mac)
-            previous = self.proven.get(mac)
-            if previous is None or stamp >= previous['observed_at']:
-                self.proven[mac] = {'host': str(host), 'mac': mac, 'observed_at': stamp, 'evidence': 'tcp+netlink'}
+                    self.known_targets.pop(old_mac)
+                    self.known_attempted.pop(old_mac, None)
+                    self.proven.pop(old_mac, None)
+            self.proven[mac] = {'host': str(host), 'mac': mac, 'observed_at': stamp, 'evidence': 'icmp+netlink'}
+            self.known_targets[mac] = dict(self.proven[mac])
+        # A /24 has at most 254 hosts; retain an explicit cap as well.
+        while len(self.known_targets) > 254:
+            oldest = min(self.known_targets, key=lambda key: self.known_targets[key]['observed_at'])
+            self.known_targets.pop(oldest)
+            self.known_attempted.pop(oldest, None)
+            self.proven.pop(oldest, None)
 
     def remember_proof(self, proof, expected_mac):
+        try:
+            expected_mac = _mac(expected_mac)
+        except ValueError:
+            return
         with self.lock:
             if not isinstance(proof, dict) or proof.get('version') != 1:
                 return
             if proof.get('verified') is True:
                 if proof.get('mac') != expected_mac:
                     return
-                self._remember_records([{**proof, 'evidence': 'tcp+netlink'}])
+                self._remember_records([{**proof, 'evidence': 'icmp+netlink'}])
             else:
                 previous = self.proven.get(expected_mac)
                 if previous is not None and previous['host'] == proof.get('host'):
                     self.proven.pop(expected_mac)
+                # A proved different owner is not a transient outage.  Forget
+                # only that old pair, never a newer association at another IP.
+                known = self.known_targets.get(expected_mac)
+                if proof.get('mac') and proof.get('mac') != expected_mac and known is not None and known['host'] == proof.get('host'):
+                    self.known_targets.pop(expected_mac)
+                    self.known_attempted.pop(expected_mac, None)
 
     def _apply_scan(self, result):
         with self.lock:
@@ -415,10 +436,18 @@ class IdentityState:
             conflicts = result.get('conflicts', [])
             for mac in conflicts:
                 self.proven.pop(mac, None)
-            seen = {row.get('mac') for row in result.get('records', []) if isinstance(row, dict)}
-            missing = [dict(row) for mac, row in self.proven.items() if mac not in seen][:16]
+                self.known_targets.pop(mac, None)
+                self.known_attempted.pop(mac, None)
+            seen = {(row.get('mac'), row.get('host'), row.get('observed_at'))
+                    for row in result.get('records', []) if isinstance(row, dict)}
+            missing = [dict(row) for mac, row in sorted(self.known_targets.items(),
+                       key=lambda item: self.known_attempted.get(item[0], float('-inf')))
+                       if (mac, row['host'], row['observed_at']) not in seen][:16]
+            for row in missing:
+                self.known_attempted[row['mac']] = self.clock()
         # Directory scans may miss a short-lived neighbour-state transition.
-        # Refresh only previously proved missing pairs using the strict guard.
+        # Retry previously proved missing pairs using the same strict guard,
+        # even after their last publishable proof has expired or failed.
         if missing and not self.stop.is_set():
             with ThreadPoolExecutor(max_workers=self.config.workers, thread_name_prefix='lan-identity-known') as pool:
                 pending = {pool.submit(verify_identity, self.config, row['host'], row['mac'], stop=self.stop): row for row in missing}
@@ -426,7 +455,7 @@ class IdentityState:
                     try:
                         proof = future.result()
                     except Exception:
-                        continue
+                        proof = {'version': 1, 'host': row['host'], 'mac': '', 'verified': False}
                     self.remember_proof(proof, row['mac'])
         with self.lock:
             self.data = result

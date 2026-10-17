@@ -158,10 +158,10 @@ class ScanTests(unittest.TestCase):
                              interface_lookup=lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24')),
                              clock=lambda: 1000, **kwargs)
 
-    def test_successful_tcp_and_fresh_netlink_are_both_required(self):
+    def test_successful_echo_and_fresh_netlink_are_both_required(self):
         result = self.scan([{'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 0.01},
                             {'host': '192.168.2.4', 'mac': '02:ab:cd:ef:01:08', 'confirmed_age': 0.01}])
-        self.assertEqual(result['records'], [{'host': '192.168.2.3', 'mac': MAC, 'observed_at': 1000, 'evidence': 'tcp+netlink'}])
+        self.assertEqual(result['records'], [{'host': '192.168.2.3', 'mac': MAC, 'observed_at': 1000, 'evidence': 'icmp+netlink'}])
         self.assertEqual((result['version'], result['subnet'], result['interface'], result['observed_at']),
                          (1, '192.168.2.0/29', 'eth0', 1000))
         self.assertEqual(len(result['scan_id']), 32)
@@ -192,7 +192,7 @@ class ScanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'directly attached'):
             self.scan([], config=ObserverConfig(TOKEN, subnet='192.168.3.0/24'))
 
-    def test_old_delay_counter_uses_current_tcp_timestamp(self):
+    def test_old_delay_counter_uses_current_echo_timestamp(self):
         row = {'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 20}
         result = self.scan([row])
         self.assertEqual(result['records'][0]['observed_at'], 1000)
@@ -234,7 +234,7 @@ class ScanTests(unittest.TestCase):
         result = scan_identity(config, probe=probe, neighbors=dump,
                                interface_lookup=lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24')),
                                clock=Mock(side_effect=[1000, 1001, 1002]))
-        self.assertEqual(result['records'], [{'host': '192.168.2.3', 'mac': MAC, 'observed_at': 1001, 'evidence': 'tcp+netlink'}])
+        self.assertEqual(result['records'], [{'host': '192.168.2.3', 'mac': MAC, 'observed_at': 1001, 'evidence': 'icmp+netlink'}])
         self.assertEqual(calls.count('192.168.2.3'), 2)
         self.assertEqual(calls.count('192.168.2.2'), 1)
         self.assertEqual(dump.call_count, 2)
@@ -264,7 +264,7 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(result['records'], [])
         self.assertEqual(calls.count('192.168.2.3'), 1)
 
-    def test_no_tcp_success_never_triggers_reprobe_or_publishes(self):
+    def test_no_echo_success_never_triggers_reprobe_or_publishes(self):
         dump = Mock(return_value=[{'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 20}])
         result = scan_identity(ObserverConfig(TOKEN, subnet='192.168.2.0/29'), probe=lambda *_: False, neighbors=dump,
                                interface_lookup=lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24')))
@@ -288,16 +288,18 @@ class ScanTests(unittest.TestCase):
         stop.set()
         self.assertIsNone(self.scan([], stop=stop))
 
-    def test_probe_is_read_only_single_port_and_source_bound(self):
-        connection = Mock()
-        connection.__enter__ = Mock(return_value=connection)
-        connection.__exit__ = Mock(return_value=False)
-        with patch('archive_app.lan_identity.socket.socket', return_value=connection):
+    def test_probe_uses_source_bound_echo_without_opening_camera_ports(self):
+        with patch('archive_app.lan_identity.echo_probe', return_value=True) as echo, \
+             patch('archive_app.lan_identity.socket.socket') as connection:
             self.assertTrue(_probe('192.168.2.3', '192.168.2.1', 0.35))
-        connection.connect.assert_called_once_with(('192.168.2.3', 8000))
-        connection.bind.assert_called_once_with(('192.168.2.1', 0))
-        connection.send.assert_not_called()
-        connection.sendall.assert_not_called()
+        echo.assert_called_once_with('192.168.2.3', '192.168.2.1', 0.35)
+        connection.assert_not_called()
+
+    def test_probe_echo_failure_does_not_fall_back_to_sdk_tcp(self):
+        with patch('archive_app.lan_identity.echo_probe', return_value=False), \
+             patch('archive_app.lan_identity.socket.socket') as connection:
+            self.assertFalse(_probe('192.168.2.3', '192.168.2.1', 0.35))
+        connection.assert_not_called()
 
 
 class HTTPTests(unittest.TestCase):
@@ -427,14 +429,14 @@ class VerificationTests(unittest.TestCase):
         self.assertFalse(result['verified'])
         self.assertEqual(result['mac'], '')
 
-    def test_no_tcp_or_stale_neighbor_proof_is_rejected(self):
+    def test_no_echo_or_stale_neighbor_proof_is_rejected(self):
         stop = threading.Event()
         stop.wait = Mock(return_value=False)
         with patch('archive_app.lan_identity.threading.Event', return_value=stop):
             self.assertFalse(self.verify(probe=lambda *_: False)['verified'])
             self.assertFalse(self.verify(rows=[{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 121}])['verified'])
 
-    def test_confirmed_age_twenty_seconds_is_valid_with_current_tcp(self):
+    def test_confirmed_age_twenty_seconds_is_valid_with_current_echo(self):
         result = self.verify(rows=[{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 20}])
         self.assertTrue(result['verified'])
         self.assertEqual(result['observed_at'], 1000)
@@ -512,9 +514,14 @@ class ProofCacheTests(unittest.TestCase):
     def test_successful_post_proof_seeds_fresh_directory_before_first_scan(self):
         self.state.remember_proof(self.proof(), MAC)
         result = self.state.snapshot()
-        self.assertEqual(result['records'], [{'host': '192.168.2.7', 'mac': MAC, 'observed_at': 1000, 'evidence': 'tcp+netlink'}])
+        self.assertEqual(result['records'], [{'host': '192.168.2.7', 'mac': MAC, 'observed_at': 1000, 'evidence': 'icmp+netlink'}])
         self.assertIsNone(result['error'])
         self.assertEqual(result['observed_at'], 1000)
+
+    def test_expected_mac_case_and_separator_share_one_normalized_retry_hint(self):
+        self.state.remember_proof(self.proof(), MAC.upper().replace(':', '-'))
+        self.assertEqual(set(self.state.known_targets), {MAC})
+        self.assertEqual(self.state.snapshot()['records'][0]['mac'], MAC)
 
     def test_missing_broad_scan_pair_is_refreshed_by_targeted_guard(self):
         self.state.remember_proof(self.proof(), MAC)
@@ -537,6 +544,78 @@ class ProofCacheTests(unittest.TestCase):
             self.state._apply_scan(self.scan())
         self.assertEqual(self.state.snapshot()['records'], [])
 
+    def test_transient_failure_retains_only_retry_hint_and_recovers_next_scan(self):
+        self.state.remember_proof(self.proof(), MAC)
+        self.now = 1060
+        with patch('archive_app.lan_identity.verify_identity', return_value=self.proof(verified=False)):
+            self.state._apply_scan(self.scan())
+        self.assertEqual(self.state.snapshot()['records'], [])
+        self.assertEqual(self.state.known_targets[MAC]['observed_at'], 1000)
+        self.now = 1121
+        self.assertEqual(self.state.snapshot()['records'], [])
+        with patch('archive_app.lan_identity.verify_identity', return_value=self.proof()) as verify:
+            self.state._apply_scan(self.scan())
+        verify.assert_called_once_with(self.state.config, '192.168.2.7', MAC, stop=self.state.stop)
+        self.assertEqual(self.state.snapshot()['records'][0]['observed_at'], 1121)
+
+    def test_expired_proof_is_not_published_but_can_receive_strict_retry(self):
+        self.state.remember_proof(self.proof(), MAC)
+        self.now = 1121
+        self.assertEqual(self.state.snapshot()['records'], [])
+        with patch('archive_app.lan_identity.verify_identity', return_value=self.proof(verified=False)) as verify:
+            self.state._apply_scan(self.scan())
+        self.assertEqual(verify.call_count, 1)
+        self.assertEqual(self.state.snapshot()['records'], [])
+
+    def test_retry_exception_revokes_proof_without_forgetting_target(self):
+        self.state.remember_proof(self.proof(), MAC)
+        with patch('archive_app.lan_identity.verify_identity', side_effect=OSError('temporary')):
+            self.state._apply_scan(self.scan())
+        self.assertEqual(self.state.snapshot()['records'], [])
+        self.assertIn(MAC, self.state.known_targets)
+        with patch('archive_app.lan_identity.verify_identity', return_value=self.proof()) as verify:
+            self.state._apply_scan(self.scan())
+        self.assertEqual(verify.call_count, 1)
+        self.assertEqual(len(self.state.snapshot()['records']), 1)
+
+    def test_known_hint_expires_after_twenty_four_hours_without_success(self):
+        self.state.remember_proof(self.proof(), MAC)
+        self.now = 87400.01
+        with patch('archive_app.lan_identity.verify_identity') as verify:
+            self.state._apply_scan(self.scan())
+        verify.assert_not_called()
+        self.assertEqual(self.state.known_targets, {})
+        self.assertEqual(self.state.snapshot()['records'], [])
+
+    def test_backward_clock_jump_forgets_future_hints_and_proofs(self):
+        self.state.remember_proof(self.proof(), MAC)
+        self.now = 994
+        with patch('archive_app.lan_identity.verify_identity') as verify:
+            self.state._apply_scan(self.scan())
+        verify.assert_not_called()
+        self.assertEqual(self.state.known_targets, {})
+        self.assertEqual(self.state.snapshot()['records'], [])
+
+    def test_different_proven_owner_forgets_old_hint_after_proof_expired(self):
+        replacement = '02:ab:cd:ef:01:08'
+        self.state.remember_proof(self.proof(), MAC)
+        self.now = 1121
+        self.assertEqual(self.state.snapshot()['records'], [])
+        self.state.remember_proof(self.proof(mac=replacement), replacement)
+        self.state.remember_proof(self.proof(stamp=1120), MAC)
+        self.assertEqual(set(self.state.known_targets), {replacement})
+        self.assertEqual([row['mac'] for row in self.state.snapshot()['records']], [replacement])
+
+    def test_wrong_mac_response_forgets_old_pair_but_not_new_host(self):
+        replacement = '02:ab:cd:ef:01:08'
+        self.state.remember_proof(self.proof(), MAC)
+        self.state.remember_proof(self.proof(mac=replacement, verified=False), MAC)
+        self.assertNotIn(MAC, self.state.known_targets)
+        self.state.remember_proof(self.proof(host='192.168.2.17'), MAC)
+        self.state.remember_proof(self.proof(mac=replacement, verified=False), MAC)
+        self.assertEqual(self.state.known_targets[MAC]['host'], '192.168.2.17')
+        self.assertEqual(self.state.snapshot()['records'][0]['host'], '192.168.2.17')
+
     def test_newer_proven_owner_replaces_old_mac_on_same_host(self):
         replacement = '02:ab:cd:ef:01:08'
         self.state.remember_proof(self.proof(), MAC)
@@ -549,7 +628,7 @@ class ProofCacheTests(unittest.TestCase):
         self.state.remember_proof(self.proof(mac=replacement, stamp=1000), replacement)
         self.now = 1001
         self.state.remember_proof(self.proof(), MAC)
-        old_row = {'host': '192.168.2.7', 'mac': replacement, 'observed_at': 1000, 'evidence': 'tcp+netlink'}
+        old_row = {'host': '192.168.2.7', 'mac': replacement, 'observed_at': 1000, 'evidence': 'icmp+netlink'}
         with patch('archive_app.lan_identity.verify_identity', return_value=self.proof()):
             self.state._apply_scan(self.scan([old_row]))
         result = self.state.snapshot()['records']
@@ -560,6 +639,10 @@ class ProofCacheTests(unittest.TestCase):
         self.state._apply_scan(self.scan(conflicts=[MAC]))
         self.assertEqual(self.state.snapshot()['records'], [])
         self.assertEqual(self.state.snapshot()['conflicts'], [MAC])
+        self.assertNotIn(MAC, self.state.known_targets)
+        with patch('archive_app.lan_identity.verify_identity') as verify:
+            self.state._apply_scan(self.scan())
+        verify.assert_not_called()
 
     def test_missing_known_pair_refresh_is_limited_to_sixteen(self):
         for index in range(20):
@@ -571,6 +654,31 @@ class ProofCacheTests(unittest.TestCase):
             self.state._apply_scan(self.scan())
         self.assertEqual(callback.call_count, 16)
         self.assertEqual(len(self.state.snapshot()['records']), 20)
+
+    def test_bounded_retry_rotates_targets_instead_of_starving_later_cameras(self):
+        for index in range(20):
+            mac = f'02:ab:cd:ef:01:{index:02x}'
+            self.state.remember_proof(self.proof(host=f'192.168.2.{index + 2}', mac=mac), mac)
+        def failed(config, host, mac, **kwargs):
+            return self.proof(host, mac, verified=False)
+        with patch('archive_app.lan_identity.verify_identity', side_effect=failed) as verify:
+            self.state._apply_scan(self.scan())
+            self.now += 60
+            self.state._apply_scan(self.scan())
+        self.assertEqual(verify.call_count, 32)
+        self.assertEqual(len({call.args[2] for call in verify.call_args_list}), 20)
+        self.assertEqual(self.state.snapshot()['records'], [])
+
+    def test_known_targets_are_bounded_by_subnet_and_replace_address_owner(self):
+        for index in range(1, 255):
+            mac = f'02:ab:cd:ef:01:{index:02x}'
+            self.state.remember_proof(self.proof(host=f'192.168.2.{index}', mac=mac), mac)
+        self.assertEqual(len(self.state.known_targets), 254)
+        replacement = '02:ab:cd:ef:02:01'
+        self.now += 1
+        self.state.remember_proof(self.proof(host='192.168.2.1', mac=replacement), replacement)
+        self.assertEqual(len(self.state.known_targets), 254)
+        self.assertNotIn('02:ab:cd:ef:01:01', self.state.known_targets)
 
     def test_failed_old_host_proof_does_not_remove_new_host_for_same_mac(self):
         self.state.remember_proof(self.proof(host='192.168.2.17'), MAC)

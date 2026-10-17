@@ -83,9 +83,9 @@ def validate_snapshot(data,now=None):
             if not isinstance(row,dict) or not _fresh(row['observed_at'],now):raise ValueError
             mac=normalize_mac(row['mac']);host=str(ipaddress.IPv4Address(row['host']))
             if (not mac or ipaddress.IPv4Address(host) not in net or host in (str(net.network_address),str(net.broadcast_address))
-                    or mac in mappings or host in ips or row.get('evidence')!='tcp+netlink'):raise ValueError
+                    or mac in mappings or host in ips or row.get('evidence') not in ('tcp+netlink','icmp+netlink')):raise ValueError
             mappings[mac]=host;ips.add(host)
-            clean.append({'host':host,'mac':mac,'observed_at':row['observed_at'],'evidence':'tcp+netlink'})
+            clean.append({'host':host,'mac':mac,'observed_at':row['observed_at'],'evidence':row['evidence']})
         return {'version':1,'configured':True,'subnet':subnet,'observed_at':data['observed_at'],
                 'records':clean,'mappings':mappings,'conflicts':[]}
     except (ValueError,KeyError,TypeError,OverflowError):
