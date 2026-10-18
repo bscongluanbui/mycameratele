@@ -159,6 +159,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 raise CameraIdentityError('sd_identity_unconfigured')
             observed={row['mac']:row for row in snapshot['records']}
             error=None
+        except CameraIdentityError as failure:
+            # Report known diagnostic codes, never remote exception text.
+            # A clock-skewed observer is not a camera MAC/password mismatch.
+            errors={'sd_identity_unavailable','sd_identity_invalid','sd_identity_unconfigured',
+                    'sd_identity_clock_skew','sd_identity_subnet','sd_identity_changed',
+                    'sd_identity_stale','sd_identity_conflict','sd_identity_not_found'}
+            snapshot={};observed={}
+            error=failure.code if isinstance(failure.code,str) and failure.code in errors else 'sd_identity_unavailable'
         except Exception:
             snapshot={};observed={};error='sd_identity_unavailable'
         results=[]

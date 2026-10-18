@@ -248,16 +248,6 @@ class ChannelIndex:
             AND channel_chat_id=? AND index_type=? AND period_key=?''', (camera, channel, kind, period)).fetchone()
         return dict(row) if row else None
 
-    def message_url(self, camera, index_type='root', period='root'):
-        try:
-            channel = self._camera(camera)['channel_chat_id']
-        except (KeyError, ValueError):
-            return None
-        node = self._node(camera, channel, index_type, period)
-        if node and node['state'] == 'ready' and node['tg_message_id']:
-            return channel_message_url(channel, node['tg_message_id'])
-        return None
-
     @staticmethod
     def _link(label, url):
         return f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'

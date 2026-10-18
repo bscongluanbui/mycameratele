@@ -1,6 +1,17 @@
-# LAN collector cho Bama
+# LAN collector — chế độ tùy chọn
 
-## Luồng dữ liệu
+## Phân biệt với cấu hình Bama hiện tại
+
+Tài liệu này giữ lại cách cài **collector trung chuyển media tùy chọn**, từng
+được dùng cho Bama. Bama hiện dùng **VPS tải trực tiếp thẻ SD qua subnet route
+Tailscale**, không dùng box để tải hoặc trung chuyển video. Không áp dụng các
+lệnh bật collector dưới đây khi chỉ muốn cập nhật Bama theo mô hình hiện tại.
+
+Box có thể tiếp tục chạy **LAN identity observer** để nhận diện MAC/IP theo
+[MAC_BINDING.md](MAC_BINDING.md). Observer chỉ gửi metadata; observer không cần
+SDK, không tải video và không phải collector trong tài liệu này.
+
+## Luồng dữ liệu khi chủ động chọn collector
 
 ```text
 Camera 192.168.2.x → Armbian trong LAN → Tailscale → cache VPS
@@ -18,14 +29,20 @@ Camera 192.168.2.x → Armbian trong LAN → Tailscale → cache VPS
 
 | Máy | File compose | Chức năng |
 | --- | --- | --- |
-| Armbian `100.92.56.98` | `compose.collector.yaml` riêng | SDK và truyền file gốc |
-| VPS Bama | `compose.yaml` + `compose.local.yaml` + `compose.sdk.yaml` + `compose.remote-sd.yaml` | Kho video, remux MP4, Telegram, dashboard |
+| Armbian `100.92.56.98` (ví dụ) | `compose.collector.yaml` riêng | SDK và truyền file gốc |
+| VPS Bama (ví dụ khi bật collector) | `compose.yaml` + `compose.local.yaml` + `compose.sdk.yaml` + `compose.remote-sd.yaml` | Kho video, remux MP4, Telegram, dashboard |
 
 Collector không dùng `.env` của Bama, không nhận bot token, channel ID hay database của VPS. Chỉ port `100.92.56.98:8787` được publish; không mở `0.0.0.0:8787` trên host. HTTP này đi trong kết nối Tailscale mã hóa. Cấu hình ACL Tailscale chỉ cho VPS truy cập port 8787 của collector.
 
 ## Cấu hình Armbian
 
-Đặt file compose riêng tại `/root/mycameratele-collector/compose.collector.yaml`. SDK ARM64 đã kiểm chứng nằm tại `/root/mycameratele-speed-audit-20261011/sdk`; giữ đầy đủ `libhcnetsdk.so`, `HCNetSDKCom` và thư viện đi kèm. Chỉ mount SDK read-only.
+Đặt file compose riêng tại `/root/mycameratele-collector/compose.collector.yaml`.
+Chuẩn bị gói SDK Linux ARM64 chính hãng, đúng kiến trúc box, vào thư mục ổn định
+`/root/mycameratele-collector/sdk` (`./sdk` tính từ file compose). Thư mục được
+mount phải chứa `libhcnetsdk.so`, `HCNetSDKCom` và đầy đủ thư viện đi kèm theo
+cấu trúc gói SDK. Không dùng thư mục benchmark/tạm làm nguồn SDK. Đây là đường
+dẫn cài đặt mẫu cần tạo và điền SDK trước, không phải khẳng định SDK đã có sẵn.
+Chỉ mount SDK read-only.
 
 Tạo token ngẫu nhiên một lần, không đặt token trong `.env` hoặc dán vào chat:
 
@@ -50,7 +67,7 @@ File `/root/mycameratele-collector/.env` chỉ chứa thông số collector:
 ```dotenv
 COLLECTOR_IMAGE=ghcr.io/bscongluanbui/mycameratele@sha256:IMAGE_DIGEST
 COLLECTOR_BIND_IP=100.92.56.98
-HCNETSDK_HOST_DIR=/root/mycameratele-speed-audit-20261011/sdk
+HCNETSDK_HOST_DIR=./sdk
 COLLECTOR_TOKEN_HOST_FILE=/root/mycameratele-collector/secrets/sd-collector.token
 COLLECTOR_ALLOWED_CIDRS=192.168.2.0/24
 COLLECTOR_MAX_SESSIONS=10

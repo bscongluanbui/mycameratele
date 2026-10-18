@@ -67,13 +67,17 @@
     },
     identityState(camera, now = Date.now()) {
       if (camera?.auto_ip !== true) return ["IP thủ công", "neutral"];
+      if (camera.identity_status === "unavailable") {
+        const errors = {sd_identity_clock_skew: "Đồng hồ box lệch giờ", sd_identity_invalid: "Dữ liệu nhận diện LAN lỗi", sd_identity_unavailable: "Bộ nhận diện LAN mất kết nối", sd_identity_unconfigured: "Chưa cấu hình nhận diện LAN", sd_identity_subnet: "Subnet nhận diện không khớp"};
+        return [Object.hasOwn(errors, camera.identity_error) ? errors[camera.identity_error] : "Chưa xác minh MAC", "amber"];
+      }
       if (camera.identity_status === "verified") {
         const checked = helpers.checkedMillis(camera.identity_checked_at);
         if (checked === null) return ["Chờ xác minh MAC", "amber"];
         if (!Number.isFinite(now) || now - checked > 120000 || now - checked < -5000) return ["MAC cần xác minh lại", "amber"];
         return ["Đã xác minh MAC", "green"];
       }
-      const statuses = {not_found: ["Chưa tìm thấy MAC", "amber"], conflict: ["MAC trùng / nhiều IP", "amber"], stale: ["Chờ dữ liệu LAN mới", "amber"], unavailable: ["Chưa xác minh MAC", "amber"], mismatch: ["MAC không khớp", "red"]};
+      const statuses = {not_found: ["Chưa tìm thấy MAC", "amber"], conflict: ["MAC trùng / nhiều IP", "amber"], stale: ["Chờ dữ liệu LAN mới", "amber"], mismatch: ["MAC không khớp", "red"]};
       return statuses[camera.identity_status] || ["Chờ xác minh MAC", "amber"];
     },
     cameraProbe(camera, manual) {

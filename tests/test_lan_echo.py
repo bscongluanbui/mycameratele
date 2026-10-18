@@ -1,10 +1,12 @@
 """Synthetic ICMP messages only; tests open no sockets or camera sessions."""
+import ipaddress
 import socket
 import struct
 import unittest
 from unittest.mock import patch
 
 from archive_app.lan_echo import _checksum, echo_probe
+from archive_app.lan_identity import ObserverConfig, _probe, scan_identity, verify_identity
 
 
 TARGET = '192.168.2.23'
@@ -96,7 +98,7 @@ class EchoProbeTests(unittest.TestCase):
 
     def test_rejects_wrong_peer(self):
         result, connection, *_ = self.run_probe(PingSocket([(reply(), ('192.168.2.24', 0))]))
-        self.assertFalse(result)
+        self.assertIsNone(result)
         self.assertEqual(connection.receives, 2)
 
     def test_rejects_other_protocol_messages_and_wrong_echo_identity(self):
@@ -105,19 +107,19 @@ class EchoProbeTests(unittest.TestCase):
                        {'nonce': b'fedcba9876543210'}):
             with self.subTest(change=change):
                 result, *_ = self.run_probe(PingSocket([(reply(**change), (TARGET, 0))]))
-                self.assertFalse(result)
+                self.assertIsNone(result)
 
     def test_rejects_bad_checksum(self):
         packet = bytearray(reply())
         packet[2] ^= 1
         result, *_ = self.run_probe(PingSocket([(bytes(packet), (TARGET, 0))]))
-        self.assertFalse(result)
+        self.assertIsNone(result)
 
     def test_rejects_truncated_or_oversized_packets(self):
         for packet in (b'', b'\0' * 7, reply()[:-1], reply() + b'x', reply() + b'x' * 500):
             with self.subTest(size=len(packet)):
                 result, *_ = self.run_probe(PingSocket([(packet, (TARGET, 0))]))
-                self.assertFalse(result)
+                self.assertIsNone(result)
 
     def test_skips_noise_then_accepts_exact_reply(self):
         packets = [(reply(sequence=1), (TARGET, 0)), (reply(), ('192.168.2.24', 0)),
@@ -129,32 +131,39 @@ class EchoProbeTests(unittest.TestCase):
     def test_noise_packet_count_is_bounded(self):
         packets = [(reply(sequence=1), (TARGET, 0))] * 8 + [(reply(), (TARGET, 0))]
         result, connection, *_ = self.run_probe(PingSocket(packets))
-        self.assertFalse(result)
+        self.assertIsNone(result)
         self.assertEqual(connection.receives, 8)
         self.assertEqual(len(connection.packets), 1)
 
     def test_socket_errors_fail_closed_and_close_socket(self):
-        for step in ('bind', 'send', 'name', 'receive', 'timeout'):
+        for step in ('bind', 'send', 'name', 'receive'):
             with self.subTest(step=step):
                 result, connection, *_ = self.run_probe(PingSocket(fail=step))
-                self.assertFalse(result)
+                self.assertIsNone(result)
                 self.assertTrue(connection.closed)
+
+    def test_clean_sent_probe_timeout_is_an_explicit_negative(self):
+        result, connection, *_ = self.run_probe(PingSocket(fail='timeout'))
+        self.assertIs(result, False)
+        self.assertTrue(hasattr(connection, 'sent'))
+        self.assertEqual(connection.receives, 1)
+        self.assertTrue(connection.closed)
 
     def test_permission_or_platform_error_does_not_attempt_raw_or_tcp_fallback(self):
         with patch('archive_app.lan_echo.socket.socket', side_effect=PermissionError) as factory:
-            self.assertFalse(echo_probe(TARGET, LOCAL, 0.1))
+            self.assertIsNone(echo_probe(TARGET, LOCAL, 0.1))
         factory.assert_called_once_with(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
 
     def test_short_send_fails_closed(self):
         result, connection, *_ = self.run_probe(PingSocket(send_size=23))
-        self.assertFalse(result)
+        self.assertIsNone(result)
         self.assertEqual(connection.receives, 0)
 
     def test_zero_identifier_fails_closed(self):
         connection = PingSocket()
         connection.getsockname = lambda: (LOCAL, 0)
         result, connection, *_ = self.run_probe(connection)
-        self.assertFalse(result)
+        self.assertIsNone(result)
         self.assertEqual(connection.receives, 0)
 
     def test_numeric_ipv4_addresses_only_no_dns(self):
@@ -163,14 +172,14 @@ class EchoProbeTests(unittest.TestCase):
                             ('224.0.0.1', LOCAL), ('255.255.255.255', LOCAL)):
             with self.subTest(host=host, local=local):
                 result, _, factory, *_ = self.run_probe(host=host, local=local)
-                self.assertFalse(result)
+                self.assertIsNone(result)
                 factory.assert_not_called()
 
     def test_invalid_timeout_opens_no_socket(self):
         for timeout in (0, -1, float('nan'), float('inf'), True, '1', None):
             with self.subTest(timeout=timeout):
                 result, _, factory, *_ = self.run_probe(timeout=timeout)
-                self.assertFalse(result)
+                self.assertIsNone(result)
                 factory.assert_not_called()
 
     def test_timeout_is_capped_at_one_second(self):
@@ -189,19 +198,39 @@ class EchoProbeTests(unittest.TestCase):
 
     def test_expired_budget_does_not_send_or_receive(self):
         result, connection, *_ = self.run_probe(timeout=0.1, clock=[100, 100.11])
-        self.assertFalse(result)
+        self.assertIsNone(result)
         self.assertFalse(hasattr(connection, 'sent'))
         self.assertEqual(connection.receives, 0)
 
     def test_expired_budget_after_send_does_not_receive(self):
         result, connection, *_ = self.run_probe(timeout=0.5, clock=[100, 100.1, 100.2, 100.6])
-        self.assertFalse(result)
+        self.assertIs(result, False)
         self.assertEqual(connection.receives, 0)
 
     def test_reply_processed_after_deadline_is_not_accepted(self):
         result, connection, *_ = self.run_probe(timeout=0.5, clock=[100, 100.1, 100.2, 100.3, 100.6])
-        self.assertFalse(result)
+        self.assertIsNone(result)
         self.assertEqual(connection.receives, 1)
+
+    def test_real_local_probe_error_cannot_disprove_competing_dhcp_alias(self):
+        target, rival = '192.168.2.3', '192.168.2.4'
+        mac = '02:ab:cd:ef:01:07'
+        rows = [{'host': host, 'mac': mac, 'confirmed_age': 0} for host in (target, rival)]
+        config = ObserverConfig('synthetic-private-token-12345678901234567890',
+                                subnet='192.168.2.0/29')
+        def probe(host, source, timeout):
+            return True if host == target else _probe(host, source, timeout)
+        kwargs = {'probe': probe, 'neighbors': lambda *a, **kw: rows,
+                  'interface_lookup': lambda _: ('192.168.2.1', ipaddress.IPv4Network(config.subnet))}
+        # The target has a fresh reply; a rival's local socket failure does
+        # not establish that the rival failed to answer an actual challenge.
+        with patch('archive_app.lan_echo.socket.socket', side_effect=PermissionError):
+            scanned = scan_identity(config, **kwargs)
+            verified = verify_identity(config, target, mac, **kwargs)
+        self.assertEqual(scanned['records'], [])
+        self.assertEqual(scanned['conflicts'], [mac])
+        self.assertIs(verified['verified'], False)
+        self.assertEqual(verified['mac'], '')
 
 
 if __name__ == '__main__':

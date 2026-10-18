@@ -68,6 +68,16 @@ equal(helpers.identityState({auto_ip: true, identity_status: 'verified', identit
 equal(helpers.identityState({auto_ip: true, identity_status: 'verified', identity_checked_at: 106}, 100000), ['MAC cần xác minh lại', 'amber']);
 for (const value of [undefined, null, 'invalid']) equal(helpers.identityState({auto_ip: true, identity_status: 'verified', identity_checked_at: value}, 100000), ['Chờ xác minh MAC', 'amber']);
 equal(helpers.identityState({auto_ip: true, identity_status: 'unavailable', identity_checked_at: 100}, 100000), ['Chưa xác minh MAC', 'amber']);
+for (const [identity_error, label] of [
+  ['sd_identity_clock_skew', 'Đồng hồ box lệch giờ'],
+  ['sd_identity_invalid', 'Dữ liệu nhận diện LAN lỗi'],
+  ['sd_identity_unavailable', 'Bộ nhận diện LAN mất kết nối'],
+  ['sd_identity_unconfigured', 'Chưa cấu hình nhận diện LAN'],
+  ['sd_identity_subnet', 'Subnet nhận diện không khớp'],
+]) equal(helpers.identityState({auto_ip: true, identity_status: 'unavailable', identity_error}), [label, 'amber']);
+for (const identity_error of ['<script>', 'constructor', 'toString', '__proto__']) equal(helpers.identityState({auto_ip: true, identity_status: 'unavailable', identity_error}), ['Chưa xác minh MAC', 'amber']);
+equal(helpers.identityState({auto_ip: false, identity_status: 'unavailable', identity_error: 'sd_identity_clock_skew'}), ['IP thủ công', 'neutral']);
+equal(helpers.identityState({auto_ip: true, identity_status: 'conflict', identity_error: 'sd_identity_clock_skew'}), ['MAC trùng / nhiều IP', 'amber']);
 equal(helpers.identityState({auto_ip: true, identity_status: 'conflict'}), ['MAC trùng / nhiều IP', 'amber']);
 equal(helpers.identityState({auto_ip: true, identity_status: '<script>'}), ['Chờ xác minh MAC', 'amber']);
 equal(helpers.cameraPatch({}, {mac_address: '', auto_ip: false, identity_subnet: ''}), {});
@@ -879,6 +889,9 @@ equal(ui.state.discovery.revision, discoveryRevision + 1);
   equal(elements.get('camera-grid').textContent.includes('MAC cần xác minh lại'), true);
   namedCamera.identity_status = 'unavailable'; ui.renderCameras();
   equal(elements.get('camera-grid').textContent.includes('Chưa xác minh MAC'), true);
+  namedCamera.identity_error = 'sd_identity_clock_skew'; ui.renderCameras();
+  equal(elements.get('camera-grid').textContent.includes('Đồng hồ box lệch giờ'), true);
+  equal(elements.get('camera-grid').textContent.includes('Đã xác minh MAC'), false);
   namedCamera.identity_status = 'conflict'; ui.renderCameras();
   equal(elements.get('camera-grid').textContent.includes('MAC trùng / nhiều IP'), true);
   // Observer metadata can prefill a MAC during import, but never opt in.

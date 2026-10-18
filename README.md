@@ -1,5 +1,8 @@
 # MyCameraTele — Camera Private Channel Archive
 
+**Tài liệu vận hành:** [Các tiến trình quan trọng](docs/IMPORTANT_PROCESSES.md) ·
+[Kết quả audit repo](docs/REPOSITORY_AUDIT_2026-10-18.md).
+
 Dashboard hỗ trợ **Xóa camera** (giữ video/channel), điều chỉnh **1–5 camera chạy
 đồng thời** trong **Hệ thống → Luồng tải camera**, và **1–2 file SD song song**
 riêng từng camera. Cấu hình được lưu bền vững, áp dụng từ lượt sync kế tiếp,
@@ -88,7 +91,7 @@ Compose mặc định **pull-only**, không build trên board:
 - `BOT_API_IMAGE=ghcr.io/bscongluanbui/mycameratele-bot-api:latest` cho local API.
 - Có thể pin tag/digest của phiên bản đã kiểm chứng trong `.env`.
 
-Mặc định cloud, `ENABLE_UPLOAD=false`, `KEEP_CACHE=false`, retention 1 giờ;
+Compose mặc định cloud, `ENABLE_UPLOAD=false`, `KEEP_CACHE=false`, retention 0 giờ;
 thiếu bot/channel ID/quyền post vẫn mở dashboard nhưng chưa upload recording. Image dùng
 UID/GID `10001:10001`; `input` chỉ đọc. SQLite/cache/tài khoản dashboard nằm trong
 named volumes. Giữ project **`ezviz-telegram-archive`** và volume keys
@@ -250,9 +253,10 @@ file; format chưa rõ dùng `.bin`. `PASSTHROUGH_PROBE_METADATA=false` là mặ
 chỉ bật tùy chọn đọc metadata giới hạn nếu thật sự cần. Raw file gửi document,
 không được đổi container để ép Telegram preview.
 
-Worker chỉ dùng cache làm trung chuyển. `KEEP_CACHE=false` và
-`CACHE_RETENTION_HOURS=1` xóa cache **sau upload đã xác nhận và metadata đã
-commit** được 1 giờ. Đặt retention `0` để xóa ngay sau bước xác nhận/commit.
+Worker chỉ dùng cache làm trung chuyển. Compose và `.env.example` mặc định
+`KEEP_CACHE=false`, `CACHE_RETENTION_HOURS=0`: xóa cache **ngay sau upload đã xác
+nhận và metadata đã commit**. Nếu muốn giữ thêm 1 giờ, đặt
+`CACHE_RETENTION_HOURS=1`; đây là tùy chọn, không phải mặc định triển khai.
 Recording chưa gửi, lỗi, `upload_unknown` hoặc chưa commit không bị timer này
 xóa; database/file_id vẫn giữ để tra cứu/khôi phục. File nguồn Studio không xóa.
 
@@ -382,7 +386,7 @@ TELEGRAM_ALLOWED_USER_IDS=OWNER_ID,VIEWER_ID_2,VIEWER_ID_3
 TELEGRAM_CHAT_ID=
 MEDIA_MODE=remux_copy
 KEEP_CACHE=false
-CACHE_RETENTION_HOURS=1
+CACHE_RETENTION_HOURS=0
 SD_SYNC_INTERVAL_SECONDS=900
 ENABLE_UPLOAD=false
 ```
@@ -552,7 +556,7 @@ Lệnh chỉ đưa bản ghi chưa có file_id và lỗi `missing_or_oversize_fi
 
 Local API dùng nguồn chính thức `tdlib/telegram-bot-api`, pin commit trong
 `Dockerfile.bot-api`; `compose.local.yaml` chọn endpoint local, tối đa
-`2000000000` bytes, `KEEP_CACHE=false`, retention mặc định 1 giờ cho worker/dashboard.
+`2000000000` bytes, `KEEP_CACHE=false`, retention mặc định 0 giờ cho worker/dashboard.
 Không âm thầm đổi sang cloud nếu local API ngừng hoạt động.
 
 Lấy application `api_id`/`api_hash` theo
@@ -581,11 +585,14 @@ và chạy lại lệnh `up -d --force-recreate archive dashboard` với **cùng
 Compose và profile**. Khi đã chọn local, luôn giữ các cờ này trong lệnh cập nhật;
 lệnh chỉ dùng `compose.yaml` sẽ chọn lại cấu hình cloud mặc định.
 
-Local API chỉ trong mạng Compose, **không publish 8081**. Worker stream multipart
-bytes qua HTTP; không dùng `file://`, không mount cache worker vào API. Volume
-`bot-api-state` giữ working-state của API qua restart, không đổi tên/xóa khi update. Theo
+Local API chỉ trong mạng Compose, **không publish 8081**. Mặc định
+`TELEGRAM_UPLOAD_TRANSPORT=local_file`: worker gửi đường dẫn `file://` của MP4
+đã quản lý, Bot API đọc cùng volume `/cache` được mount **read-only**. Raw/document
+vẫn dùng multipart; đặt transport `multipart` để chủ động dùng cách này cho MP4.
+Spool tách trên đĩa có ngân sách admission 5 GB, không phải tmpfs hoặc quota cứng.
+Volume `bot-api-state` giữ working-state của API qua restart, không đổi tên/xóa khi update. Theo
 [Telegram Local Bot API](https://core.telegram.org/bots/api#using-a-local-bot-api-server),
-local mode hỗ trợ upload tới 2000 MB. Không cần VPS hoặc middleware.
+local mode hỗ trợ upload tới 2000 MB. Xem [luồng Local Bot API đọc MP4](docs/LOCAL_FILE_UPLOAD.md).
 
 RAM runtime tùy workload/TDLib; không có một mức cố định suy ra từ dung lượng
 file. Theo dõi **min/max/peak** trước và trong upload thực bằng `docker stats`
@@ -599,10 +606,12 @@ mock API, kiểm tra config hoặc unit test thành công.
 
 ## 5. Retention và daily SQLite backup
 
-House01/cloud/local mặc định `KEEP_CACHE=false`, `CACHE_RETENTION_HOURS=1`;
-đặt retention `0` để cleanup ngay. Chỉ xóa cache đã upload xác nhận,
-có metadata Telegram, SQLite commit thành công và đủ thời gian retention.
-File thất bại/mơ hồ/chưa upload được giữ; nguồn `input` không bị cleanup.
+Compose House01/cloud/local mặc định `KEEP_CACHE=false`, `CACHE_RETENTION_HOURS=0`.
+Chỉ xóa cache đã upload xác nhận, có metadata Telegram và SQLite commit thành
+công; đặt retention `1` nếu muốn giữ thêm một giờ. Media ở trạng thái lỗi kết
+thúc theo `ERROR_RETENTION_HOURS=72`; catalog và lỗi vẫn được giữ. Lượt upload
+mơ hồ (`upload_unknown`) không tự gửi lại hoặc xóa theo timer thành công. Nguồn
+`input` không bị cleanup. Xem [chi tiết phạm vi và hạn giữ](docs/CACHE_RETENTION.md).
 
 Worker tạo SQLite snapshot nhất quán hằng ngày trong `/data/backups`, giữ **7
 snapshot ngày gần nhất**. Snapshot nằm cùng volume với DB nên cần copy ra ổ
@@ -633,7 +642,7 @@ backup của bạn.
    `TELEGRAM_DESTINATION=channel`, channel ID thật; giữ owner/allowlist dương.
 3. Giữ API mode hiện tại (cloud/local), không đồng thời đổi endpoint khi đổi
    storage destination. Cấu hình Local API là bước riêng, có cloud logOut.
-4. Chọn `MEDIA_MODE=remux_copy`, retention 1 giờ, SD 900; giữ `ENABLE_UPLOAD=false`
+4. Chọn `MEDIA_MODE=remux_copy`, retention 0 giờ (hoặc chủ động giữ thêm), SD 900; giữ `ENABLE_UPLOAD=false`
    trong bước kiểm tra channel/media. Chỉ bật sau khi gate được xác nhận.
 5. Dùng **base + SDK overlay hiện có**, không thêm overlay project House01 mới:
 

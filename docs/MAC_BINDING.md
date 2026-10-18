@@ -39,6 +39,14 @@ của camera cũ sau DHCP nếu chưa xác nhận: IP cũ có thể thuộc came
 
 ## Cài observer trên box LAN
 
+VPS và box phải đồng bộ giờ. Observer trả `server_time` để phân biệt lệch giờ
+(`sd_identity_clock_skew`, dashboard: **Đồng hồ box lệch giờ**) với proof hết
+hạn; không tăng TTL hoặc bỏ guard MAC để chữa nhãn này. Box không có RTC cần
+NTP liên tục sau reboot. Trên DietPi kiểm tra `CONFIG_NTP_MODE=4` và
+`timedatectl show -p NTPSynchronized -p NTP` (cả hai `yes`).
+Chi tiết sự cố, cách phục hồi và giới hạn kiểm chứng:
+[CAMERA_RECOVERY_2026-10-18.md](CAMERA_RECOVERY_2026-10-18.md).
+
 Sử dụng image chứa tính năng này; giữ tag/digest giống bản đã kiểm thử trên VPS.
 Các lệnh dưới chạy tại một thư mục riêng, không dùng lại service video collector.
 

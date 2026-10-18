@@ -70,8 +70,20 @@ def _fresh(value,now):
     return type(value) in (int,float) and math.isfinite(value) and -5<=now-value<=MAX_AGE
 
 
+def _check_observer_clock(data,now):
+    # A current server timestamp distinguishes an unsynchronised LAN host from
+    # an expired proof.  Neither case grants permission to use an old mapping.
+    if isinstance(data,dict) and 'server_time' in data:
+        stamp=data['server_time']
+        if type(stamp) not in (int,float) or not math.isfinite(stamp):
+            raise CameraIdentityError('sd_identity_invalid')
+        if abs(now-stamp)>5:
+            raise CameraIdentityError('sd_identity_clock_skew','Synchronize the LAN observer and VPS clocks')
+
+
 def validate_snapshot(data,now=None):
     now=time.time() if now is None else now
+    _check_observer_clock(data,now)
     try:
         if not isinstance(data,dict) or type(data.get('version')) is not int or data['version']!=1:raise ValueError
         subnet=normalize_subnet(data['subnet']);net=ipaddress.IPv4Network(subnet)
@@ -116,8 +128,10 @@ class IdentityClient:
     def snapshot(self,force=False):
         with self.lock:
             now=self.clock()
-            if force or self.cached is None or now-self.cached_at>=5:
-                self.cached=validate_snapshot(self._request('/v1/neighbors'),now)
+            if force or self.cached is None or not 0<=now-self.cached_at<5:
+                response=self._request('/v1/neighbors')
+                now=self.clock()
+                self.cached=validate_snapshot(response,now)
                 self.cached_at=now
             # Revalidate the timestamp even for a cached response.
             return validate_snapshot(self.cached,now)
@@ -128,6 +142,8 @@ class IdentityClient:
             now=self.clock()
             if 0<=now-self.verified.get(key,-math.inf)<1:return
             reply=self._request('/v1/verify',{'host':host,'mac':mac})
+            now=self.clock()
+            _check_observer_clock(reply,now)
             if (not isinstance(reply,dict) or type(reply.get('version')) is not int or reply['version']!=1 or reply.get('verified') is not True
                     or reply.get('host')!=host or reply.get('mac')!=mac
                     or not _fresh(reply.get('observed_at'),now) or abs(now-reply['observed_at'])>5):

@@ -62,6 +62,23 @@ class ValidationTests(unittest.TestCase):
         data=snapshot(1000);data['records'][0]['observed_at']=800
         with self.assertRaises(CameraIdentityError):validate_snapshot(data,1000)
 
+    def test_server_clock_skew_is_explicit_and_still_fail_closed(self):
+        for offset in (-3300,3300):
+            data=snapshot(1000+offset);data['server_time']=1000+offset
+            with self.subTest(offset=offset),self.assertRaises(CameraIdentityError) as err:
+                validate_snapshot(data,1000)
+            self.assertEqual(err.exception.code,'sd_identity_clock_skew')
+
+    def test_current_server_clock_does_not_make_stale_mapping_valid(self):
+        data=snapshot(800);data['server_time']=1000
+        with self.assertRaises(CameraIdentityError) as err:validate_snapshot(data,1000)
+        self.assertEqual(err.exception.code,'sd_identity_invalid')
+
+    def test_malformed_server_time_never_accepted(self):
+        for stamp in (True,'1000',float('nan'),float('inf'),None):
+            data=snapshot(1000);data['server_time']=stamp
+            with self.subTest(stamp=stamp),self.assertRaises(CameraIdentityError):validate_snapshot(data,1000)
+
     def test_invalid_scope_evidence_conflict_error_version(self):
         for key,value in (('host','192.168.1.17'),('host','192.168.2.0'),('host','192.168.2.255'),('evidence','arp'),('mac','ff:ff:ff:ff:ff:ff')):
             data=snapshot(1000);data['records'][0][key]=value
@@ -85,6 +102,12 @@ class ClientTests(unittest.TestCase):
             self.client.clock=lambda:1121
             with self.assertRaises(CameraIdentityError):self.client.snapshot()
 
+    def test_backward_client_clock_refreshes_cache_instead_of_waiting_to_catch_up(self):
+        with patch.object(self.client,'_request',side_effect=[snapshot(1000),snapshot(900)]) as request:
+            self.client.snapshot();self.client.clock=lambda:900
+            self.assertEqual(self.client.snapshot()['observed_at'],900)
+            self.assertEqual(request.call_count,2)
+
     def test_guard_manual_mode_does_not_connect(self):
         with patch('archive_app.camera_identity.client_for') as client:
             guard_camera({'host':'192.168.2.5'},settings=object());client.assert_not_called()
@@ -106,6 +129,21 @@ class ClientTests(unittest.TestCase):
         for key,value in (('version',True),('verified',False),('host','192.168.2.7'),('mac','94:ec:13:14:d2:a2'),('observed_at',990)):
             with self.subTest(key=key),patch.object(self.client,'_request',return_value={**base,key:value}),self.assertRaises(CameraIdentityError):self.client.verify(base['host'],MAC)
         self.assertEqual(self.client.verified,{})
+
+    def test_verify_unsynchronised_observer_never_cached(self):
+        reply={'version':1,'host':'192.168.2.17','mac':MAC,'verified':True,'observed_at':4300,'server_time':4300}
+        with patch.object(self.client,'_request',return_value=reply),self.assertRaises(CameraIdentityError) as err:
+            self.client.verify(reply['host'],MAC)
+        self.assertEqual(err.exception.code,'sd_identity_clock_skew')
+        self.assertEqual(self.client.verified,{})
+
+    def test_verify_checks_response_time_after_request(self):
+        # A near-limit response must be compared to receipt time, not the
+        # timestamp captured before a bounded network/verification request.
+        reply={'version':1,'host':'192.168.2.17','mac':MAC,'verified':True,'observed_at':1005,'server_time':1005}
+        with patch.object(self.client,'_request',return_value=reply),patch.object(self.client,'clock',side_effect=[1000,1005,1005]):
+            self.client.verify(reply['host'],MAC)
+        self.assertEqual(self.client.verified[(reply['host'],MAC)],1005)
 
     def test_transport_does_not_expose_secret_or_follow_redirect(self):
         with tempfile.TemporaryDirectory() as root:

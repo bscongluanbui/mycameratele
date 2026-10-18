@@ -95,12 +95,19 @@ class IdentityDashboardTests(unittest.TestCase):
     def test_camera_get_observer_failure_is_sanitized_and_does_not_mutate(self):
         self.login();self.bound()
         before=dict(self.archive.conn.execute("SELECT * FROM cameras WHERE id='bound'").fetchone())
-        for error in (CameraIdentityError('sd_identity_invalid','SENSITIVE'),RuntimeError('SENSITIVE')):
+        failures=((CameraIdentityError('sd_identity_invalid','SENSITIVE'),'sd_identity_invalid'),
+                  (CameraIdentityError('sd_identity_clock_skew','SENSITIVE'),'sd_identity_clock_skew'),
+                  (CameraIdentityError('sd_identity_unconfigured','SENSITIVE'),'sd_identity_unconfigured'),
+                  (CameraIdentityError('unexpected-sensitive-code','SENSITIVE'),'sd_identity_unavailable'),
+                  (CameraIdentityError({},'SENSITIVE'),'sd_identity_unavailable'),
+                  (RuntimeError('SENSITIVE'),'sd_identity_unavailable'))
+        for error,expected in failures:
             with self.subTest(error=type(error).__name__),patch('archive_app.dashboard.public_snapshot',side_effect=error):
                 code,data,_=self.request('GET','/api/cameras')
             self.assertEqual(code,200);row=data['cameras'][0]
-            self.assertEqual((row['identity_status'],row['identity_error']),('unavailable','sd_identity_unavailable'))
+            self.assertEqual((row['identity_status'],row['identity_error']),('unavailable',expected))
             self.assertNotIn('SENSITIVE',str(data))
+            self.assertNotIn('unexpected-sensitive-code',str(data))
         self.assertEqual(dict(self.archive.conn.execute("SELECT * FROM cameras WHERE id='bound'").fetchone()),before)
 
     def test_camera_get_does_not_hide_saved_binding_conflict(self):

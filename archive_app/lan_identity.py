@@ -193,7 +193,7 @@ def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lo
     if not network.subnet_of(attached) or ipaddress.IPv4Address(local_address) not in attached:
         raise ValueError('Configured subnet is not directly attached to the LAN interface')
     hosts = iter(str(host) for host in network.hosts() if str(host) != local_address)
-    connected, pending, exhausted = {}, {}, False
+    connected, disconnected, pending, exhausted = {}, set(), {}, False
     with ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix='lan-identity-probe') as pool:
         while not stop.is_set() and monotonic() - started < config.scan_timeout - 2 - config.probe_timeout:
             while not exhausted and len(pending) < config.workers:
@@ -207,8 +207,11 @@ def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lo
             completed, _ = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
             for future in completed:
                 host = pending.pop(future)
-                if future.result() is True:
+                answer = future.result()
+                if answer is True:
                     connected[host] = clock()
+                elif answer is False:
+                    disconnected.add(host)
         for future in pending:
             future.cancel()
     if stop.is_set():
@@ -247,8 +250,12 @@ def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lo
             refreshed = {pool.submit(probe or _probe, host, local_address, config.probe_timeout): host for host in missing}
             for future, host in refreshed.items():
                 connected.pop(host, None)
-                if future.result() is True:
+                disconnected.discard(host)
+                answer = future.result()
+                if answer is True:
                     connected[host] = clock()
+                elif answer is False:
+                    disconnected.add(host)
         # Retain earlier rows as well so an observed MAC change stays a conflict.
         rows.extend(read_rows())
     if stop.is_set():
@@ -257,6 +264,11 @@ def scan_identity(config, *, stop=None, probe=None, neighbors=None, interface_lo
     records, by_host, by_mac = [], {}, {}
     for row in rows:
         host, mac = row['host'], row['mac']
+        # DHCP can leave the former IP's recent ARP row behind.  It is not a
+        # second owner after that IP explicitly failed this scan's echo.  An
+        # unscanned/cancelled candidate remains ambiguous, never assumed dead.
+        if host in disconnected:
+            continue
         by_host.setdefault(host, set()).add(mac)
         by_mac.setdefault(mac, set()).add(host)
     conflicting_hosts = {host for host, values in by_host.items() if len(values) != 1}
@@ -332,14 +344,44 @@ def verify_identity(config, host, mac, *, stop=None, probe=None, neighbors=None,
             break
         if len(old_macs) == len(new_macs) == 1 and connected:
             candidate = next(iter(new_macs))
-            if len(old_hosts[candidate]) != 1 or len(new_hosts[candidate]) != 1:
-                break
+            competing = (old_hosts[candidate] | new_hosts[candidate]) - {str(address)}
+            if competing:
+                # A recent ARP row at the former DHCP address is only a
+                # candidate.  Disprove every competing IP actively, within
+                # this request's original deadline and a fixed fan-out cap.
+                if len(competing) > 4:
+                    break
+                disproved = set()
+                for other in sorted(competing, key=ipaddress.IPv4Address):
+                    remaining = deadline - monotonic()
+                    if stop.is_set() or remaining <= 0.1:
+                        break
+                    if (probe or _probe)(other, local_address, min(config.probe_timeout, remaining)) is not False:
+                        break
+                    disproved.add(other)
+                if disproved != competing:
+                    break
+                # A rival probe can trigger ARP updates.  Require the target
+                # to answer again and its MAC to remain unchanged afterwards;
+                # a new, unchecked alias still makes the proof ambiguous.
+                remaining = deadline - monotonic()
+                if stop.is_set() or remaining <= 0.1 or (probe or _probe)(str(address), local_address, min(0.5, remaining)) is not True:
+                    break
+                proof_at = clock()
+                final = proof()
+                if final is None:
+                    break
+                final_macs, final_hosts = final
+                if final_macs != {candidate} or (final_hosts[candidate] - {str(address)}) - disproved:
+                    break
             actual, verified = candidate, candidate == expected
             break
         if stop.wait(min(0.2, max(0, deadline - monotonic()))):
             break
+    server_time = clock()
     return {'version': 1, 'host': str(address), 'mac': actual, 'verified': verified,
-            'observed_at': proof_at if proof_at is not None else clock()}
+            'observed_at': proof_at if proof_at is not None else server_time,
+            'server_time': server_time}
 
 
 class IdentityState:
@@ -358,6 +400,7 @@ class IdentityState:
         with self.lock:
             self._prune_proofs()
             result = copy.deepcopy(self.data)
+            result['server_time'] = self.clock()
             result['records'] = sorted(copy.deepcopy(list(self.proven.values())), key=lambda row: ipaddress.IPv4Address(row['host']))
             if result['records'] and not result.get('conflicts'):
                 result['observed_at'] = max(row['observed_at'] for row in result['records'])

@@ -32,3 +32,6 @@ sdk
 sdk/**
 tests/.tmp*
 tests/.tmp*/**
+
+# Node regression tests run from the CI checkout, not in the Python runtime.
+archive_app/web/test_web.js

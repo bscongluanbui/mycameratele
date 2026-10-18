@@ -126,7 +126,8 @@ class ChannelIndexTests(unittest.TestCase):
         self.assertIn(month['tg_message_url'], self.text('day', '2026-10-10'))
         self.assertIn('https://t.me/c/1111111111/77', self.text('day', '2026-10-10'))
         self.assertIn('https://t.me/synthetic_bot', self.text('root', 'root'))
-        self.assertEqual(self.index.message_url('CAM01'), root['tg_message_url'])
+        camera = next(row for row in self.archive.cameras() if row['id'] == 'CAM01')
+        self.assertEqual(camera['channel_index_url'], root['tg_message_url'])
 
     def test_all_posts_are_silent_text_only_and_only_root_is_pinned(self):
         self.record()

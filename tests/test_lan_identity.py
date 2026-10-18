@@ -174,6 +174,37 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(result['records'], [])
         self.assertEqual(result['conflicts'], [MAC, '02:ab:cd:ef:01:08'])
 
+    def test_dhcp_old_ip_failed_echo_does_not_conflict_with_proven_new_ip(self):
+        rows = [{'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 20},
+                {'host': '192.168.2.4', 'mac': MAC, 'confirmed_age': 0.01}]
+        result = self.scan(rows, probe=lambda host, *_: host == '192.168.2.4')
+        self.assertEqual(result['conflicts'], [])
+        self.assertEqual(result['records'], [{'host': '192.168.2.4', 'mac': MAC,
+                                              'observed_at': 1000, 'evidence': 'icmp+netlink'}])
+
+    def test_dhcp_candidate_without_explicit_negative_echo_stays_ambiguous(self):
+        rows = [{'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 20},
+                {'host': '192.168.2.4', 'mac': MAC, 'confirmed_age': 0.01}]
+        result = self.scan(rows, probe=lambda host, *_: True if host == '192.168.2.4' else None)
+        self.assertEqual(result['records'], [])
+        self.assertEqual(result['conflicts'], [MAC])
+
+    def test_scan_deadline_does_not_assume_unscanned_dhcp_alias_is_offline(self):
+        now, calls = [0], []
+        def probe(host, *_):
+            calls.append(host)
+            if host == '192.168.2.3':
+                now[0] = 14
+                return True
+            return False
+        rows = [{'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 0},
+                {'host': '192.168.2.200', 'mac': MAC, 'confirmed_age': 20}]
+        result = self.scan(rows, config=replace(ObserverConfig(TOKEN), workers=1),
+                           probe=probe, monotonic=lambda: now[0])
+        self.assertNotIn('192.168.2.200', calls)
+        self.assertEqual(result['records'], [])
+        self.assertEqual(result['conflicts'], [MAC])
+
     def test_duplicate_identical_rows_are_deduplicated(self):
         row = {'host': '192.168.2.3', 'mac': MAC, 'confirmed_age': 0.01}
         result = self.scan([row, row])
@@ -405,7 +436,17 @@ class VerificationTests(unittest.TestCase):
 
     def test_fresh_positive_single_host_proof(self):
         result = self.verify()
-        self.assertEqual(result, {'version': 1, 'host': '192.168.2.7', 'mac': MAC, 'verified': True, 'observed_at': 1000})
+        self.assertEqual(result, {'version': 1, 'host': '192.168.2.7', 'mac': MAC, 'verified': True,
+                                  'observed_at': 1000, 'server_time': 1000})
+
+    def test_response_server_time_is_current_not_the_echo_timestamp(self):
+        result = verify_identity(ObserverConfig(TOKEN), '192.168.2.7', MAC,
+                                 probe=lambda *_: True,
+                                 neighbors=lambda *a, **kw: [{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 0}],
+                                 interface_lookup=lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24')),
+                                 clock=Mock(side_effect=[1000, 1003]))
+        self.assertTrue(result['verified'])
+        self.assertEqual((result['observed_at'], result['server_time']), (1000, 1003))
 
     def test_wrong_mac_never_verifies(self):
         result = self.verify(mac='02:ab:cd:ef:01:08')
@@ -426,6 +467,70 @@ class VerificationTests(unittest.TestCase):
     def test_same_mac_on_multiple_fresh_hosts_is_rejected(self):
         result = self.verify(rows=[{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 0},
                                    {'host': '192.168.2.8', 'mac': MAC, 'confirmed_age': 0}])
+        self.assertFalse(result['verified'])
+        self.assertEqual(result['mac'], '')
+
+    def test_old_dhcp_alias_must_fail_current_echo_then_target_is_rechecked(self):
+        rows = [{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 0},
+                {'host': '192.168.2.8', 'mac': MAC, 'confirmed_age': 20}]
+        calls = []
+        def probe(host, *_):
+            calls.append(host)
+            return host == '192.168.2.7'
+        result = self.verify(rows=rows, probe=probe)
+        self.assertTrue(result['verified'])
+        self.assertEqual(result['mac'], MAC)
+        self.assertEqual(calls, ['192.168.2.7', '192.168.2.8', '192.168.2.7'])
+
+    def test_competing_alias_with_unknown_probe_result_remains_rejected(self):
+        rows = [{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 0},
+                {'host': '192.168.2.8', 'mac': MAC, 'confirmed_age': 20}]
+        result = self.verify(rows=rows, probe=lambda host, *_: True if host == '192.168.2.7' else None)
+        self.assertFalse(result['verified'])
+        self.assertEqual(result['mac'], '')
+
+    def test_competing_alias_probe_fanout_is_bounded_and_fails_closed(self):
+        rows = [{'host': f'192.168.2.{index}', 'mac': MAC, 'confirmed_age': 0}
+                for index in range(7, 13)]
+        probe = Mock(return_value=True)
+        result = self.verify(rows=rows, probe=probe)
+        self.assertFalse(result['verified'])
+        self.assertEqual(probe.call_count, 1)
+
+    def test_competing_alias_probes_cannot_extend_original_verification_deadline(self):
+        now, calls = [0], []
+        rows = [{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 0},
+                {'host': '192.168.2.8', 'mac': MAC, 'confirmed_age': 20}]
+        def probe(host, *_):
+            calls.append(host)
+            if host == '192.168.2.8':
+                now[0] = 3.1
+                return False
+            return True
+        with patch('archive_app.lan_identity.time.monotonic', side_effect=lambda: now[0]):
+            result = self.verify(rows=rows, probe=probe)
+        self.assertFalse(result['verified'])
+        self.assertEqual(calls, ['192.168.2.7', '192.168.2.8'])
+
+    def test_mac_change_after_dhcp_alias_probe_is_rejected(self):
+        rows = [{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 0},
+                {'host': '192.168.2.8', 'mac': MAC, 'confirmed_age': 20}]
+        changed = [{'host': '192.168.2.7', 'mac': '02:ab:cd:ef:01:08', 'confirmed_age': 0}]
+        dump = Mock(side_effect=[rows, rows, changed])
+        result = verify_identity(ObserverConfig(TOKEN), '192.168.2.7', MAC,
+                                 probe=lambda host, *_: host == '192.168.2.7', neighbors=dump,
+                                 interface_lookup=lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24')))
+        self.assertFalse(result['verified'])
+        self.assertEqual(result['mac'], '')
+        self.assertEqual(dump.call_count, 3)
+
+    def test_new_unchecked_alias_after_dhcp_alias_probe_is_rejected(self):
+        rows = [{'host': '192.168.2.7', 'mac': MAC, 'confirmed_age': 0},
+                {'host': '192.168.2.8', 'mac': MAC, 'confirmed_age': 20}]
+        dump = Mock(side_effect=[rows, rows, rows + [{'host': '192.168.2.9', 'mac': MAC, 'confirmed_age': 0}]])
+        result = verify_identity(ObserverConfig(TOKEN), '192.168.2.7', MAC,
+                                 probe=lambda host, *_: host == '192.168.2.7', neighbors=dump,
+                                 interface_lookup=lambda _: ('192.168.2.1', ipaddress.IPv4Network('192.168.2.0/24')))
         self.assertFalse(result['verified'])
         self.assertEqual(result['mac'], '')
 
@@ -473,14 +578,14 @@ class StateTests(unittest.TestCase):
         def scan(*args, **kwargs):
             called.set()
             return data
-        state = IdentityState(ObserverConfig(TOKEN), scanner=scan)
+        state = IdentityState(ObserverConfig(TOKEN), scanner=scan, clock=lambda: 1000)
         state.start()
         worker = state.thread
         state.start()
         self.assertIs(state.thread, worker)
         self.assertTrue(called.wait(2))
         state.close()
-        self.assertEqual(state.snapshot(), data)
+        self.assertEqual(state.snapshot(), {**data, 'server_time': 1000})
 
     def test_pre_stopped_server_starts_and_closes_cleanly(self):
         stop = threading.Event()
@@ -517,6 +622,14 @@ class ProofCacheTests(unittest.TestCase):
         self.assertEqual(result['records'], [{'host': '192.168.2.7', 'mac': MAC, 'observed_at': 1000, 'evidence': 'icmp+netlink'}])
         self.assertIsNone(result['error'])
         self.assertEqual(result['observed_at'], 1000)
+
+    def test_snapshot_server_time_is_current_not_the_retained_proof_timestamp(self):
+        self.state.remember_proof(self.proof(), MAC)
+        self.now = 1060
+        result = self.state.snapshot()
+        self.assertEqual(result['server_time'], 1060)
+        self.assertEqual(result['observed_at'], 1000)
+        self.assertEqual(result['records'][0]['observed_at'], 1000)
 
     def test_expected_mac_case_and_separator_share_one_normalized_retry_hint(self):
         self.state.remember_proof(self.proof(), MAC.upper().replace(':', '-'))
